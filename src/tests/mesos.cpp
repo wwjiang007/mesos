@@ -430,16 +430,23 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
 Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     MasterDetector* detector,
     slave::GarbageCollector* gc,
-    const Option<slave::Flags>& flags)
+    const Option<slave::Flags>& flags,
+    bool mock)
 {
   Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
       detector,
       flags.isNone() ? CreateSlaveFlags() : flags.get(),
       None(),
       None(),
-      gc);
+      gc,
+      None(),
+      None(),
+      None(),
+      None(),
+      None(),
+      mock);
 
-  if (slave.isSome()) {
+  if (slave.isSome() && !mock) {
     slave.get()->start();
   }
 
@@ -546,7 +553,8 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
 Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     mesos::master::detector::MasterDetector* detector,
     mesos::Authorizer* authorizer,
-    const Option<slave::Flags>& flags)
+    const Option<slave::Flags>& flags,
+    bool mock)
 {
   Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
       detector,
@@ -558,9 +566,10 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
       None(),
       None(),
       None(),
-      authorizer);
+      authorizer,
+      mock);
 
-  if (slave.isSome()) {
+  if (slave.isSome() && !mock) {
     slave.get()->start();
   }
 
@@ -572,7 +581,8 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     mesos::master::detector::MasterDetector* detector,
     slave::Containerizer* containerizer,
     mesos::Authorizer* authorizer,
-    const Option<slave::Flags>& flags)
+    const Option<slave::Flags>& flags,
+    bool mock)
 {
   Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
       detector,
@@ -584,9 +594,10 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
       None(),
       None(),
       None(),
-      authorizer);
+      authorizer,
+      mock);
 
-  if (slave.isSome()) {
+  if (slave.isSome() && !mock) {
     slave.get()->start();
   }
 
@@ -678,6 +689,15 @@ MockAuthorizer::MockAuthorizer()
 
 
 MockAuthorizer::~MockAuthorizer() {}
+
+
+MockGarbageCollector::MockGarbageCollector()
+{
+  EXPECT_CALL(*this, unschedule(_)).WillRepeatedly(Return(true));
+}
+
+
+MockGarbageCollector::~MockGarbageCollector() {}
 
 
 slave::Flags ContainerizerTest<slave::MesosContainerizer>::CreateSlaveFlags()

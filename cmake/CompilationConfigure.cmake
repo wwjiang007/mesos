@@ -99,7 +99,59 @@ option(
   "Build libprocess with LIFO fixed size semaphore."
   FALSE)
 
-option(ENABLE_JAVA
+option(
+  ENABLE_NEW_CLI
+  "Build the new CLI instead of the old one."
+  FALSE)
+
+if (ENABLE_NEW_CLI)
+  find_package(PythonInterp)
+  find_package(PythonLibs)
+
+  if (NOT PYTHON_LIBRARY)
+    message(
+      FATAL_ERROR
+      "Python not found.\n"
+      "The new CLI requires Python version 2.6 or 2.7 in order to build.\n"
+      "Your Python version is ${PYTHONLIBS_VERSION_STRING}.\n"
+      "You may wish to set the PYTHON environment variable to an "
+      "appropriate value if Python is not installed in your PATH.")
+  endif ()
+
+  if (${PYTHONLIBS_VERSION_STRING} VERSION_LESS "2.6.0")
+    message(
+      FATAL_ERROR
+      "Python version too old.\n"
+      "The new CLI requires Python version 2.6 or 2.7 in order to build.\n"
+      "Your Python version is ${PYTHONLIBS_VERSION_STRING}.\n"
+      "You may wish to set the PYTHON environment variable to an "
+      "appropriate value to assure the right Python executable is found.")
+  endif ()
+
+  if (${PYTHONLIBS_VERSION_STRING} VERSION_EQUAL "3.0.0" OR
+      ${PYTHONLIBS_VERSION_STRING} VERSION_GREATER "3.0.0")
+    message(
+      FATAL_ERROR
+      "Python version too new.\n"
+      "The new CLI requires Python version 2.6 or 2.7 in order to build.\n"
+      "Your Python version is ${PYTHONLIBS_VERSION_STRING}.\n"
+      "You may wish to set the PYTHON environment variable to an "
+      "appropriate value to assure the right Python executable is found.")
+  endif ()
+
+  find_program(VIRTUALENV virtualenv)
+  if (NOT VIRTUALENV)
+    message(
+      FATAL_ERROR
+      "Cannot find virtualenv.\n"
+      "The new CLI requires 'virtualenv' be installed as part of your "
+      "Python ${PYTHONLIBS_VERSION_STRING} installation.\n"
+      "You may wish to install it via 'pip install virtualenv'.")
+  endif ()
+endif ()
+
+option(
+  ENABLE_JAVA
   "Build Java components. Warning: this is SLOW."
   FALSE)
 
@@ -301,6 +353,51 @@ endif()
 ######################
 string(COMPARE EQUAL ${CMAKE_SYSTEM_NAME} "Linux" LINUX)
 
+if (LINUX)
+  # We currenty only support using the bundled jemalloc on linux.
+  # While building it and linking against is actually not a problem
+  # on other platforms, to make it actually *useful* we need some
+  # additional platform-specific code in the mesos binaries that re-routes
+  # all existing malloc/free calls through jemalloc.
+  # On linux, that is not necessary because the default malloc implementation
+  # explicitly supports replacement via symbol interposition.
+  option(
+    ENABLE_JEMALLOC_ALLOCATOR
+    "Use jemalloc as memory allocator for the master and agent binaries."
+    FALSE)
+endif ()
+
+# FREEBSD CONFIGURATION.
+######################
+string(COMPARE EQUAL ${CMAKE_SYSTEM_NAME} "FreeBSD" FREEBSD)
+
+# There is a problem linking with BFD linkers when using Clang on
+# FreeBSD (MESOS-8761). CMake uses the compiler to link, and the
+# compiler uses `/usr/bin/ld` by default. On FreeBSD the default
+# compiler is Clang but the default linker is GNU ld (BFD). Since LLD
+# is available in the base system, and GOLD is available from
+# `devel/binutils`, we look for a more modern linker and tell Clang to
+# use that instead.
+#
+# TODO(dforsyth): Understand why this is failing and add a check to
+# make sure we have a compatible linker (MESOS-8765), or wait until
+# FreeBSD makes lld the default linker.
+if (${CMAKE_SYSTEM_NAME} MATCHES FreeBSD
+    AND CMAKE_CXX_COMPILER_ID MATCHES Clang)
+
+  find_program(LD_PROGRAM
+    NAMES ld.lld ld.gold)
+
+  if (NOT LD_PROGRAM)
+    message(FATAL_ERROR
+      "Please set LD_PROGRAM to a working (non-BFD) linker (MESOS-8761) to \
+      build on FreeBSD.")
+  endif ()
+
+  foreach (type EXE SHARED STATIC MODULE)
+    string(APPEND CMAKE_${type}_LINKER_FLAGS " -fuse-ld=${LD_PROGRAM}")
+  endforeach ()
+endif ()
 
 # WINDOWS CONFIGURATION.
 ########################

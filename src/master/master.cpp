@@ -1092,8 +1092,9 @@ void Master::initialize()
   // build directory before 'make install') or determined at build
   // time via the preprocessor macro '-DMESOS_WEBUI_DIR' set in the
   // Makefile.
-  provide("", path::join(flags.webui_dir, "master/static/index.html"));
-  provide("static", path::join(flags.webui_dir, "master/static"));
+  provide("", path::join(flags.webui_dir, "index.html"));
+  provide("app", path::join(flags.webui_dir, "app"));
+  provide("assets", path::join(flags.webui_dir, "assets"));
 
   const PID<Master> masterPid = self();
 
@@ -2432,7 +2433,10 @@ void Master::receive(
       break;
 
     case scheduler::Call::RECONCILE_OPERATIONS:
-      reconcileOperations(framework, call.reconcile_operations());
+      drop(
+          from,
+          call,
+          "'RECONCILE_OPERATIONS' is not supported by the v0 API");
       break;
 
     case scheduler::Call::MESSAGE:
@@ -6472,9 +6476,12 @@ void Master::_registerSlave(
   if (Slave* slave = slaves.registered.get(pid)) {
     if (!slave->connected) {
       // The slave was previously disconnected but it is now trying
-      // to register as a new slave. This could happen if the slave
-      // failed recovery and hence registering as a new slave before
-      // the master removed the old slave from its map.
+      // to register as a new slave.
+      // There are several possible reasons for this to happen:
+      // - If the slave failed recovery and hence registering as a new
+      //   slave before the master removed the old slave from its map.
+      // - If the slave was shutting down while it had a registration
+      //   retry scheduled. See MESOS-8463.
       LOG(INFO) << "Removing old disconnected agent " << *slave
                 << " because a registration attempt occurred";
 
@@ -10820,7 +10827,11 @@ void Master::_apply(
     Operation* operation = new Operation(
         protobuf::createOperation(
             operationInfo,
-            protobuf::createOperationStatus(OPERATION_PENDING),
+            protobuf::createOperationStatus(
+              OPERATION_PENDING,
+              operationInfo.has_id()
+                ? operationInfo.id()
+                : Option<OperationID>::none()),
             framework != nullptr
               ? framework->id()
               : Option<FrameworkID>::none(),

@@ -226,6 +226,9 @@ set(COMMON_SRC
   common/validation.cpp
   common/values.cpp)
 
+set(CSI_SRC
+  csi/paths.cpp)
+
 set(DOCKER_SRC
   docker/docker.cpp
   docker/spec.cpp)
@@ -428,6 +431,7 @@ set(MESOS_SRC
   ${AUTHENTICATION_SRC}
   ${AUTHORIZER_SRC}
   ${COMMON_SRC}
+  ${CSI_SRC}
   ${DOCKER_SRC}
   ${EXECUTOR_SRC}
   ${FILES_SRC}
@@ -523,7 +527,6 @@ if (ENABLE_PRECOMPILED_HEADERS)
   cotire(mesos)
 endif ()
 
-
 # BUILD THE MESOS EXECUTABLES.
 ##############################
 add_subdirectory(checks)
@@ -534,6 +537,7 @@ add_subdirectory(launcher)
 add_subdirectory(local)
 add_subdirectory(log)
 add_subdirectory(master)
+add_subdirectory(python/cli_new)
 add_subdirectory(slave)
 add_subdirectory(slave/containerizer/mesos)
 add_subdirectory(usage)
@@ -542,3 +546,4 @@ add_subdirectory(usage)
 # BUILD THE MESOS TESTS.
 ########################
 add_subdirectory(tests)
+add_subdirectory(python/cli_new/tests)

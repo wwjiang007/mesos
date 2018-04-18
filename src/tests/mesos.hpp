@@ -204,7 +204,8 @@ protected:
   virtual Try<process::Owned<cluster::Slave>> StartSlave(
       mesos::master::detector::MasterDetector* detector,
       slave::GarbageCollector* gc,
-      const Option<slave::Flags>& flags = None());
+      const Option<slave::Flags>& flags = None(),
+      bool mock = false);
 
   // Starts a slave with the specified detector, resource estimator, and flags.
   virtual Try<process::Owned<cluster::Slave>> StartSlave(
@@ -239,7 +240,8 @@ protected:
   virtual Try<process::Owned<cluster::Slave>> StartSlave(
       mesos::master::detector::MasterDetector* detector,
       mesos::Authorizer* authorizer,
-      const Option<slave::Flags>& flags = None());
+      const Option<slave::Flags>& flags = None(),
+      bool mock = false);
 
   // Starts a slave with the specified detector, containerizer, authorizer,
   // and flags.
@@ -247,7 +249,8 @@ protected:
       mesos::master::detector::MasterDetector* detector,
       slave::Containerizer* containerizer,
       mesos::Authorizer* authorizer,
-      const Option<slave::Flags>& flags = None());
+      const Option<slave::Flags>& flags = None(),
+      bool mock = false);
 
   // Starts a slave with the specified detector, containerizer,
   // secretGenerator, authorizer and flags.
@@ -782,6 +785,8 @@ inline void setAgentID(TaskInfo* task, const SlaveID& slaveId)
 {
   task->mutable_slave_id()->CopyFrom(slaveId);
 }
+
+
 inline void setAgentID(
     mesos::v1::TaskInfo* task,
     const mesos::v1::AgentID& agentId)
@@ -3212,6 +3217,18 @@ public:
 };
 
 
+// Definition of a MockGarbageCollector that can be used in tests with gmock.
+class MockGarbageCollector : public slave::GarbageCollector
+{
+public:
+  MockGarbageCollector();
+  virtual ~MockGarbageCollector();
+
+  // The default action is to always return `true`.
+  MOCK_METHOD1(unschedule, process::Future<bool>(const std::string& path));
+};
+
+
 class MockSecretGenerator : public SecretGenerator
 {
 public:
@@ -3583,6 +3600,47 @@ MATCHER_P(TaskStatusUpdateTaskIdEq, taskInfo, "")
 MATCHER_P(TaskStatusUpdateStateEq, taskState, "")
 {
   return arg.status().state() == taskState;
+}
+
+
+// This matcher is used to match the task id of
+// `authorization::Request.Object.TaskInfo`.
+MATCHER_P(AuthorizationRequestHasTaskID, taskId, "")
+{
+  if (!arg.has_object()) {
+    return false;
+  }
+
+  if (!arg.object().has_task_info()) {
+    return false;
+  }
+
+  return arg.object().task_info().task_id() == taskId;
+}
+
+
+// This matcher is used to match the task id of `Option<TaskInfo>`.
+MATCHER_P(OptionTaskHasTaskID, taskId, "")
+{
+  return arg.isNone() ? false : arg->task_id() == taskId;
+}
+
+
+// This matcher is used to match an `Option<TaskGroupInfo>` which contains a
+// task with the specified task id.
+MATCHER_P(OptionTaskGroupHasTaskID, taskId, "")
+{
+  if (arg.isNone()) {
+    return false;
+  }
+
+  foreach(const TaskInfo& taskInfo, arg->tasks()) {
+    if (taskInfo.task_id() == taskId) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 

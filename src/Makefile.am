@@ -33,6 +33,7 @@ GMOCK = $(GOOGLETEST)/googlemock
 GOOGLETEST = 3rdparty/googletest-release-$(GOOGLETEST_VERSION)
 GRPC = 3rdparty/grpc-$(GRPC_VERSION)
 GTEST = $(GOOGLETEST)/googletest
+JEMALLOC = 3rdparty/jemalloc-$(JEMALLOC_VERSION)
 LEVELDB = 3rdparty/leveldb-$(LEVELDB_VERSION)
 LIBPROCESS = 3rdparty/libprocess
 NVML = 3rdparty/nvml-$(NVML_VERSION)
@@ -181,6 +182,17 @@ else
 LIB_GRPC = -lgrpc++ -lgrpc -lgpr -lssl -lcrypto
 GRPC_CPP_PLUGIN = @GRPC_CXX_PLUGIN@
 endif
+endif
+
+if WITH_BUNDLED_JEMALLOC
+# TODO(bennoe): We could call `jemalloc-conf --libs` to get the required
+# libs without hardcoding `-ldl`, but then a version bump could introduce
+# additional dependencies without us being aware of it.
+LIB_JEMALLOC = ../$(JEMALLOC)/lib/libjemalloc_pic.a -ldl
+else
+LIB_JEMALLOC = $(if $(WITH_JEMALLOC),\
+    -L$(WITH_JEMALLOC)/lib -ljemalloc -ldl,\
+    -ljemalloc -ldl)
 endif
 
 if WITH_BUNDLED_LEVELDB
@@ -1524,28 +1536,29 @@ libbuild_la_CPPFLAGS += -DBUILD_FLAGS="\"$$BUILD_FLAGS\""
 libmesos_no_3rdparty_la_LIBADD += libbuild.la
 
 
-if ENABLE_GRPC
 # Convenience library for build the CSI client.
 noinst_LTLIBRARIES += libcsi.la
 libcsi_la_SOURCES =							\
-  csi/paths.cpp								\
-  csi/utils.cpp
-libcsi_la_SOURCES +=							\
-  ../include/csi/spec.hpp						\
-  csi/paths.hpp								\
-  csi/state.hpp								\
-  csi/state.proto							\
-  csi/utils.hpp
+  csi/paths.cpp
 
 libcsi_la_SOURCES +=							\
+  csi/paths.hpp
+
+if ENABLE_GRPC
+libcsi_la_SOURCES +=							\
+  ../include/csi/spec.hpp						\
   csi/client.cpp							\
-  csi/client.hpp
+  csi/client.hpp							\
+  csi/state.hpp								\
+  csi/state.proto							\
+  csi/utils.cpp								\
+  csi/utils.hpp
+endif
 
 nodist_libcsi_la_SOURCES = $(CXX_CSI_PROTOS)
 libcsi_la_CPPFLAGS = $(MESOS_CPPFLAGS)
 
 libmesos_no_3rdparty_la_LIBADD += libcsi.la
-endif
 
 
 # Convenience library for building the replicated log in order to
@@ -1680,6 +1693,11 @@ mesos_local_SOURCES = local/main.cpp
 mesos_local_CPPFLAGS = $(MESOS_CPPFLAGS)
 mesos_local_LDADD = libmesos.la $(LDADD)
 
+if ENABLE_JEMALLOC_ALLOCATOR
+mesos_agent_LDADD += $(LIB_JEMALLOC)
+mesos_master_LDADD  += $(LIB_JEMALLOC)
+endif
+
 pkglibexec_PROGRAMS += mesos-fetcher
 mesos_fetcher_SOURCES = launcher/fetcher.cpp
 mesos_fetcher_CPPFLAGS = $(MESOS_CPPFLAGS)
@@ -1749,11 +1767,6 @@ mesos_log_SOURCES = log/main.cpp
 mesos_log_CPPFLAGS = $(MESOS_CPPFLAGS)
 mesos_log_LDADD = libmesos.la $(LDADD)
 
-bin_PROGRAMS += mesos
-mesos_SOURCES = cli/mesos.cpp
-mesos_CPPFLAGS = $(MESOS_CPPFLAGS)
-mesos_LDADD = libmesos.la $(LDADD)
-
 bin_PROGRAMS += mesos-execute
 mesos_execute_SOURCES = cli/execute.cpp
 mesos_execute_CPPFLAGS = $(MESOS_CPPFLAGS)
@@ -1764,12 +1777,45 @@ mesos_resolve_SOURCES = cli/resolve.cpp
 mesos_resolve_CPPFLAGS = $(MESOS_CPPFLAGS)
 mesos_resolve_LDADD = libmesos.la $(LDADD)
 
+bin_PROGRAMS += mesos
+if ENABLE_NEW_CLI
+MESOS_CLI_SRCDIR = $(srcdir)/python/cli_new
+MESOS_CLI_BUILDDIR = $(builddir)/cli
+MESOS_CLI_HIDDEN_IMPORTS =					\
+	$(patsubst %, --hidden-import cli.plugins.%,		\
+		$(notdir $(shell find				\
+			   $(MESOS_CLI_SRCDIR)/lib/cli/plugins	\
+			     -mindepth 1 -maxdepth 1 -type d)))
+
+mesos: $(shell find $(MESOS_CLI_SRCDIR) | grep -v .virtualenv)
+	@echo "Building the CLI ..."
+	VIRTUALENV_DIRECTORY=$(builddir)/.virtualenv	\
+	$(MESOS_CLI_SRCDIR)/bootstrap &&		\
+	echo "VERSION = \"$(PACKAGE_VERSION)\""		\
+		> $(MESOS_CLI_BUILDDIR)/version.py &&	\
+	source $(builddir)/.virtualenv/bin/activate &&	\
+	python -m PyInstaller -p $(MESOS_CLI_SRCDIR)/lib\
+		$(MESOS_CLI_HIDDEN_IMPORTS)		\
+		--specpath $(MESOS_CLI_BUILDDIR)	\
+		--workpath $(MESOS_CLI_BUILDDIR)/work	\
+		--distpath $(builddir)			\
+		--name $(@)				\
+		--noconfirm				\
+		--onefile				\
+		$(MESOS_CLI_SRCDIR)/bin/main.py
+check_PROGRAMS += mesos
+else
+mesos_SOURCES = cli/mesos.cpp
+mesos_CPPFLAGS = $(MESOS_CPPFLAGS)
+mesos_LDADD = libmesos.la $(LDADD)
+
 # Need to distribute and install mesos-*.
 dist_bin_SCRIPTS +=							\
   cli/mesos-cat								\
   cli/mesos-ps								\
   cli/mesos-scp								\
   cli/mesos-tail
+endif
 
 # Need to distribute/install webui javascript. We use 'pkgdatadir'
 # instead of 'datadir' as the install directory so we get the
@@ -1778,60 +1824,60 @@ dist_bin_SCRIPTS +=							\
 # that 'datadir' (e.g., /usr/local/share) is for read-only "data" and
 # 'sysconfdir' (e.g., /usr/local/var) is for modifiable "data".
 nobase_dist_pkgdata_DATA +=						\
-  webui/master/static/js/app.js						\
-  webui/master/static/js/controllers.js					\
-  webui/master/static/js/jquery.pailer.js				\
-  webui/master/static/js/services.js
+  webui/app/app.js							\
+  webui/app/controllers.js						\
+  webui/app/services.js
 
 # Need to distribute/install webui CSS.
 nobase_dist_pkgdata_DATA +=						\
-  webui/master/static/css/bootstrap-3.3.6.min.css			\
-  webui/master/static/css/bootstrap-table-1.11.1.min.css		\
-  webui/master/static/css/mesos.css
+  webui/assets/css/bootstrap-3.3.6.min.css                              \
+  webui/assets/css/bootstrap-table-1.11.1.min.css\
+  webui/assets/css/mesos.css
 
 # Need to distribute/install webui HTML.
 nobase_dist_pkgdata_DATA +=						\
-  webui/master/static/agent.html					\
-  webui/master/static/agents.html					\
-  webui/master/static/agent_executor.html				\
-  webui/master/static/agent_framework.html				\
-  webui/master/static/browse.html					\
-  webui/master/static/framework.html					\
-  webui/master/static/frameworks.html					\
-  webui/master/static/home.html						\
-  webui/master/static/index.html					\
-  webui/master/static/maintenance.html					\
-  webui/master/static/offers.html					\
-  webui/master/static/pailer.html					\
-  webui/master/static/roles.html					\
-  webui/master/static/directives/pagination.html			\
-  webui/master/static/directives/tableHeader.html			\
-  webui/master/static/directives/timestamp.html
+  webui/index.html							\
+  webui/app/home.html							\
+  webui/app/agents/agent.html						\
+  webui/app/agents/agent-browse.html					\
+  webui/app/agents/agent-executor.html					\
+  webui/app/agents/agent-framework.html					\
+  webui/app/agents/agents.html						\
+  webui/app/frameworks/framework.html					\
+  webui/app/frameworks/frameworks.html					\
+  webui/app/maintenance/maintenance.html				\
+  webui/app/offers/offers.html						\
+  webui/app/roles/roles.html						\
+  webui/app/shared/pagination.html					\
+  webui/app/shared/pailer.html						\
+  webui/app/shared/table-header.html					\
+  webui/app/shared/timestamp.html
 
 # Need to distribute/install webui images.
 nobase_dist_pkgdata_DATA +=						\
-  webui/master/static/ico/favicon.ico					\
-  webui/master/static/img/loading.gif					\
-  webui/master/static/img/mesos_logo.png
+  webui/assets/ico/favicon.ico						\
+  webui/assets/img/loading.gif						\
+  webui/assets/img/mesos-logo.png
 
 # Need to distribute/install webui fonts.
 nobase_dist_pkgdata_DATA +=						\
-  webui/master/static/fonts/glyphicons-halflings-regular.eot		\
-  webui/master/static/fonts/glyphicons-halflings-regular.svg		\
-  webui/master/static/fonts/glyphicons-halflings-regular.ttf		\
-  webui/master/static/fonts/glyphicons-halflings-regular.woff		\
-  webui/master/static/fonts/glyphicons-halflings-regular.woff2
+  webui/assets/fonts/glyphicons-halflings-regular.eot			\
+  webui/assets/fonts/glyphicons-halflings-regular.svg			\
+  webui/assets/fonts/glyphicons-halflings-regular.ttf			\
+  webui/assets/fonts/glyphicons-halflings-regular.woff			\
+  webui/assets/fonts/glyphicons-halflings-regular.woff2
 
 # Need to distribute/install third-party javascript.
 nobase_dist_pkgdata_DATA +=						\
-  webui/master/static/js/angular-1.2.32.min.js				\
-  webui/master/static/js/angular-route-1.2.32.min.js			\
-  webui/master/static/js/bootstrap-table-1.11.1.min.js			\
-  webui/master/static/js/clipboard-1.5.16.min.js			\
-  webui/master/static/js/jquery-3.2.1.min.js				\
-  webui/master/static/js/relative-date.js				\
-  webui/master/static/js/ui-bootstrap-tpls-0.9.0.min.js			\
-  webui/master/static/js/underscore-1.4.3.min.js
+  webui/assets/libs/angular-1.2.32.min.js				\
+  webui/assets/libs/angular-route-1.2.32.min.js				\
+  webui/assets/libs/bootstrap-table-1.11.1.min.js			\
+  webui/assets/libs/clipboard-1.5.16.min.js				\
+  webui/assets/libs/jquery-3.2.1.min.js					\
+  webui/assets/libs/jquery.pailer.js					\
+  webui/assets/libs/relative-date.js					\
+  webui/assets/libs/ui-bootstrap-tpls-0.9.0.min.js			\
+  webui/assets/libs/underscore-1.4.3.min.js
 
 # And the deploy related stuff.
 nodist_sbin_SCRIPTS +=							\
@@ -2788,6 +2834,10 @@ uninstall-hook:
 # http://lists.gnu.org/archive/html/automake/2013-01/msg00051.html
 check-local: tests
 	$(TEST_DRIVER) ./mesos-tests
+if ENABLE_NEW_CLI
+	@source $(builddir)/.virtualenv/bin/activate;	\
+	 $(MESOS_CLI_SRCDIR)/bin/mesos-cli-tests
+endif
 
 if INSTALL_TESTS
 # If we enabled test installation, we can run the tests from the

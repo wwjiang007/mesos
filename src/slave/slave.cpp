@@ -2152,22 +2152,154 @@ void Slave::run(
     }
   }
 
-  // Run the task after the unschedules are done.
-  collect(unschedules)
-    .onAny(defer(self(),
-                 &Self::_run,
-                 lambda::_1,
-                 frameworkInfo,
-                 executorInfo,
-                 task,
-                 taskGroup,
-                 resourceVersionUuids,
-                 launchExecutor));
+  auto onUnscheduleGCFailure =
+    [=](const Future<list<bool>>& unschedules) -> Future<list<bool>> {
+      LOG(ERROR) << "Failed to unschedule directories scheduled for gc: "
+                 << unschedules.failure();
+
+      Framework* _framework = getFramework(frameworkId);
+      if (_framework == nullptr) {
+        const string error =
+          "Cannot handle unschedule GC failure for " +
+          taskOrTaskGroup(task, taskGroup) + " because the framework " +
+          stringify(frameworkId) + " does not exist";
+
+        LOG(WARNING) << error;
+
+        return Failure(error);
+      }
+
+      // We report TASK_DROPPED to the framework because the task was
+      // never launched. For non-partition-aware frameworks, we report
+      // TASK_LOST for backward compatibility.
+      mesos::TaskState taskState = TASK_DROPPED;
+      if (!protobuf::frameworkHasCapability(
+              frameworkInfo, FrameworkInfo::Capability::PARTITION_AWARE)) {
+        taskState = TASK_LOST;
+      }
+
+      foreach (const TaskInfo& _task, tasks) {
+        _framework->removePendingTask(_task.task_id());
+
+        const StatusUpdate update = protobuf::createStatusUpdate(
+            frameworkId,
+            info.id(),
+            _task.task_id(),
+            taskState,
+            TaskStatus::SOURCE_SLAVE,
+            id::UUID::random(),
+            "Could not launch the task because we failed to unschedule"
+            " directories scheduled for gc",
+            TaskStatus::REASON_GC_ERROR);
+
+        // TODO(vinod): Ensure that the task status update manager
+        // reliably delivers this update. Currently, we don't guarantee
+        // this because removal of the framework causes the status
+        // update manager to stop retrying for its un-acked updates.
+        statusUpdate(update, UPID());
+      }
+
+      if (_framework->idle()) {
+        removeFramework(_framework);
+      }
+
+      return unschedules;
+  };
+
+  // `taskLaunch` encapsulates each task's launch steps from this point
+  // to the end of `_run` (the completion of task authorization).
+  Future<Nothing> taskLaunch = collect(unschedules)
+    // Handle the failure iff unschedule GC fails.
+    .repair(defer(self(), onUnscheduleGCFailure))
+    // If unschedule GC succeeds, trigger the next continuation.
+    .then(defer(
+        self(),
+        &Self::_run,
+        frameworkInfo,
+        executorInfo,
+        task,
+        taskGroup,
+        resourceVersionUuids,
+        launchExecutor));
+
+  // Use a sequence to ensure that task launch order is preserved.
+  framework->taskLaunchSequences[executorId]
+    .add<Nothing>([taskLaunch]() -> Future<Nothing> {
+      // We use this sequence only to maintain the task launching order. If the
+      // sequence is deleted, we do not want the resulting discard event to
+      // propagate up the chain, which would prevent the previous `.then()` or
+      // `.repair()` callbacks from being invoked. Thus, we use `undiscardable`
+      // to protect each `taskLaunch`.
+      return undiscardable(taskLaunch);
+    })
+    // We register `onAny` on the future returned by the sequence (referred to
+    // as `seqFuture` below). The following scenarios could happen:
+    //
+    // (1) `seqFuture` becomes ready. This happens when all previous tasks'
+    // `taskLaunch` futures are in non-pending state AND this task's own
+    // `taskLaunch` future is in ready state. The `onReady` call registered
+    // below will be triggered and continue the success path.
+    //
+    // (2) `seqFuture` becomes failed. This happens when all previous tasks'
+    // `taskLaunch` futures are in non-pending state AND this task's own
+    // `taskLaunch` future is in failed state (e.g. due to unschedule GC
+    // failure or some other failure). The `onFailed` call registered below
+    // will be triggered to handle the failure.
+    //
+    // (3) `seqFuture` becomes discarded. This happens when the sequence is
+    // destructed (see declaration of `taskLaunchSequences` on its lifecycle)
+    // while the `seqFuture` is still pending. In this case, we wait until
+    // this task's own `taskLaunch` future becomes non-pending and trigger
+    // callbacks accordingly.
+    //
+    // TODO(mzhu): In case (3), the destruction of the sequence means that the
+    // agent will eventually discover that the executor is absent and drop
+    // the task. While `__run` is capable of handling this case, it is more
+    // optimal to handle the failure earlier here rather than waiting for
+    // the `taskLaunch` transition and directing control to `__run`.
+    .onAny(defer(self(), [=](const Future<Nothing>&) {
+      // We only want to execute the following callbacks once the work performed
+      // in the `taskLaunch` chain is complete. Thus, we add them onto the
+      // `taskLaunch` chain rather than dispatching directly.
+      taskLaunch
+        .onReady(defer(
+            self(),
+            &Self::__run,
+            frameworkInfo,
+            executorInfo,
+            task,
+            taskGroup,
+            resourceVersionUuids,
+            launchExecutor))
+        .onFailed(defer(self(), [=](const string& failure) {
+          Framework* _framework = getFramework(frameworkId);
+          if (_framework == nullptr) {
+            LOG(WARNING) << "Ignoring running "
+                         << taskOrTaskGroup(task, taskGroup)
+                         << " because the framework " << stringify(frameworkId)
+                         << " does not exist";
+          }
+
+          if (launchExecutor.isSome() && launchExecutor.get()) {
+            // Master expects a new executor to be launched for this task(s).
+            // To keep the master executor entries updated, the agent needs to
+            // send `ExitedExecutorMessage` even though no executor launched.
+            sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
+
+            // See the declaration of `taskLaunchSequences` regarding its
+            // lifecycle management.
+            if (_framework != nullptr) {
+              _framework->taskLaunchSequences.erase(executorInfo.executor_id());
+            }
+          }
+        }));
+    }));
+
+  // TODO(mzhu): Consolidate error handling code in `__run` here.
 }
 
 
-void Slave::_run(
-    const Future<list<bool>>& unschedules,
+Future<Nothing> Slave::_run(
     const FrameworkInfo& frameworkInfo,
     const ExecutorInfo& executorInfo,
     const Option<TaskInfo>& task,
@@ -2192,26 +2324,24 @@ void Slave::_run(
   const FrameworkID& frameworkId = frameworkInfo.id();
   Framework* framework = getFramework(frameworkId);
   if (framework == nullptr) {
-    LOG(WARNING) << "Ignoring running " << taskOrTaskGroup(task, taskGroup)
-                 << " because the framework " << frameworkId
-                 << " does not exist";
+    const string error =
+      "Ignoring running " + taskOrTaskGroup(task, taskGroup) +
+      " because the framework " + stringify(frameworkId) + " does not exist";
 
-    if (launchExecutor.isSome() && launchExecutor.get()) {
-      // Master expects new executor to be launched for this task(s) launch.
-      // To keep the master executor entries updated, the agent needs to send
-      // 'ExitedExecutorMessage' even though no executor launched.
-      sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
-    }
+    LOG(WARNING) << error;
 
-    return;
+    return Failure(error);
   }
 
   // We don't send a status update here because a terminating
   // framework cannot send acknowledgements.
   if (framework->state == Framework::TERMINATING) {
-    LOG(WARNING) << "Ignoring running " << taskOrTaskGroup(task, taskGroup)
-                 << " of framework " << frameworkId
-                 << " because the framework is terminating";
+    const string error = "Ignoring running " +
+                         taskOrTaskGroup(task, taskGroup) + " of framework " +
+                         stringify(frameworkId) +
+                         " because the framework is terminating";
+
+    LOG(WARNING) << error;
 
     // Although we cannot send a status update in this case, we remove
     // the affected tasks from the pending tasks.
@@ -2223,14 +2353,7 @@ void Slave::_run(
       removeFramework(framework);
     }
 
-    if (launchExecutor.isSome() && launchExecutor.get()) {
-      // Master expects new executor to be launched for this task(s) launch.
-      // To keep the master executor entries updated, the agent needs to send
-      // 'ExitedExecutorMessage' even though no executor launched.
-      sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
-    }
-
-    return;
+    return Failure(error);
   }
 
   // Ignore the launch if killed in the interim. The invariant here
@@ -2251,69 +2374,14 @@ void Slave::_run(
     << " was partially killed";
 
   if (allRemoved) {
-    LOG(WARNING) << "Ignoring running " << taskOrTaskGroup(task, taskGroup)
-                 << " of framework " << frameworkId
-                 << " because it has been killed in the meantime";
+    const string error = "Ignoring running " +
+                         taskOrTaskGroup(task, taskGroup) + " of framework " +
+                         stringify(frameworkId) +
+                         " because it has been killed in the meantime";
 
-    if (launchExecutor.isSome() && launchExecutor.get()) {
-      // Master expects new executor to be launched for this task(s) launch.
-      // To keep the master executor entries updated, the agent needs to send
-      // 'ExitedExecutorMessage' even though no executor launched.
-      sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
-    }
+    LOG(WARNING) << error;
 
-    return;
-  }
-
-  CHECK(!unschedules.isDiscarded());
-
-  if (!unschedules.isReady()) {
-    LOG(ERROR) << "Failed to unschedule directories scheduled for gc: "
-               << (unschedules.isFailed() ?
-                   unschedules.failure() : "future discarded");
-
-    // We report TASK_DROPPED to the framework because the task was
-    // never launched. For non-partition-aware frameworks, we report
-    // TASK_LOST for backward compatibility.
-    mesos::TaskState taskState = TASK_DROPPED;
-    if (!protobuf::frameworkHasCapability(
-            frameworkInfo, FrameworkInfo::Capability::PARTITION_AWARE)) {
-      taskState = TASK_LOST;
-    }
-
-    foreach (const TaskInfo& _task, tasks) {
-      framework->removePendingTask(_task.task_id());
-
-      const StatusUpdate update = protobuf::createStatusUpdate(
-          frameworkId,
-          info.id(),
-          _task.task_id(),
-          taskState,
-          TaskStatus::SOURCE_SLAVE,
-          id::UUID::random(),
-          "Could not launch the task because we failed to unschedule"
-          " directories scheduled for gc",
-          TaskStatus::REASON_GC_ERROR);
-
-      // TODO(vinod): Ensure that the task status update manager
-      // reliably delivers this update. Currently, we don't guarantee
-      // this because removal of the framework causes the status
-      // update manager to stop retrying for its un-acked updates.
-      statusUpdate(update, UPID());
-    }
-
-    if (framework->idle()) {
-      removeFramework(framework);
-    }
-
-    if (launchExecutor.isSome() && launchExecutor.get()) {
-      // Master expects new executor to be launched for this task(s) launch.
-      // To keep the master executor entries updated, the agent needs to send
-      // 'ExitedExecutorMessage' even though no executor launched.
-      sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
-    }
-
-    return;
+    return Failure(error);
   }
 
   // Authorize the task or tasks (as in a task group) to ensure that the
@@ -2328,21 +2396,105 @@ void Slave::_run(
     authorizations.push_back(authorizeTask(_task, frameworkInfo));
   }
 
-  collect(authorizations)
-    .onAny(defer(self(),
-                 &Self::__run,
-                 lambda::_1,
-                 frameworkInfo,
-                 executorInfo,
-                 task,
-                 taskGroup,
-                 resourceVersionUuids,
-                 launchExecutor));
+  auto onTaskAuthorizationFailure =
+    [=](const string& error, Framework* _framework) {
+      CHECK_NOTNULL(_framework);
+
+      // For failed authorization, we send a TASK_ERROR status update
+      // for all tasks.
+      const TaskStatus::Reason reason = task.isSome()
+        ? TaskStatus::REASON_TASK_UNAUTHORIZED
+        : TaskStatus::REASON_TASK_GROUP_UNAUTHORIZED;
+
+      LOG(ERROR) << "Authorization failed for "
+                 << taskOrTaskGroup(task, taskGroup) << " of framework "
+                 << frameworkId << ": " << error;
+
+      foreach (const TaskInfo& _task, tasks) {
+        _framework->removePendingTask(_task.task_id());
+
+        const StatusUpdate update = protobuf::createStatusUpdate(
+            frameworkId,
+            info.id(),
+            _task.task_id(),
+            TASK_ERROR,
+            TaskStatus::SOURCE_SLAVE,
+            id::UUID::random(),
+            error,
+            reason);
+
+        statusUpdate(update, UPID());
+      }
+
+      if (_framework->idle()) {
+        removeFramework(_framework);
+      }
+  };
+
+  return collect(authorizations)
+    .repair(defer(self(),
+      [=](const Future<list<bool>>& future) -> Future<list<bool>> {
+        Framework* _framework = getFramework(frameworkId);
+        if (_framework == nullptr) {
+          const string error =
+            "Authorization failed for " + taskOrTaskGroup(task, taskGroup) +
+            " because the framework " + stringify(frameworkId) +
+            " does not exist";
+
+            LOG(WARNING) << error;
+
+          return Failure(error);
+        }
+
+        const string error =
+          "Failed to authorize " + taskOrTaskGroup(task, taskGroup) +
+          ": " + future.failure();
+
+        onTaskAuthorizationFailure(error, _framework);
+
+        return future;
+      }
+    ))
+    .then(defer(self(),
+      [=](const Future<list<bool>>& future) -> Future<Nothing> {
+        Framework* _framework = getFramework(frameworkId);
+        if (_framework == nullptr) {
+          const string error =
+            "Ignoring running " + taskOrTaskGroup(task, taskGroup) +
+            " because the framework " + stringify(frameworkId) +
+            " does not exist";
+
+            LOG(WARNING) << error;
+
+          return Failure(error);
+        }
+
+        list<bool> authorizations = future.get();
+
+        foreach (const TaskInfo& _task, tasks) {
+          bool authorized = authorizations.front();
+          authorizations.pop_front();
+
+          // If authorization for this task fails, we fail all tasks (in case
+          // of a task group) with this specific error.
+          if (!authorized) {
+            const string error =
+              "Framework " + stringify(frameworkId) +
+              " is not authorized to launch task " + stringify(_task);
+
+            onTaskAuthorizationFailure(error, _framework);
+
+            return Failure(error);
+          }
+        }
+
+        return Nothing();
+      }
+    ));
 }
 
 
 void Slave::__run(
-    const Future<list<bool>>& future,
     const FrameworkInfo& frameworkInfo,
     const ExecutorInfo& executorInfo,
     const Option<TaskInfo>& task,
@@ -2370,10 +2522,13 @@ void Slave::__run(
                  << " does not exist";
 
     if (launchExecutor.isSome() && launchExecutor.get()) {
-      // Master expects new executor to be launched for this task(s) launch.
+      // Master expects a new executor to be launched for this task(s).
       // To keep the master executor entries updated, the agent needs to send
-      // 'ExitedExecutorMessage' even though no executor launched.
+      // `ExitedExecutorMessage` even though no executor launched.
       sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
+
+      // There is no need to clean up the task launch sequence here since
+      // the framework (along with the sequence) no longer exists.
     }
 
     return;
@@ -2399,10 +2554,14 @@ void Slave::__run(
     }
 
     if (launchExecutor.isSome() && launchExecutor.get()) {
-      // Master expects new executor to be launched for this task(s) launch.
+      // Master expects a new executor to be launched for this task(s).
       // To keep the master executor entries updated, the agent needs to send
-      // 'ExitedExecutorMessage' even though no executor launched.
+      // `ExitedExecutorMessage` even though no executor launched.
       sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
+
+      // See the declaration of `taskLaunchSequences` regarding its lifecycle
+      // management.
+      framework->taskLaunchSequences.erase(executorInfo.executor_id());
     }
 
     return;
@@ -2431,10 +2590,14 @@ void Slave::__run(
                  << " because it has been killed in the meantime";
 
     if (launchExecutor.isSome() && launchExecutor.get()) {
-      // Master expects new executor to be launched for this task(s) launch.
+      // Master expects a new executor to be launched for this task(s).
       // To keep the master executor entries updated, the agent needs to send
-      // 'ExitedExecutorMessage' even though no executor launched.
+      // `ExitedExecutorMessage` even though no executor launched.
       sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
+
+      // See the declaration of `taskLaunchSequences` regarding its lifecycle
+      // management.
+      framework->taskLaunchSequences.erase(executorInfo.executor_id());
     }
 
     return;
@@ -2442,85 +2605,6 @@ void Slave::__run(
 
   foreach (const TaskInfo& _task, tasks) {
     CHECK(framework->removePendingTask(_task.task_id()));
-  }
-
-  CHECK(!future.isDiscarded());
-
-  // Validate that the task (or tasks in case of task group) are authorized
-  // to be run on this agent.
-  Option<Error> error = None();
-  if (!future.isReady()) {
-    error = Error("Failed to authorize " + taskOrTaskGroup(task, taskGroup) +
-                  ": " + future.failure());
-  }
-
-  if (error.isNone()) {
-    list<bool> authorizations = future.get();
-
-    foreach (const TaskInfo& _task, tasks) {
-      bool authorized = authorizations.front();
-      authorizations.pop_front();
-
-      // If authorization for this task fails, we fail all tasks (in case of
-      // a task group) with this specific error.
-      if (!authorized) {
-        string user = frameworkInfo.user();
-
-        if (_task.has_command() && _task.command().has_user()) {
-          user = _task.command().user();
-        } else if (executorInfo.has_command() &&
-                   executorInfo.command().has_user()) {
-          user = executorInfo.command().user();
-        }
-
-        error = Error("Task '" + stringify(_task.task_id()) + "'"
-                      " is not authorized to launch as"
-                      " user '" + user + "'");
-
-        break;
-      }
-    }
-  }
-
-  // For failed authorization, we send a TASK_ERROR status update for
-  // all tasks.
-  if (error.isSome()) {
-    const TaskStatus::Reason reason = task.isSome()
-      ? TaskStatus::REASON_TASK_UNAUTHORIZED
-      : TaskStatus::REASON_TASK_GROUP_UNAUTHORIZED;
-
-    LOG(ERROR) << "Ignoring running " << taskOrTaskGroup(task, taskGroup)
-               << " of framework " << frameworkId
-               << ": " << error->message;
-
-    foreach (const TaskInfo& _task, tasks) {
-      const StatusUpdate update = protobuf::createStatusUpdate(
-          frameworkId,
-          info.id(),
-          _task.task_id(),
-          TASK_ERROR,
-          TaskStatus::SOURCE_SLAVE,
-          id::UUID::random(),
-          error->message,
-          reason);
-
-      statusUpdate(update, UPID());
-    }
-
-    // Refer to the comment after 'framework->removePendingTask' above
-    // for why we need this.
-    if (framework->idle()) {
-      removeFramework(framework);
-    }
-
-    if (launchExecutor.isSome() && launchExecutor.get()) {
-      // Master expects new executor to be launched for this task(s) launch.
-      // To keep the master executor entries updated, the agent needs to send
-      // 'ExitedExecutorMessage' even though no executor launched.
-      sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
-    }
-
-    return;
   }
 
   // Check task invariants.
@@ -2601,10 +2685,14 @@ void Slave::__run(
     }
 
     if (launchExecutor.isSome() && launchExecutor.get()) {
-      // Master expects new executor to be launched for this task(s) launch.
+      // Master expects a new executor to be launched for this task(s).
       // To keep the master executor entries updated, the agent needs to send
-      // 'ExitedExecutorMessage' even though no executor launched.
+      // `ExitedExecutorMessage` even though no executor launched.
       sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
+
+      // See the declaration of `taskLaunchSequences` regarding its lifecycle
+      // management.
+      framework->taskLaunchSequences.erase(executorInfo.executor_id());
     }
 
     return;
@@ -2675,10 +2763,14 @@ void Slave::__run(
     }
 
     if (launchExecutor.isSome() && launchExecutor.get()) {
-      // Master expects new executor to be launched for this task(s) launch.
+      // Master expects a new executor to be launched for this task(s).
       // To keep the master executor entries updated, the agent needs to send
-      // 'ExitedExecutorMessage' even though no executor launched.
+      // `ExitedExecutorMessage` even though no executor launched.
       sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
+
+      // See the declaration of `taskLaunchSequences` regarding its lifecycle
+      // management.
+      framework->taskLaunchSequences.erase(executorInfo.executor_id());
     }
 
     return;
@@ -2735,10 +2827,14 @@ void Slave::__run(
     }
 
     if (launchExecutor.isSome() && launchExecutor.get()) {
-      // Master expects new executor to be launched for this task(s) launch.
+      // Master expects a new executor to be launched for this task(s).
       // To keep the master executor entries updated, the agent needs to send
-      // 'ExitedExecutorMessage' even though no executor launched.
+      // `ExitedExecutorMessage` even though no executor launched.
       sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
+
+      // See the declaration of `taskLaunchSequences` regarding its lifecycle
+      // management.
+      framework->taskLaunchSequences.erase(executorInfo.executor_id());
     }
 
     return;
@@ -2845,9 +2941,9 @@ void Slave::__run(
             statusUpdate(update, UPID());
           }
 
-          // Master expects new executor to be launched for this task(s) launch.
+          // Master expects a new executor to be launched for this task(s).
           // To keep the master executor entries updated, the agent needs to
-          // send 'ExitedExecutorMessage' even though no executor launched.
+          // send `ExitedExecutorMessage` even though no executor launched.
           if (executor->state == Executor::TERMINATED) {
             sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
           } else {
@@ -4267,6 +4363,10 @@ void Slave::applyOperation(const ApplyOperationMessage& message)
     ? message.framework_id()
     : Option<FrameworkID>::none();
 
+  Option<OperationID> operationId = message.operation_info().has_id()
+    ? message.operation_info().id()
+    : Option<OperationID>::none();
+
   Result<ResourceProviderID> resourceProviderId =
     getResourceProviderId(message.operation_info());
 
@@ -4286,7 +4386,7 @@ void Slave::applyOperation(const ApplyOperationMessage& message)
   Operation* operation = new Operation(
       protobuf::createOperation(
           message.operation_info(),
-          protobuf::createOperationStatus(OPERATION_PENDING),
+          protobuf::createOperationStatus(OPERATION_PENDING, operationId),
           frameworkId,
           info.id(),
           uuid));
@@ -4320,7 +4420,7 @@ void Slave::applyOperation(const ApplyOperationMessage& message)
   UpdateOperationStatusMessage update =
     protobuf::createUpdateOperationStatusMessage(
         uuid,
-        protobuf::createOperationStatus(OPERATION_FINISHED),
+        protobuf::createOperationStatus(OPERATION_FINISHED, operationId),
         None(),
         frameworkId,
         info.id());
@@ -8921,6 +9021,10 @@ void Framework::destroyExecutor(const ExecutorID& executorId)
   if (executors.contains(executorId)) {
     Executor* executor = executors[executorId];
     executors.erase(executorId);
+
+    // See the declaration of `taskLaunchSequences` regarding its
+    // lifecycle management.
+    taskLaunchSequences.erase(executorId);
 
     // Pass ownership of the executor pointer.
     completedExecutors.push_back(Owned<Executor>(executor));

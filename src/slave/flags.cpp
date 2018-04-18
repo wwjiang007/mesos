@@ -498,7 +498,7 @@ mesos::internal::slave::Flags::Flags()
       "For partition-aware frameworks, it makes sense to set this higher\n"
       "than the timeout that the framework uses to give up on the task,\n"
       "otherwise the executor might terminate even if the task could still\n"
-      "sucessfully reconnect to the framework.",
+      "successfully reconnect to the framework.",
       RECOVERY_TIMEOUT);
 
   add(&Flags::reconfiguration_policy,
@@ -1393,6 +1393,17 @@ mesos::internal::slave::Flags::Flags()
       "NOTE: Currently Mesos doesn't listen on IPv6 sockets and hence\n"
       "this IPv6 address is only used to advertise IPv6 addresses for\n"
       "containers running on the host network.\n");
+
+  // TODO(bevers): Switch the default to `true` after gathering
+  // some real-world experience.
+  add(&Flags::memory_profiling,
+      "memory_profiling",
+      "This setting controls whether the memory profiling functionality of\n"
+      "libprocess should be exposed when jemalloc is detected.\n"
+      "NOTE: Even if set to true, memory profiling will not work unless\n"
+      "jemalloc is loaded into the address space of the binary, either by\n"
+      "linking against it at compile-time or using `LD_PRELOAD`.",
+      false);
 
   add(&Flags::domain,
       "domain",
