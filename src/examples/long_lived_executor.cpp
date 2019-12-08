@@ -63,10 +63,10 @@ public:
       executorId(_executorId),
       state(DISCONNECTED) {}
 
-  virtual ~LongLivedExecutor() = default;
+  ~LongLivedExecutor() override = default;
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // We initialize the library here to ensure that callbacks are only invoked
     // after the process has spawned.
@@ -132,6 +132,7 @@ protected:
 
         case Event::KILL:
         case Event::MESSAGE:
+        case Event::HEARTBEAT:
         case Event::SHUTDOWN: {
           break;
         }

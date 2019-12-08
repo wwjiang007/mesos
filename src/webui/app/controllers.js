@@ -63,6 +63,16 @@
     return url;
   }
 
+  function leadingMasterURLPrefix(leader_info) {
+    if (leader_info) {
+      return '//' + leader_info.hostname + ':' + leader_info.port;
+    }
+
+    // If we do not have `leader_info` available (e.g. the first
+    // time we are retrieving state), fallback to the current master.
+    return '';
+  }
+
   // Invokes the pailer, building the endpoint URL with the specified urlPrefix
   // and path.
   function pailer(urlPrefix, path, window_title) {
@@ -188,6 +198,17 @@
     $scope.unreachable_agents = $scope.state.unreachable_slaves;
 
     _.each($scope.state.slaves, function(agent) {
+      // Calculate the agent "state" from activation and drain state.
+      if (!agent.deactivated) {
+        agent.state = "Active";
+      } else if (agent.drain_info) {
+        // Transform the drain state so only the first letter is capitalized.
+        var s = agent.drain_info.state;
+        agent.state = s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+      } else {
+        agent.state = "Deactivated";
+      }
+
       $scope.agents[agent.id] = agent;
       $scope.total_cpus += agent.resources.cpus;
       $scope.total_gpus += agent.resources.gpus;
@@ -440,18 +461,6 @@
       if (!matched) $scope.navbarActiveTab = null;
     });
 
-    var leadingMasterURL = function(path) {
-      // Use current location as address in case we could not find the
-      // leading master.
-      var address = location.hostname + ':' + location.port;
-      if ($scope.state && $scope.state.leader_info) {
-          address = $scope.state.leader_info.hostname + ':' +
-                    $scope.state.leader_info.port;
-      }
-
-      return '//' + address + path;
-    }
-
     var popupErrorModal = function() {
       if ($scope.delay >= 128000) {
         $scope.delay = 2000;
@@ -511,7 +520,13 @@
       // the leading master automatically. This would cause a CORS error if we
       // use XMLHttpRequest here. To avoid the CORS error, we use JSONP as a
       // workaround. Please refer to MESOS-5911 for further details.
-      $http.jsonp(leadingMasterURL('/master/state?jsonp=JSON_CALLBACK'))
+      //
+      // Note that `$scope.state` will not be defined during the first
+      // request.
+      var leader_info = $scope.state ? $scope.state.leader_info : null;
+
+      $http.jsonp(leadingMasterURLPrefix(leader_info) +
+                  '/master/state?jsonp=JSON_CALLBACK')
         .success(function(response) {
           if (updateState($scope, $timeout, response)) {
             $scope.delay = updateInterval(_.size($scope.agents));
@@ -526,7 +541,10 @@
     };
 
     var pollMetrics = function() {
-      $http.jsonp(leadingMasterURL('/metrics/snapshot?jsonp=JSON_CALLBACK'))
+      var leader_info = $scope.state ? $scope.state.leader_info : null;
+
+      $http.jsonp(leadingMasterURLPrefix(leader_info) +
+                  '/metrics/snapshot?jsonp=JSON_CALLBACK')
         .success(function(response) {
           if (updateMetrics($scope, $timeout, response)) {
             $scope.delay = updateInterval(_.size($scope.agents));
@@ -548,29 +566,25 @@
     pollMetrics();
   }]);
 
-  mesosApp.controller('HomeCtrl', function($scope, $http) {
+  mesosApp.controller('HomeCtrl', function($scope) {
     var hostname = $scope.$location.host() + ':' + $scope.$location.port();
 
     var update = function() {
       $scope.streamLogs = function(_$event) {
         pailer(
-            '//' + hostname,
+            leadingMasterURLPrefix($scope.state.leader_info),
             '/master/log',
             'Mesos Master (' + hostname + ')');
       };
 
-      // We must query the '/flags' endpoint of *this* master since
-      // `$scope.state` contains the leader master state.
-      $http.jsonp('//' + hostname + '/flags?jsonp=JSON_CALLBACK')
-        .success(function (response) {
-          // The master attaches a "/master/log" file when either
-          // of these flags are set.
-          $scope.log_file_attached = response.flags.external_log_file || response.flags.log_dir;
-        })
-        .error(function(reason) {
-          $scope.alert_message = 'Failed to get master flags: ' + reason;
-          $('#alert').show();
-        });
+      // Note that we always show the leader's log, which is why
+      // we examine the leader's flags to determine whether the
+      // log file is attached.
+      $scope.log_file_attached =
+        $scope.state.flags.external_log_file || $scope.state.flags.log_dir;
+
+      $scope.leader_url_prefix =
+        leadingMasterURLPrefix($scope.state.leader_info);
     };
 
     if ($scope.state) {
@@ -585,9 +599,8 @@
 
   mesosApp.controller('RolesCtrl', function($scope, $http) {
     var update = function() {
-      // TODO(haosdent): Send requests to the leading master directly
-      // once `leadingMasterURL` is public.
-      $http.jsonp('master/roles?jsonp=JSON_CALLBACK')
+      $http.jsonp(leadingMasterURLPrefix($scope.state.leader_info) +
+                  '/master/roles?jsonp=JSON_CALLBACK')
       .success(function(response) {
         $scope.roles = response;
       })
@@ -602,6 +615,15 @@
       update();
     }
 
+    $scope.show_weight = false;
+    $scope.show_framework_count = false;
+    $scope.show_offered = false;
+    $scope.show_allocated = true;
+    $scope.show_reserved = true;
+    $scope.show_quota_consumption = true;
+    $scope.show_quota_guarantee = false;
+    $scope.show_quota_limit = true;
+
     var removeListener = $scope.$on('state_updated', update);
     $scope.$on('$routeChangeStart', removeListener);
   });
@@ -610,9 +632,8 @@
 
   mesosApp.controller('MaintenanceCtrl', function($scope, $http) {
     var update = function() {
-      // TODO(haosdent): Send requests to the leading master directly
-      // once `leadingMasterURL` is public.
-      $http.jsonp('master/maintenance/schedule?jsonp=JSON_CALLBACK')
+      $http.jsonp(leadingMasterURLPrefix($scope.state.leader_info) +
+                  '/master/maintenance/schedule?jsonp=JSON_CALLBACK')
       .success(function(response) {
         $scope.maintenance = response;
       })
@@ -687,17 +708,25 @@
       }
 
       $http.jsonp(agentURLPrefix(agent, true) + '/state?jsonp=JSON_CALLBACK')
-        .success(function (response) {
+        .success(function(response) {
           $scope.state = response;
 
           $scope.agent = {};
           $scope.agent.frameworks = {};
           $scope.agent.completed_frameworks = {};
+          $scope.agent.resource_providers = {};
           $scope.agent.url_prefix = agentURLPrefix(agent, false);
 
           // The agent attaches a "/slave/log" file when either
           // of these flags are set.
           $scope.agent.log_file_attached = $scope.state.external_log_file || $scope.state.log_dir;
+
+          $scope.agent.drain_config = response.drain_config;
+          if (response.estimated_drain_start_time_seconds && response.drain_config.max_grace_period) {
+            $scope.agent.estimated_drain_end_time_seconds =
+              response.estimated_drain_start_time_seconds +
+              (response.drain_config.max_grace_period.nanoseconds / 1000000000);
+          }
 
           // Convert the reserved resources map into an array for inclusion
           // in an `ng-repeat` table.
@@ -706,6 +735,28 @@
               reservation.role = role;
               return reservation;
             });
+
+          // Compute resource provider information.
+          _.each($scope.state.resource_providers, function(provider) {
+            // Store a summarized representation of the resource provider's
+            // total scalar resources in the `total_resources` field; the full
+            // original data is available under `total_resources_full`.
+            provider.total_resources_full = _.clone(provider.total_resources);
+            // provider.total_resources = {};
+            _.each(provider.total_resources_full, function(resource) {
+              if (resource.type != "SCALAR") {
+                return;
+              }
+
+              if (!provider.total_resources[resource.name]) {
+                provider.total_resources[resource.name] = 0;
+              }
+
+              provider.total_resources[resource.name] += resource.scalar.value;
+            });
+
+            $scope.agent.resource_providers[provider.resource_provider_info.id.value] = provider;
+          });
 
           // Computes framework stats by setting new attributes on the 'framework'
           // object.

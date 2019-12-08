@@ -40,8 +40,6 @@
 
 #include "tests/mesos.hpp"
 
-namespace authentication = process::http::authentication;
-
 using process::Future;
 using process::Owned;
 
@@ -53,6 +51,8 @@ using process::http::Response;
 using process::http::Unauthorized;
 
 using process::http::authentication::Principal;
+using process::http::authentication::setAuthenticator;
+using process::http::authentication::unsetAuthenticator;
 
 using std::string;
 
@@ -69,7 +69,7 @@ protected:
       const string& realm,
       const Credentials& credentials)
   {
-    Try<authentication::Authenticator*> authenticator =
+    Try<process::http::authentication::Authenticator*> authenticator =
       BasicAuthenticatorFactory::create(realm, credentials);
 
     ASSERT_SOME(authenticator);
@@ -78,17 +78,18 @@ protected:
     realms.insert(realm);
 
     // Pass ownership of the authenticator to libprocess.
-    AWAIT_READY(authentication::setAuthenticator(
+    AWAIT_READY(setAuthenticator(
         realm,
-        Owned<authentication::Authenticator>(authenticator.get())));
+        Owned<process::http::authentication::Authenticator>(
+            authenticator.get())));
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     foreach (const string& realm, realms) {
       // We need to wait in order to ensure that the operation completes before
       // we leave `TearDown`. Otherwise, we may leak a mock object.
-      AWAIT_READY(authentication::unsetAuthenticator(realm));
+      AWAIT_READY(unsetAuthenticator(realm));
     }
 
     realms.clear();
@@ -316,6 +317,48 @@ TEST_F(FilesTest, ResolveTest)
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       BadRequest().status,
       process::http::get(upid, "read", "path=two/../two"));
+}
+
+
+// Tests paths with percent-encoded sequences in the HTTP request
+// query. Very specifically, this checks that a percent-encoded symbol
+// is not "double decoded." That is to say, say we have a literal path
+// `foo%3Abar` because we couldn't use `:` literally on Windows, and
+// so instead encoded it literally in the file path on Windows. This
+// demonstrated a bug in libprocess where the encoding `%3A` was
+// decoded too many times, and so the query was for `foo:bar` instead
+// of literally `foo%3Abar`.
+TEST_F(FilesTest, QueryWithEncodedSequence)
+{
+  Files files;
+  process::UPID upid("files", process::address());
+
+  // This path has the ASCII escape sequence `%3A` literally instead
+  // of `:` because the latter is a reserved character on Windows.
+  //
+  // NOTE: This is not just an arbitrary character such as `+`, it is
+  // explicitly a percent-encoded sequence, but it could be e.g. `+`
+  // percent-encoded as `%2B`. Hence the assertion that this could be
+  // decoded again.
+  const string filename = "foo%3Abar";
+  ASSERT_SOME_EQ("foo:bar", process::http::decode(filename));
+
+  ASSERT_SOME(os::write(filename, "body"));
+  ASSERT_SOME_EQ("body", os::read(filename));
+  AWAIT_EXPECT_READY(files.attach(sandbox.get(), "/"));
+
+  // NOTE: The query here has to be encoded because it is a `string`
+  // and not a `hashmap<string, string>`. The latter is automatically
+  // encoded, but the former is not.
+  Future<Response> response = process::http::get(
+      upid, "read", "path=/" + process::http::encode(filename) + "&offset=0");
+
+  JSON::Object expected;
+  expected.values["offset"] = 0;
+  expected.values["data"] = "body";
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_BODY_EQ(stringify(expected), response);
 }
 
 

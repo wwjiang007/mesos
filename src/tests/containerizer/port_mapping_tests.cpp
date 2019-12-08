@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cmath>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -35,8 +36,11 @@
 #include <stout/stopwatch.hpp>
 
 #include <stout/os/constants.hpp>
-#include <stout/os/stat.hpp>
 #include <stout/os/exists.hpp>
+#include <stout/os/int_fd.hpp>
+#include <stout/os/stat.hpp>
+
+#include "common/values.hpp"
 
 #include "linux/fs.hpp"
 #include "linux/ns.hpp"
@@ -79,6 +83,8 @@ using namespace routing::filter;
 using namespace routing::queueing;
 
 using mesos::internal::master::Master;
+
+using mesos::internal::values::rangesToIntervalSet;
 
 using mesos::master::detector::MasterDetector;
 
@@ -346,13 +352,12 @@ protected:
         containerId,
         path::join(flags.launcher_dir, MESOS_CONTAINERIZER),
         argv,
-        Subprocess::FD(STDIN_FILENO),
-        Subprocess::FD(STDOUT_FILENO),
-        Subprocess::FD(STDERR_FILENO),
+        mesos::slave::ContainerIO(),
         &launchFlags,
         None(),
         None(),
-        CLONE_NEWNET | CLONE_NEWNS);
+        CLONE_NEWNET | CLONE_NEWNS,
+        {pipes[0], pipes[1]});
 
     return pid;
   }
@@ -1816,6 +1821,80 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_PortMappingStatistics)
 }
 
 
+static uint16_t roundUpToPow2(uint16_t x)
+{
+  uint16_t r = 1 << static_cast<uint16_t>(std::log2(x));
+  return x == r ? x : (r << 1);
+}
+
+
+// This test verifies that the isolator properly cleans up the
+// container that was not isolated, and doesn't leak ephemeral ports.
+TEST_F(PortMappingIsolatorTest, ROOT_CleanupNotIsolated)
+{
+  Try<Resources> resources = Resources::parse(flags.resources.get());
+  ASSERT_SOME(resources);
+  Try<IntervalSet<uint16_t>> ephemeralPorts =
+    rangesToIntervalSet<uint16_t>(resources->ephemeral_ports().get());
+  ASSERT_SOME(ephemeralPorts);
+
+  // Increase the number of ephemeral ports per container so that we
+  // won't be able to launch a second container unless ports used by
+  // the first one are deallocated.
+  flags.ephemeral_ports_per_container =
+    roundUpToPow2(ephemeralPorts->size() / 2 + 1);
+
+  Try<Isolator*> _isolator = PortMappingIsolatorProcess::create(flags);
+  ASSERT_SOME(_isolator);
+  Owned<Isolator> isolator(_isolator.get());
+
+  ExecutorInfo executorInfo;
+  executorInfo.mutable_resources()->CopyFrom(
+      Resources::parse(container1Ports).get());
+
+  ContainerID containerId1;
+  containerId1.set_value(id::UUID::random().toString());
+
+  Try<string> dir1 = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir1);
+
+  ContainerConfig containerConfig1;
+  containerConfig1.mutable_executor_info()->CopyFrom(executorInfo);
+  containerConfig1.set_directory(dir1.get());
+
+  Future<Option<ContainerLaunchInfo>> launchInfo1 =
+    isolator->prepare(containerId1, containerConfig1);
+  AWAIT_READY(launchInfo1);
+  ASSERT_SOME(launchInfo1.get());
+  ASSERT_EQ(1, launchInfo1.get()->pre_exec_commands().size());
+
+  // Simulate container destruction during preparation and clean up
+  // not isolated container.
+  AWAIT_READY(isolator->cleanup(containerId1));
+
+  executorInfo.mutable_resources()->CopyFrom(
+      Resources::parse(container2Ports).get());
+
+  ContainerID containerId2;
+  containerId2.set_value(id::UUID::random().toString());
+
+  Try<string> dir2 = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir2);
+
+  ContainerConfig containerConfig2;
+  containerConfig2.mutable_executor_info()->CopyFrom(executorInfo);
+  containerConfig2.set_directory(dir2.get());
+
+  Future<Option<ContainerLaunchInfo>> launchInfo2 =
+    isolator->prepare(containerId2, containerConfig2);
+  AWAIT_READY(launchInfo2);
+  ASSERT_SOME(launchInfo2.get());
+  ASSERT_EQ(1, launchInfo2.get()->pre_exec_commands().size());
+
+  AWAIT_READY(isolator->cleanup(containerId2));
+}
+
+
 class PortMappingMesosTest : public ContainerizerTest<MesosContainerizer>
 {
 public:
@@ -1858,7 +1937,7 @@ public:
 // Test the scenario where the network isolator is asked to recover
 // both types of containers: containers that were previously managed
 // by network isolator, and containers that weren't.
-TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedContainers)
+TEST_F(PortMappingMesosTest, ROOT_CGROUPS_RecoverMixedContainers)
 {
   master::Flags masterFlags = CreateMasterFlags();
 
@@ -2039,7 +2118,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedContainers)
 
 // Test that all configurations (tc filters etc) is cleaned up for an
 // orphaned container using the network isolator.
-TEST_F(PortMappingMesosTest, CGROUPS_ROOT_CleanUpOrphan)
+TEST_F(PortMappingMesosTest, ROOT_CGROUPS_CleanUpOrphan)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -2269,7 +2348,7 @@ TEST_F(PortMappingMesosTest, ROOT_NetworkNamespaceHandleSymlink)
 // This test verifies that the isolator is able to recover a mix of
 // known and unknown orphans. This is used to capture the regression
 // described in MESOS-2914.
-TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedKnownAndUnKnownOrphans)
+TEST_F(PortMappingMesosTest, ROOT_CGROUPS_RecoverMixedKnownAndUnKnownOrphans)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);

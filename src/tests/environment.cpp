@@ -100,7 +100,7 @@ Environment* environment;
 class BenchmarkFilter : public TestFilter
 {
 public:
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "BENCHMARK_") && !flags.benchmark;
   }
@@ -148,7 +148,7 @@ public:
 #endif // __linux__
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "CFS_") && cfsError.isSome();
   }
@@ -191,7 +191,7 @@ public:
 #endif // __linux__
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     if (matches(test, "CGROUPS_") || matches(test, "Cgroups")) {
 #ifdef __linux__
@@ -244,7 +244,7 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "CURL_") && curlError;
   }
@@ -269,7 +269,7 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "NVIDIA_GPU_") && nvidiaGpuError;
   }
@@ -341,7 +341,7 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     if (dockerError.isSome()) {
       return matches(test, "DOCKER_");
@@ -361,15 +361,16 @@ private:
   Future<Nothing> launchContainer(
       const Owned<Docker>& docker,
       const string& containerName,
-      const string& networkName)
+      const string& networkName,
+      const string& imageName)
   {
     Docker::RunOptions opts;
     opts.privileged = false;
     opts.name = containerName;
     opts.network = networkName;
     opts.additionalOptions = {"-d", "--rm"};
-    opts.image = mesos::internal::checks::DOCKER_HEALTH_CHECK_IMAGE;
-    opts.arguments = {"pwsh", "-Command", "Start-Sleep", "-Seconds", "60"};
+    opts.image = imageName;
+    opts.arguments = {"ping", "-n", "60", "127.0.0.1"};
 
     // Launches the container in detached mode, which means that docker
     // run should return as soon as the container successfully launched.
@@ -392,16 +393,22 @@ private:
 
   Option<Error> runNetNamespaceCheck(const Owned<Docker>& docker)
   {
+    const string image =
+      string(mesos::internal::checks::DOCKER_HEALTH_CHECK_IMAGE);
+
     // Use `os::system` here because `docker->inspect()` only works on
     // containers even though `docker inspect` cli command works on images.
-    const Option<int> res = os::system(
-        docker->getPath() + " -H " + docker->getSocket() + " inspect " +
-        string(mesos::internal::checks::DOCKER_HEALTH_CHECK_IMAGE) + " > NUL");
+    const Option<int> res = os::system(strings::join(
+        " ",
+        docker->getPath(),
+        "-H",
+        docker->getSocket(),
+        "inspect",
+        image,
+        "> NUL"));
 
     if (res != 0) {
-      return Error(
-          "Cannot find " +
-          string(mesos::internal::checks::DOCKER_HEALTH_CHECK_IMAGE));
+      return Error("Cannot find " + image);
     }
 
     // Launch two containers. One with regular network settings and the
@@ -411,10 +418,12 @@ private:
     const string container2 = id::UUID::random().toString();
 
     Future<Nothing> containers =
-      launchContainer(docker, container1, "nat").then(process::defer([=]() {
-        return launchContainer(docker, container2, "container:" + container1)
-          .then(lambda::bind(&Docker::rm, docker, container2, true))
-          .onAny(lambda::bind(&Docker::rm, docker, container1, true));
+      launchContainer(docker, container1, "nat", image)
+        .then(process::defer([=]() {
+          return launchContainer(
+              docker, container2, "container:" + container1, image)
+            .then(lambda::bind(&Docker::rm, docker, container2, true))
+            .onAny(lambda::bind(&Docker::rm, docker, container1, true));
       }));
 
     // A minute should be enough for both containers to lauch and delete.
@@ -499,7 +508,7 @@ public:
 #endif
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return dtypeError.isSome() && matches(test, "DTYPE_");
   }
@@ -514,8 +523,11 @@ class InternetFilter : public TestFilter
 public:
   InternetFilter()
   {
+#ifdef __WINDOWS__
+    error = os::system("ping -n 1 -w 1000 google.com") != 0;
+#else
     error = os::system("ping -c 1 -W 1 google.com") != 0;
-    // TODO(andschwa): Make ping command cross-platform.
+#endif // __WINDOWS__
     if (error) {
       std::cerr
         << "-------------------------------------------------------------\n"
@@ -525,13 +537,64 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "INTERNET_") && error;
   }
 
 private:
   bool error;
+};
+
+
+class IPTablesFilter : public TestFilter
+{
+public:
+  IPTablesFilter()
+  {
+#ifdef __linux__
+    // Check iptables -w option
+    //
+    if (os::which("iptables").isNone()) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "No 'iptables' command found so no tests depending\n"
+        << "on 'iptables' will be run\n"
+        << "-------------------------------------------------------------"
+        << std::endl;
+
+      iptablesError = Error("iptables command not found");
+      return;
+    }
+
+    if (::geteuid() != 0) {
+      iptablesError = Error("iptables command requires root");
+      return;
+    }
+
+    Try<string> iptables = os::shell("iptables -w -n -L OUTPUT");
+    if (iptables.isError()) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "'iptables' command does not support '-w' option\n"
+        << "-------------------------------------------------------------"
+        << std::endl;
+
+      iptablesError = Error("iptables command does not support -w option");
+      return;
+    }
+#else
+    iptablesError = Error("Unsupported platform");
+#endif
+  }
+
+  bool disable(const ::testing::TestInfo* test) const override
+  {
+    return iptablesError.isSome() && matches(test, "IPTABLES_");
+  }
+
+private:
+  Option<Error> iptablesError;
 };
 
 
@@ -551,7 +614,7 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "LOGROTATE_") && logrotateError;
   }
@@ -576,7 +639,7 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "NC_") && netcatError;
   }
@@ -632,7 +695,7 @@ public:
 #endif
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "NET_CLS_") && netClsError;
   }
@@ -661,7 +724,7 @@ public:
 #endif
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     if (matches(test, "PortMappingIsolatorTest") ||
         matches(test, "PortMappingMesosTest")) {
@@ -715,7 +778,7 @@ class AufsFilter : public SupportedFilesystemTestFilter
 public:
   AufsFilter() : SupportedFilesystemTestFilter("aufs") {}
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return fsSupportError.isSome() && matches(test, "AUFS_");
   }
@@ -727,7 +790,7 @@ class OverlayFSFilter : public SupportedFilesystemTestFilter
 public:
   OverlayFSFilter() : SupportedFilesystemTestFilter("overlayfs") {}
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return fsSupportError.isSome() && matches(test, "OVERLAYFS_");
   }
@@ -739,7 +802,7 @@ class XfsFilter : public SupportedFilesystemTestFilter
 public:
   XfsFilter() : SupportedFilesystemTestFilter("xfs") {}
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return fsSupportError.isSome() && matches(test, "XFS_");
   }
@@ -782,7 +845,7 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     // Disable all tests that try to sample 'cpu-cycles' events using 'perf'.
     return (matches(test, "ROOT_CGROUPS_PERF_PerfTest") ||
@@ -815,7 +878,7 @@ public:
 #endif // __linux__
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "PERF_") && perfError;
   }
@@ -828,7 +891,7 @@ private:
 class RootFilter : public TestFilter
 {
 public:
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
 #ifdef __WINDOWS__
     // On Windows, tests are expected to be run as Administrator.
@@ -851,6 +914,77 @@ public:
 };
 
 
+class SeccompFilter : public TestFilter
+{
+public:
+  SeccompFilter()
+  {
+    // Since the Seccomp parser depends on CPU architecture, we can run Seccomp
+    // tests deterministically only on `x86_64`.
+    Try<string> arch = os::shell("arch");
+    if (arch.isError()) {
+      seccompError = arch.error();
+    } else if (strings::trim(arch.get()) != "x86_64") {
+      seccompError = Error("Seccomp tests cannot be run on non-x86_64 systems");
+    }
+
+    if (seccompError.isSome()) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "We can't run any SECCOMP tests:\n"
+        << seccompError.get() << "\n"
+        << "-------------------------------------------------------------"
+        << std::endl;
+    }
+  }
+
+  bool disable(const ::testing::TestInfo* test) const override
+  {
+    return matches(test, "SECCOMP_") && seccompError.isSome();
+  }
+
+private:
+  Option<Error> seccompError;
+};
+
+
+class UnprivilegedUserFilter : public TestFilter
+{
+public:
+  UnprivilegedUserFilter()
+  {
+#ifdef __WINDOWS__
+    unprivilegedUserFound = false;
+#else
+    Option<string> user = os::getenv("SUDO_USER");
+    if (user.isNone() || user.get() == "root") {
+      unprivilegedUserFound = false;
+    } else {
+      unprivilegedUserFound = true;
+    }
+
+    if (!unprivilegedUserFound) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "No usable unprivileged user found from the 'SUDO_USER'\n"
+        << "environment variable. So tests that rely on an unprivileged\n"
+        << "user will not run\n"
+        << "-------------------------------------------------------------"
+        << std::endl;
+    }
+#endif
+  }
+
+  bool disable(const ::testing::TestInfo* test) const override
+  {
+    return matches(test, "UNPRIVILEGED_USER_") && !unprivilegedUserFound;
+  }
+
+private:
+  bool unprivilegedUserFound;
+};
+
+
 class UnzipFilter : public TestFilter
 {
 public:
@@ -866,13 +1000,86 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "UNZIP_") && unzipError;
   }
 
 private:
   bool unzipError;
+};
+
+
+// This is a test filter for the veth CNI plugin.
+class VEthFilter : public TestFilter
+{
+public:
+  VEthFilter()
+  {
+#ifdef __linux__
+    vector<string> messages;
+
+    // Checking if it runs as root.
+    Result<string> user = os::user();
+    CHECK_SOME(user);
+
+    if (user.get() != "root") {
+      messages.emplace_back("non-root user");
+    }
+
+    // This command returns `ip utility, iproute2-YYMMDD` where
+    // `YYMMDD` is a release (snapshot) date of iproute2.
+    Try<string> ipVersion = os::shell("ip -Version");
+
+    // Checking if iproute2 exists.
+    if (ipVersion.isError()) {
+      messages.emplace_back("iproute2 not found");
+    } else {
+      // Checking if it supports `ip link set ... netns ...`.
+      const string version = strings::trim(ipVersion.get());
+      if (version.size() < 6) {
+        messages.emplace_back("unexpected version");
+      } else {
+        Try<int> snapshot = numify<int>(version.substr(version.size() - 6));
+        if (snapshot.isError()) {
+          messages.emplace_back("iproute2 version is not an integer");
+        } else if (snapshot.get() < 100224) {
+          // Support for `netns` was added to iproute2 in v2.6.33.
+          messages.emplace_back("iproute2 doesn't support network namespaces");
+        }
+      }
+    }
+
+    // Checking if libprocess is bound on loopback address, in that
+    // case network namespace with veth network won't be able to
+    // connect to parent process on host network namespace.
+    // TODO(urbanserj): Improve the network connectivity check.
+    process::network::inet::Address address = process::address();
+    if (address.ip.isLoopback()) {
+      messages.emplace_back("libprocess is bound on loopback address");
+    }
+
+    disabled = !messages.empty();
+    if (disabled) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "We can't run any VETH tests:\n"
+        << strings::join("\n", messages) << "\n"
+        << "-------------------------------------------------------------"
+        << std::endl;
+    }
+#else
+    disabled = true;
+#endif // __linux__
+  }
+
+  bool disable(const ::testing::TestInfo* test) const override
+  {
+    return matches(test, "VETH_") && disabled;
+  }
+
+private:
+  bool disabled;
 };
 
 
@@ -887,6 +1094,7 @@ Environment::Environment(const Flags& _flags)
             std::make_shared<DockerFilter>(),
             std::make_shared<DtypeFilter>(),
             std::make_shared<InternetFilter>(),
+            std::make_shared<IPTablesFilter>(),
             std::make_shared<LogrotateFilter>(),
             std::make_shared<NetcatFilter>(),
             std::make_shared<NetClsCgroupsFilter>(),
@@ -896,7 +1104,10 @@ Environment::Environment(const Flags& _flags)
             std::make_shared<PerfCPUCyclesFilter>(),
             std::make_shared<PerfFilter>(),
             std::make_shared<RootFilter>(),
+            std::make_shared<SeccompFilter>(),
+            std::make_shared<UnprivilegedUserFilter>(),
             std::make_shared<UnzipFilter>(),
+            std::make_shared<VEthFilter>(),
             std::make_shared<XfsFilter>()}),
     flags(_flags)
 {

@@ -33,7 +33,9 @@
 #include <process/dispatch.hpp>
 #include <process/executor.hpp>
 #include <process/id.hpp>
-#include <process/metrics/counter.hpp>
+
+#include <process/metrics/metrics.hpp>
+#include <process/metrics/timer.hpp>
 
 #include "slave/containerizer/mesos/provisioner/constants.hpp"
 #include "slave/containerizer/mesos/provisioner/utils.hpp"
@@ -82,7 +84,7 @@ public:
   {
   }
 
-  ~StoreProcess() {}
+  ~StoreProcess() override {}
 
   Future<Nothing> recover();
 
@@ -95,6 +97,23 @@ public:
       const hashset<string>& activeLayerPaths);
 
 private:
+  struct Metrics
+  {
+    Metrics() :
+        image_pull(
+          "containerizer/mesos/provisioner/docker_store/image_pull", Hours(1))
+    {
+      process::metrics::add(image_pull);
+    }
+
+    ~Metrics()
+    {
+      process::metrics::remove(image_pull);
+    }
+
+    process::metrics::Timer<Milliseconds> image_pull;
+  };
+
   Future<Image> _get(
       const spec::ImageReference& reference,
       const Option<Secret>& config,
@@ -105,9 +124,9 @@ private:
       const Image& image,
       const string& backend);
 
-  Future<vector<string>> moveLayers(
+  Future<Image> moveLayers(
       const string& staging,
-      const vector<string>& layerIds,
+      const Image& image,
       const string& backend);
 
   Future<Nothing> moveLayer(
@@ -123,10 +142,11 @@ private:
 
   Owned<MetadataManager> metadataManager;
   Owned<Puller> puller;
-  hashmap<string, Owned<Promise<Image>>> pulling;
 
   // For executing path removals in a separated actor.
   process::Executor executor;
+
+  Metrics metrics;
 };
 
 
@@ -143,6 +163,10 @@ Try<Owned<slave::Store>> Store::create(
   _flags.docker_config = flags.docker_config;
   _flags.docker_stall_timeout = flags.fetcher_stall_timeout;
 #endif
+
+  if (flags.hadoop_home.isSome()) {
+    _flags.hadoop_client = path::join(flags.hadoop_home.get(), "bin", "hadoop");
+  }
 
   Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create(_flags);
   if (fetcher.isError()) {
@@ -301,56 +325,47 @@ Future<Image> StoreProcess::_get(
       }
     }
 
+    if (image->has_config_digest() &&
+        !os::exists(paths::getImageLayerPath(
+            flags.docker_store_dir,
+            image->config_digest()))) {
+      layerMissed = true;
+    }
+
     if (!layerMissed) {
+      LOG(INFO) << "Using cached image '" << reference << "'";
       return image.get();
     }
   }
 
-  // If there is already a pulling going on for the given 'name', we
-  // will skip the additional pulling.
-  const string name = stringify(reference);
+  Try<string> staging =
+    os::mkdtemp(paths::getStagingTempDir(flags.docker_store_dir));
 
-  if (!pulling.contains(name)) {
-    Try<string> staging =
-      os::mkdtemp(paths::getStagingTempDir(flags.docker_store_dir));
-
-    if (staging.isError()) {
-      return Failure(
-          "Failed to create a staging directory: " + staging.error());
-    }
-
-    Owned<Promise<Image>> promise(new Promise<Image>());
-
-    Future<Image> future = puller->pull(
-        reference,
-        staging.get(),
-        backend,
-        config)
-      .then(defer(self(),
-                  &Self::moveLayers,
-                  staging.get(),
-                  lambda::_1,
-                  backend))
-      .then(defer(self(), [=](const vector<string>& layerIds) {
-        return metadataManager->put(reference, layerIds);
-      }))
-      .onAny(defer(self(), [=](const Future<Image>&) {
-        pulling.erase(name);
-
-        Try<Nothing> rmdir = os::rmdir(staging.get());
-        if (rmdir.isError()) {
-          LOG(WARNING) << "Failed to remove staging directory: "
-                       << rmdir.error();
-        }
-      }));
-
-    promise->associate(future);
-    pulling[name] = promise;
-
-    return promise->future();
+  if (staging.isError()) {
+    return Failure(
+        "Failed to create a staging directory: " + staging.error());
   }
 
-  return pulling[name]->future();
+  LOG(INFO) << "Pulling image '" << reference << "'";
+
+  return metrics.image_pull.time(puller->pull(
+      reference,
+      staging.get(),
+      backend,
+      config)
+    .then(defer(self(), &Self::moveLayers, staging.get(), lambda::_1, backend))
+    .then(defer(self(), [=](const Image& image) {
+      LOG(INFO) << "Caching image '" << reference << "'";
+      return metadataManager->put(image);
+    }))
+    .onAny(defer(self(), [=](const Future<Image>& image) {
+      LOG(INFO) << "Removing staging directory '" << staging.get() << "'";
+      Try<Nothing> rmdir = os::rmdir(staging.get());
+      if (rmdir.isError()) {
+        LOG(WARNING) << "Failed to remove staging directory '" << staging.get()
+                     << "': " << rmdir.error();
+      }
+    })));
 }
 
 
@@ -368,16 +383,25 @@ Future<ImageInfo> StoreProcess::__get(
         backend));
   }
 
-  const string path = paths::getImageLayerManifestPath(
-      flags.docker_store_dir,
-      image.layer_ids(image.layer_ids_size() - 1));
+  string configPath;
+  if (image.has_config_digest()) {
+    // Optional 'config_digest' will only be set for docker manifest
+    // V2 Schema2 case.
+    configPath = paths::getImageLayerPath(
+        flags.docker_store_dir,
+        image.config_digest());
+  } else {
+    // Read the manifest from the last layer because all runtime config
+    // are merged at the leaf already.
+    configPath = paths::getImageLayerManifestPath(
+        flags.docker_store_dir,
+        image.layer_ids(image.layer_ids_size() - 1));
+  }
 
-  // Read the manifest from the last layer because all runtime config
-  // are merged at the leaf already.
-  Try<string> manifest = os::read(path);
+  Try<string> manifest = os::read(configPath);
   if (manifest.isError()) {
     return Failure(
-        "Failed to read manifest from '" + path + "': " +
+        "Failed to read manifest from '" + configPath + "': " +
         manifest.error());
   }
 
@@ -386,26 +410,51 @@ Future<ImageInfo> StoreProcess::__get(
 
   if (v1.isError()) {
     return Failure(
-        "Failed to parse docker v1 manifest from '" + path + "': " +
+        "Failed to parse docker v1 manifest from '" + configPath + "': " +
         v1.error());
+  }
+
+  if (image.has_config_digest()) {
+    return ImageInfo{layerPaths, v1.get(), None(), configPath};
   }
 
   return ImageInfo{layerPaths, v1.get()};
 }
 
 
-Future<vector<string>> StoreProcess::moveLayers(
+Future<Image> StoreProcess::moveLayers(
     const string& staging,
-    const vector<string>& layerIds,
+    const Image& image,
     const string& backend)
 {
-  list<Future<Nothing>> futures;
-  foreach (const string& layerId, layerIds) {
+  LOG(INFO) << "Moving layers from staging directory '" << staging
+            << "' to image store for image '" << image.reference() << "'";
+
+  vector<Future<Nothing>> futures;
+  foreach (const string& layerId, image.layer_ids()) {
     futures.push_back(moveLayer(staging, layerId, backend));
   }
 
   return collect(futures)
-    .then([layerIds]() -> vector<string> { return layerIds; });
+    .then(defer(self(), [=]() -> Future<Image> {
+      if (image.has_config_digest()) {
+        const string configSource = path::join(staging, image.config_digest());
+        const string configTarget = paths::getImageLayerPath(
+            flags.docker_store_dir,
+            image.config_digest());
+
+        if (!os::exists(configTarget)) {
+          Try<Nothing> rename = os::rename(configSource, configTarget);
+          if (rename.isError()) {
+            return Failure(
+                "Failed to move image manifest config from '" + configSource +
+                "' to '" + configTarget + "': " + rename.error());
+          }
+        }
+      }
+
+      return image;
+    }));
 }
 
 
@@ -488,11 +537,6 @@ Future<Nothing> StoreProcess::prune(
     const vector<mesos::Image>& excludedImages,
     const hashset<string>& activeLayerPaths)
 {
-  // All existing pulling should have finished.
-  if (!pulling.empty()) {
-    return Failure("Cannot prune and pull at the same time");
-  }
-
   vector<spec::ImageReference> imageReferences;
   imageReferences.reserve(excludedImages.size());
 

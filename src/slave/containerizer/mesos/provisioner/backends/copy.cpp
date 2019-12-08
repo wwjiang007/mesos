@@ -14,9 +14,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <list>
+#include <vector>
 
+#ifndef __WINDOWS__
 #include <mesos/docker/spec.hpp>
+#endif // __WINDOWS__
 
 #include <process/collect.hpp>
 #include <process/defer.hpp>
@@ -38,7 +40,6 @@
 using namespace process;
 
 using std::string;
-using std::list;
 using std::vector;
 
 namespace mesos {
@@ -51,7 +52,8 @@ public:
   CopyBackendProcess()
     : ProcessBase(process::ID::generate("copy-provisioner-backend")) {}
 
-  Future<Nothing> provision(const vector<string>& layers, const string& rootfs);
+  Future<Option<vector<Path>>> provision(
+      const vector<string>& layers, const string& rootfs);
 
   Future<bool> destroy(const string& rootfs);
 
@@ -81,7 +83,7 @@ CopyBackend::CopyBackend(Owned<CopyBackendProcess> _process)
 }
 
 
-Future<Nothing> CopyBackend::provision(
+Future<Option<vector<Path>>> CopyBackend::provision(
     const vector<string>& layers,
     const string& rootfs,
     const string& backendDir)
@@ -99,7 +101,7 @@ Future<bool> CopyBackend::destroy(
 }
 
 
-Future<Nothing> CopyBackendProcess::provision(
+Future<Option<vector<Path>>> CopyBackendProcess::provision(
     const vector<string>& layers,
     const string& rootfs)
 {
@@ -116,7 +118,7 @@ Future<Nothing> CopyBackendProcess::provision(
     return Failure("Failed to create rootfs directory: " + mkdir.error());
   }
 
-  list<Future<Nothing>> futures{Nothing()};
+  vector<Future<Nothing>> futures{Nothing()};
 
   foreach (const string layer, layers) {
     futures.push_back(
@@ -125,7 +127,7 @@ Future<Nothing> CopyBackendProcess::provision(
   }
 
   return collect(futures)
-    .then([]() -> Future<Nothing> { return Nothing(); });
+    .then([]() -> Future<Option<vector<Path>>> { return None(); });
 }
 
 
@@ -152,6 +154,7 @@ Future<Nothing> CopyBackendProcess::_provision(
     if (node->fts_info == FTS_DNR ||
         node->fts_info == FTS_ERR ||
         node->fts_info == FTS_NS) {
+      ::fts_close(tree);
       return Failure(
           "Failed to read '" + ftsPath + "': " + os::strerror(node->fts_errno));
     }
@@ -327,9 +330,15 @@ Future<bool> CopyBackendProcess::destroy(const string& rootfs)
     .then([](const Option<int>& status) -> Future<bool> {
       if (status.isNone()) {
         return Failure("Failed to reap subprocess to destroy rootfs");
-      } else if (status.get() != 0) {
-        return Failure("Failed to destroy rootfs, exit status: " +
-                       WSTRINGIFY(status.get()));
+      }
+
+      if (status.get() != 0) {
+        // It's possible that `rm -rf` will fail if some other
+        // programs are accessing the files.  No need to return a hard
+        // failure here because the directory will be removed later
+        // and re-attempted on agent recovery.
+        LOG(ERROR) << "Failed to destroy rootfs, exit status: "
+                   << WSTRINGIFY(status.get());
       }
 
       return true;

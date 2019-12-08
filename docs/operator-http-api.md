@@ -13,7 +13,7 @@ Similar to the [Scheduler](scheduler-http-api.md) and [Executor](executor-http-a
 
 For requests that Mesos can answer synchronously and immediately, an HTTP response will be sent with status **200 OK**, possibly including a response body encoded in JSON or Protobuf. The encoding depends on the **Accept** header present in the request (the default encoding is JSON). Responses will be gzip compressed if the **Accept-Encoding** header is set to "gzip".
 
-For requests that require asynchronous processing (e.g., `RESERVE_RESOURCES`), an HTTP response will be sent with status **202 Accepted**. For requests that result in a stream of events (`SUBSCRIBE`), a streaming HTTP response with [RecordIO](scheduler-http-api.md#recordio-response-format) encoding is sent. Currently, gzip compression is not supported for streaming responses.
+For requests that require asynchronous processing (e.g., `RESERVE_RESOURCES`), an HTTP response will be sent with status **202 Accepted**. For requests that result in a stream of events (`SUBSCRIBE`), a streaming HTTP response with [RecordIO](recordio.md) encoding is sent. Currently, gzip compression is not supported for streaming responses.
 
 ## Master API
 
@@ -677,6 +677,10 @@ Content-Type: application/json
         "value": 0.0
       },
       {
+        "name": "master/messages_reconcile_operations",
+        "value": 0.0
+      },
+      {
         "name": "master/messages_reconcile_tasks",
         "value": 0.0
       },
@@ -710,6 +714,10 @@ Content-Type: application/json
       },
       {
         "name": "master/outstanding_offers",
+        "value": 0.0
+      },
+      {
+        "name": "master/operator_event_stream_subscribers",
         "value": 0.0
       },
       {
@@ -1653,6 +1661,93 @@ Content-Type: application/json
 
 ```
 
+### GET_OPERATIONS
+
+Returns a list of all offer operations throughout the cluster, not including
+`LAUNCH` or `LAUNCH_GROUP` operations which can be retrieved with `GET_TASKS`.
+
+```
+GET_OPERATIONS HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: masterhost:5050
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "GET_OPERATIONS"
+}
+
+
+GET_OPERATIONS HTTP Response (JSON):
+
+HTTP/1.1 200 OK
+
+Content-Type: application/json
+
+{
+  "type": "GET_OPERATIONS",
+  "get_operations": {
+    "operations": [
+      {
+        "framework_id": {"value": "74bddcbc-4a02-4d64-b291-aed52032055f-0000"},
+        "agent_id": {"value": "18083noa-j287-dan4-9qx6-l02b84nksb7z-0021"},
+        "info": {
+          "type": "CREATE_DISK",
+          "id": {"value": "n2j8nksj-9827-82bk-nd7u-83hbchu7whdk-9978"},
+          "create_disk": {
+            "source": {
+              "provider_id": {"value": "837hfmi2-u2u7-19pp-1884-812i8f02828j-0030"},
+              "name": "disk",
+              "type": "SCALAR",
+              "scalar": {"value": 1024.0},
+              "role": "storage-role-1",
+              "allocation_info": {"role": "storage-role-1"},
+              "reservation": {
+                "type": "DYNAMIC",
+                "role": "storage-role-1",
+                "principal": "storage-service"
+              },
+              "reservations": [{
+                "type": "DYNAMIC",
+                "role": "storage-role-1",
+                "principal": "storage-service"
+              }],
+              "disk": {
+                "source": {
+                  "type": "RAW",
+                  "vendor": "nas-service",
+                  "id": "vol-19827509",
+                  "profile": "fast-volume"
+                }
+              }
+            },
+            "target_type": "MOUNT"
+          }
+        },
+        "latest_status": {
+          "operation_id": {"value": "n2j8nksj-9827-82bk-nd7u-83hbchu7whdk-9978"},
+          "state": "OPERATION_PENDING",
+          "uuid": {"value": "28987843-j288-1k0s-l29n-837ybzmo18tj-nv73"},
+          "agent_id": {"value": "18083noa-j287-dan4-9qx6-l02b84nksb7z-0021"},
+          "resource_provider_id": {"value": "837hfmi2-u2u7-19pp-1884-812i8f02828j-0030"}
+        },
+        "statuses": [{
+          "operation_id": {"value": "n2j8nksj-9827-82bk-nd7u-83hbchu7whdk-9978"},
+          "state": "OPERATION_PENDING",
+          "uuid": {"value": "28987843-j288-1k0s-l29n-837ybzmo18tj-nv73"},
+          "agent_id": {"value": "18083noa-j287-dan4-9qx6-l02b84nksb7z-0021"},
+          "resource_provider_id": {"value": "837hfmi2-u2u7-19pp-1884-812i8f02828j-0030"}
+        }],
+        "uuid": {"value": "nsj27802-jd82-jd19-jd38-837jdfnoqfij-u284"}
+      }
+    ]
+  }
+}
+
+```
+
 ### GET_WEIGHTS
 
 This call retrieves the information about role weights.
@@ -1771,8 +1866,25 @@ Content-Type: application/json
 
 ### RESERVE_RESOURCES
 
-This call reserve resources dynamically on a specific agent. This call takes
-`agent_id` and `resources` details like the following.
+This call is used to update resource reservations.
+
+This call reserves resources dynamically on a specific agent. This call takes
+`agent_id`, the `source` resources of the operation and the target
+`resources`, and updates the reservations of `source` to be equal to
+the reservations of `target`.
+
+For backwards compatibility we accept calls without the `sources` field present,
+but only allow adding a single reservation refinement in that case;
+otherwise we expect that `sources` can be transformed into `resources` by
+repeatedly removing or adding identical reservations from all given
+resources. This means that `source` and `resources` must be identical
+in all values apart from reservation.
+
+If authorization is enabled we expect the caller to be authorized to perform any
+`UNRESERVE` or `RESERVE` operations needed to transform `sources` to
+`resources`.
+
+Example of a call creating reserved resources for role `role`:
 
 ```
 RESERVE_RESOURCES HTTP Request (JSON):
@@ -1789,14 +1901,10 @@ Accept: application/json
     "agent_id": {
       "value": "1557de7d-547c-48db-b5d3-6bef9c9640ef-S0"
     },
-    "resources": [
+    "source": [
       {
         "type": "SCALAR",
         "name": "cpus",
-        "reservation": {
-          "principal": "my-principal"
-        },
-        "role": "role",
         "scalar": {
           "value": 1.0
         }
@@ -1804,13 +1912,127 @@ Accept: application/json
       {
         "type": "SCALAR",
         "name": "mem",
-        "reservation": {
-          "principal": "my-principal"
-        },
-        "role": "role",
         "scalar": {
           "value": 512.0
         }
+      }
+    ],
+    "resources": [
+      {
+        "type": "SCALAR",
+        "name": "cpus",
+        "scalar": {
+          "value": 1.0
+        },
+        "reservations": [
+          {
+            "type": "DYNAMIC",
+            "role": "role",
+            "principal": "my-principal"
+          }
+        ]
+      },
+      {
+        "type": "SCALAR",
+        "name": "mem",
+        "scalar": {
+          "value": 512.0
+        },
+        "reservations": [
+          {
+            "type": "DYNAMIC",
+            "role": "role",
+            "principal": "my-principal"
+          }
+        ]
+      }
+    ]
+  }
+}
+
+
+RESERVE_RESOURCES HTTP Response:
+
+HTTP/1.1 202 Accepted
+
+```
+
+Example of a call changing the reservation of resources from `role_a` to
+`role_b`.
+
+```
+RESERVE_RESOURCES HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: masterhost:5050
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "RESERVE_RESOURCES",
+  "reserve_resources": {
+    "agent_id": {
+      "value": "1557de7d-547c-48db-b5d3-6bef9c9640ef-S0"
+    },
+    "source": [
+      {
+        "type": "SCALAR",
+        "name": "cpus",
+        "scalar": {
+          "value": 1.0
+        },
+        "reservations": [
+          {
+            "type": "DYNAMIC",
+            "role": "role_a",
+            "principal": "my-principal"
+          }
+        ]
+      },
+      {
+        "type": "SCALAR",
+        "name": "mem",
+        "scalar": {
+          "value": 512.0
+        },
+        "reservations": [
+          {
+            "type": "DYNAMIC",
+            "role": "role_a",
+            "principal": "my-principal"
+          }
+        ]
+      }
+    ],
+    "resources": [
+      {
+        "type": "SCALAR",
+        "name": "cpus",
+        "scalar": {
+          "value": 1.0
+        },
+        "reservations": [
+          {
+            "type": "DYNAMIC",
+            "role": "role_b",
+            "principal": "my-principal"
+          }
+        ]
+      },
+      {
+        "type": "SCALAR",
+        "name": "mem",
+        "scalar": {
+          "value": 512.0
+        },
+        "reservations": [
+          {
+            "type": "DYNAMIC",
+            "role": "role_b",
+            "principal": "my-principal"
+          }
+        ]
       }
     ]
   }
@@ -1847,24 +2069,30 @@ Accept: application/json
       {
         "type": "SCALAR",
         "name": "cpus",
-        "reservation": {
-          "principal": "my-principal"
-        },
-        "role": "role",
         "scalar": {
           "value": 1.0
-        }
+        },
+        "reservations": [
+          {
+            "type": "DYNAMIC",
+            "role": "role",
+            "principal": "my-principal"
+          }
+        ]
       },
       {
         "type": "SCALAR",
         "name": "mem",
-        "reservation": {
-          "principal": "my-principal"
-        },
-        "role": "role",
         "scalar": {
           "value": 512.0
-        }
+        },
+        "reservations": [
+          {
+            "type": "DYNAMIC",
+            "role": "role",
+            "principal": "my-principal"
+          }
+        ]
       }
     ]
   }
@@ -1879,11 +2107,11 @@ HTTP/1.1 202 Accepted
 
 ### CREATE_VOLUMES
 
-This call create persistent volumes on reserved resources. The request is
-forwarded asynchronously to the Mesos agent where the reserved resources are
-located. That asynchronous message may not be delivered or creating the volumes
-at the agent might fail. This call takes `agent_id` and `volumes` details like
-the following.
+This call create [persistent volumes](persistent-volume.md) on reserved
+resources. The request is forwarded asynchronously to the Mesos agent where the
+reserved resources are located. That asynchronous message may not be delivered
+or creating the volumes at the agent might fail. This call takes `agent_id`
+and `volumes` details like the following.
 
 ```
 CREATE_VOLUMES HTTP Request (JSON):
@@ -1932,8 +2160,8 @@ HTTP/1.1 202 Accepted
 
 ### DESTROY_VOLUMES
 
-This call destroys persistent volumes. The request is forwarded asynchronously to the
-Mesos agent where the reserved resources are located.
+This call destroys [persistent volumes](persistent-volume.md). The request is
+forwarded asynchronously to the Mesos agent where the volumes are located.
 
 ```
 DESTROY_VOLUMES HTTP Request (JSON):
@@ -1979,6 +2207,116 @@ DESTROY_VOLUMES HTTP Response:
 HTTP/1.1 202 Accepted
 
 ```
+
+### GROW_VOLUME
+
+This call grows the size of a [persistent volume](persistent-volume.md). The
+request is forwarded asynchronously to the Mesos agent where the volume is
+located.
+
+```
+GROW_VOLUME HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: masterhost:5050
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "GROW_VOLUME",
+  "grow_volume": {
+    "agent_id": {
+      "value": "919141a8-b434-4946-86b9-e1b65c8171f6-S0"
+    },
+    "volume": {
+      "disk": {
+        "persistence": {
+          "id": "id1",
+          "principal": "my-principal"
+        },
+        "volume": {
+          "container_path": "path1",
+          "mode": "RW"
+        }
+      },
+      "name": "disk",
+      "role": "role1",
+      "scalar": {
+        "value": 64.0
+      },
+      "type": "SCALAR"
+    },
+    "addition": {
+      "name": "disk",
+      "role": "role1",
+      "scalar": {
+        "value": 64.0
+      },
+      "type": "SCALAR"
+    }
+  }
+}
+
+
+GROW_VOLUME HTTP Response:
+
+HTTP/1.1 202 Accepted
+
+```
+
+### SHRINK_VOLUME
+
+This call shrinks the size of a [persistent volume](persistent-volume.md).
+The request is forwarded asynchronously to the Mesos agent where the volume
+is located.
+
+```
+SHRINK_VOLUME HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: masterhost:5050
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "SHRINK_VOLUME",
+  "shrink_volume": {
+    "agent_id": {
+      "value": "919141a8-b434-4946-86b9-e1b65c8171f6-S0"
+    },
+    "volume": {
+      "disk": {
+        "persistence": {
+          "id": "id1",
+          "principal": "my-principal"
+        },
+        "volume": {
+          "container_path": "path1",
+          "mode": "RW"
+        }
+      },
+      "name": "disk",
+      "role": "role1",
+      "scalar": {
+        "value": 128.0
+      },
+      "type": "SCALAR"
+    },
+    "subtract": {
+      "value": 64.0
+    }
+  }
+}
+
+
+SHRINK_VOLUME HTTP Response:
+
+HTTP/1.1 202 Accepted
+
+```
+
 
 ### GET_MAINTENANCE_STATUS
 
@@ -2218,26 +2556,16 @@ Content-Type: application/json
     "status": {
       "infos": [
         {
-          "guarantee": [
+          "configs" : [
             {
-              "name": "cpus",
-              "role": "*",
-              "scalar": {
-                "value": 1.0
-              },
-              "type": "SCALAR"
-            },
-            {
-              "name": "mem",
-              "role": "*",
-              "scalar": {
-                "value": 512.0
-              },
-              "type": "SCALAR"
+              "role": "dev",
+              "limits": {
+                "cpus": { "value": 2.0 },
+                "mem":  { "value": 2048.0 },
+                "disk": { "value": 4096.0 }
+              }
             }
-          ],
-          "principal": "my-principal",
-          "role": "role1"
+          ]
         }
       ]
     }
@@ -2246,12 +2574,15 @@ Content-Type: application/json
 
 ```
 
-### SET_QUOTA
+### UPDATE_QUOTA
 
-This call sets the quota for resources to be used by a particular role.
+This call updates the quota for the specified role(s).
+These configurations are applied in an all-or-nothing manner.
+To reset a role's quota back to the default (no guarantees and no limits),
+simply update its quota with empty guarantees and limits fields.
 
 ```
-SET_QUOTA HTTP Request (JSON):
+UPDATE_QUOTA HTTP Request (JSON):
 
 POST /api/v1  HTTP/1.1
 
@@ -2260,64 +2591,33 @@ Content-Type: application/json
 Accept: application/json
 
 {
-  "type": "SET_QUOTA",
-  "set_quota": {
-    "quota_request": {
-      "force": true,
-      "guarantee": [
-        {
-          "name": "cpus",
-          "role": "*",
-          "scalar": {
-            "value": 1.0
-          },
-          "type": "SCALAR"
-        },
-        {
-          "name": "mem",
-          "role": "*",
-          "scalar": {
-            "value": 512.0
-          },
-          "type": "SCALAR"
+  "type": "UPDATE_QUOTA",
+  "update_quota": {
+    "force": false,
+    "quota_configs": [
+      {
+        "role": "dev",
+        "limits": {
+          "cpus": { "value": 10 },
+          "mem":  { "value": 2048 },
+          "disk": { "value": 4096 }
         }
-      ],
-      "role": "role1"
-    }
+      },
+      {
+        "role": "test",
+        "limits": {
+          "cpus": { "value": 1 },
+          "mem":  { "value": 256 },
+          "disk": { "value": 512 }
+        }
+      }
+    ]
   }
 }
 
+UPDATE_QUOTA HTTP Response:
 
-SET_QUOTA HTTP Response:
-
-HTTP/1.1 202 Accepted
-
-```
-
-### REMOVE_QUOTA
-
-This call removes the quota for a particular role.
-
-```
-REMOVE_QUOTA HTTP Request (JSON):
-
-POST /api/v1  HTTP/1.1
-
-Host: masterhost:5050
-Content-Type: application/json
-Accept: application/json
-
-{
-  "type": "REMOVE_QUOTA",
-  "remove_quota": {
-    "role": "role1"
-  }
-}
-
-
-REMOVE_QUOTA HTTP Response:
-
-HTTP/1.1 202 Accepted
+HTTP/1.1 200 OK
 
 ```
 
@@ -2356,6 +2656,91 @@ MARK_AGENT_GONE HTTP Response (JSON):
 HTTP/1.1 200 OK
 ```
 
+### DRAIN_AGENT
+
+Initiates [draining](maintenance.md) on the specified agent.
+
+```
+DRAIN_AGENT HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: masterhost:5050
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "DRAIN_AGENT",
+  "drain_agent": {
+    "agent_id": {
+      "value": "3192b9d1-db71-4699-ae25-e28dfbf42de1"
+    },
+    "max_grace_period": "10mins",
+    "mark_gone": false
+  }
+}
+
+DRAIN_AGENT HTTP Response (JSON):
+
+HTTP/1.1 200 OK
+```
+
+### DEACTIVATE_AGENT
+
+Deactivates the specified agent, preventing offers for that agent's resources
+from being sent to schedulers until the agent is reactivated.
+
+```
+DEACTIVATE_AGENT HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: masterhost:5050
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "DEACTIVATE_AGENT",
+  "deactivate_agent": {
+    "agent_id": {
+      "value": "3192b9d1-db71-4699-ae25-e28dfbf42de1"
+    }
+  }
+}
+
+DEACTIVATE_AGENT HTTP Response (JSON):
+
+HTTP/1.1 200 OK
+```
+
+### REACTIVATE_AGENT
+
+Reactivates the specified agent, resuming offers for that agent's resources if
+the agent was previously deactivated.
+
+```
+REACTIVATE_AGENT HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: masterhost:5050
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "REACTIVATE_AGENT",
+  "reactivate_agent": {
+    "agent_id": {
+      "value": "3192b9d1-db71-4699-ae25-e28dfbf42de1"
+    }
+  }
+}
+
+REACTIVATE_AGENT HTTP Response (JSON):
+
+HTTP/1.1 200 OK
+```
+
 ## Events
 
 Currently, the only call that results in a streaming response is the `SUBSCRIBE` call sent to the master API.
@@ -2390,7 +2775,7 @@ Transfer-Encoding: chunked
 <more events>
 ```
 
-The client is expected to keep a **persistent** connection open to the endpoint even after getting a `SUBSCRIBED` HTTP Response event. This is indicated by "Connection: keep-alive" and "Transfer-Encoding: chunked" headers with *no* "Content-Length" header set. All subsequent events generated by Mesos are streamed on this connection. The master encodes each Event in [RecordIO](scheduler-http-api.md#recordio-response-format) format, i.e., string representation of length of the event in bytes followed by JSON or binary Protobuf encoded event.
+The client is expected to keep a **persistent** connection open to the endpoint even after getting a `SUBSCRIBED` HTTP Response event. This is indicated by "Connection: keep-alive" and "Transfer-Encoding: chunked" headers with *no* "Content-Length" header set. All subsequent events generated by Mesos are streamed on this connection. The master encodes each Event in [RecordIO](recordio.md) format, i.e., string representation of length of the event in bytes followed by JSON or binary Protobuf encoded event.
 
 The following events are currently sent by the master. The canonical source of this information is at [master.proto](https://github.com/apache/mesos/blob/master/include/mesos/v1/master/master.proto). Note that when sending JSON encoded events, master encodes raw bytes in Base64 and strings in UTF-8.
 
@@ -2839,8 +3224,8 @@ Content-Type: application/json
         "value": "0.1"
       },
       {
-        "name": "hadoop_home",
-        "value": ""
+        "name": "gc_non_executor_container_sandboxes",
+        "value": "false"
       },
       {
         "name": "help",
@@ -3472,11 +3857,105 @@ Content-Type: application/json
 
 ```
 
+### GET_OPERATIONS
+
+Returns a list of all offer operations known to the agent, not including
+`LAUNCH` or `LAUNCH_GROUP` operations which can be retrieved with `GET_TASKS`.
+
+```
+GET_OPERATIONS HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: agenthost:5051
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "GET_OPERATIONS"
+}
+
+
+GET_OPERATIONS HTTP Response (JSON):
+
+HTTP/1.1 200 OK
+
+Content-Type: application/json
+
+{
+  "type": "GET_OPERATIONS",
+  "get_operations": {
+    "operations": [
+      {
+        "framework_id": {"value": "74bddcbc-4a02-4d64-b291-aed52032055f-0000"},
+        "agent_id": {"value": "18083noa-j287-dan4-9qx6-l02b84nksb7z-0021"},
+        "info": {
+          "type": "CREATE_DISK",
+          "id": {"value": "n2j8nksj-9827-82bk-nd7u-83hbchu7whdk-9978"},
+          "create_disk": {
+            "source": {
+              "provider_id": {"value": "837hfmi2-u2u7-19pp-1884-812i8f02828j-0030"},
+              "name": "disk",
+              "type": "SCALAR",
+              "scalar": {"value": 1024.0},
+              "role": "storage-role-1",
+              "allocation_info": {"role": "storage-role-1"},
+              "reservation": {
+                "type": "DYNAMIC",
+                "role": "storage-role-1",
+                "principal": "storage-service"
+              },
+              "reservations": [{
+                "type": "DYNAMIC",
+                "role": "storage-role-1",
+                "principal": "storage-service"
+              }],
+              "disk": {
+                "source": {
+                  "type": "RAW",
+                  "vendor": "nas-service",
+                  "id": "vol-19827509",
+                  "profile": "fast-volume"
+                }
+              }
+            },
+            "target_type": "MOUNT"
+          }
+        },
+        "latest_status": {
+          "operation_id": {"value": "n2j8nksj-9827-82bk-nd7u-83hbchu7whdk-9978"},
+          "state": "OPERATION_PENDING",
+          "uuid": {"value": "28987843-j288-1k0s-l29n-837ybzmo18tj-nv73"},
+          "agent_id": {"value": "18083noa-j287-dan4-9qx6-l02b84nksb7z-0021"},
+          "resource_provider_id": {"value": "837hfmi2-u2u7-19pp-1884-812i8f02828j-0030"}
+        },
+        "statuses": [{
+          "operation_id": {"value": "n2j8nksj-9827-82bk-nd7u-83hbchu7whdk-9978"},
+          "state": "OPERATION_PENDING",
+          "uuid": {"value": "28987843-j288-1k0s-l29n-837ybzmo18tj-nv73"},
+          "agent_id": {"value": "18083noa-j287-dan4-9qx6-l02b84nksb7z-0021"},
+          "resource_provider_id": {"value": "837hfmi2-u2u7-19pp-1884-812i8f02828j-0030"}
+        }],
+        "uuid": {"value": "nsj27802-jd82-jd19-jd38-837jdfnoqfij-u284"}
+      }
+    ]
+  }
+}
+
+```
+
 ### LAUNCH_NESTED_CONTAINER
 
 This call launches a nested container. Any authorized entity,
 including the executor itself, its tasks, or the operator can use this
 API to launch a nested container.
+
+**NOTE**: Successful invocation of this API will result in some metadata
+tracked by the agent and the creation of a container sandbox under the
+parent container. The REMOVE_NESTED_CONTAINER should be used to remove
+the metadata and sandbox. If the `--gc_non_executor_container_sandboxes`
+agent flag is enabled, the agent will garbage collect the sandboxes of
+any containers launched via this API.
 
 ```
 LAUNCH_NESTED_CONTAINER HTTP Request (JSON):
@@ -3691,7 +4170,9 @@ they may contain subtypes of either DATA or CONTROL. DATA messages
 must be of type STDIN and contain the actual data to stream to the
 STDIN of the container being attached to. Currently, the only valid
 CONTROL message sends a heartbeat to keep the connection alive. We may
-add more CONTROL messages in the future.
+add more CONTROL messages in the future. An empty DATA message of type
+STDIN indicates EOF. If the container was launched with TTYInfo in their
+ContainerInfo, an EOT DATA message is expected instead.
 
 ```
 ATTACH_CONTAINER_INPUT HTTP Request (JSON):
@@ -3740,6 +4221,19 @@ Accept: application/json
             "nanoseconds": 30000000000
           }
         }
+      }
+    }
+  }
+}215
+{
+  "type": "ATTACH_CONTAINER_INPUT",
+  "attach_container_input": {
+    "type": "PROCESS_IO",
+    "process_io": {
+      "type": "DATA",
+      "data": {
+        "type": "STDIN",
+        "data": ""
       }
     }
   }
@@ -3848,6 +4342,81 @@ REMOVE_NESTED_CONTAINER HTTP Response (JSON):
 
 HTTP/1.1 200 OK
 ```
+
+### GET_RESOURCE_PROVIDERS
+
+This call retrieves information about all the resource providers known
+to the agent.
+
+```
+GET_RESOURCE_PROVIDERS HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: agenthost:5051
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "GET_RESOURCE_PROVIDERS"
+}
+
+
+GET_RESOURCE_PROVIDERS HTTP Response (JSON):
+
+HTTP/1.1 200 OK
+
+Content-Type: application/json
+
+{
+  "type": "GET_RESOURCE_PROVIDERS",
+  "get_resource_providers": {
+    "resource_providers": [
+      {
+        "resource_provider_info": {
+          "id": {
+            "value": "22d25a71-9134-4fe6-88f4-146c31ceaf4a"
+          },
+          "type": "org.apache.mesos.rp.local.storage",
+          "name": "test",
+          "default_reservations": [
+            {
+              "type": "DYNAMIC",
+              "role": "storage"
+            }
+          ],
+          "storage": {
+            "plugin": {
+              "type": "org.apache.mesos.csi.test",
+              "name": "test_csi_plugin",
+              "containers": [
+                {
+                  "services": [
+                    "CONTROLLER_SERVICE",
+                    "NODE_SERVICE"
+                  ],
+                  "command": {
+                    "shell": false,
+                    "value": "/opt/mesos/bin/test-csi-plugin",
+                    "arguments": [
+                      "/opt/mesos/bin/test-csi-plugin",
+                      "--available_capacity=4GB",
+                      "--volumes=",
+                      "--work_dir=/var/run/mesos/test_csi_plugin"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    ]
+  }
+}
+
+```
+
 
 ### ADD_RESOURCE_PROVIDER_CONFIG
 

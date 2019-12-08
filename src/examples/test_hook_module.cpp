@@ -51,7 +51,7 @@ class HookProcess : public ProtobufProcess<HookProcess>
 public:
   HookProcess() : ProcessBase(process::ID::generate("example-hook")) {}
 
-  void initialize()
+  void initialize() override
   {
     install<internal::HookExecuted>(
         &HookProcess::handler,
@@ -87,10 +87,10 @@ private:
 class TestHook : public Hook
 {
 public:
-  virtual Result<Labels> masterLaunchTaskLabelDecorator(
+  Result<Labels> masterLaunchTaskLabelDecorator(
       const TaskInfo& taskInfo,
       const FrameworkInfo& frameworkInfo,
-      const SlaveInfo& slaveInfo)
+      const SlaveInfo& slaveInfo) override
   {
     LOG(INFO) << "Executing 'masterLaunchTaskLabelDecorator' hook";
 
@@ -111,7 +111,35 @@ public:
     return labels;
   }
 
-  virtual Try<Nothing> masterSlaveLostHook(const SlaveInfo& slaveInfo)
+  Result<Resources> masterLaunchTaskResourceDecorator(
+      const TaskInfo& taskInfo,
+      const Resources& slaveResources) override
+  {
+    LOG(INFO) << "Executing 'masterLaunchTaskResourceDecorator' hook";
+
+    // If slave does not declare network bandwidth resource,
+    // don't set a default value for it.
+    if (slaveResources.names().count("network_bandwidth") == 0) {
+      return taskInfo.resources();
+    }
+
+    Resources taskResources = taskInfo.resources();
+
+    // Add a default value for network bandwidth if absent.
+    if (taskResources.names().count("network_bandwidth") == 0) {
+      Resources bandwidth =
+        CHECK_NOTERROR(Resources::parse("network_bandwidth:10"));
+
+      CHECK(!taskResources.allocations().empty());
+      bandwidth.allocate(taskResources.allocations().begin()->first);
+
+      taskResources += bandwidth;
+    }
+
+    return taskResources;
+  }
+
+  Try<Nothing> masterSlaveLostHook(const SlaveInfo& slaveInfo) override
   {
     LOG(INFO) << "Executing 'masterSlaveLostHook' in agent '"
               << slaveInfo.id() << "'";
@@ -140,11 +168,11 @@ public:
 
   // TODO(nnielsen): Split hook tests into multiple modules to avoid
   // interference.
-  virtual Result<Labels> slaveRunTaskLabelDecorator(
+  Result<Labels> slaveRunTaskLabelDecorator(
       const TaskInfo& taskInfo,
       const ExecutorInfo& executorInfo,
       const FrameworkInfo& frameworkInfo,
-      const SlaveInfo& slaveInfo)
+      const SlaveInfo& slaveInfo) override
   {
     LOG(INFO) << "Executing 'slaveRunTaskLabelDecorator' hook";
 
@@ -168,8 +196,8 @@ public:
 
   // In this hook, we create a new environment variable "FOO" and set
   // it's value to "bar".
-  virtual Result<Environment> slaveExecutorEnvironmentDecorator(
-      const ExecutorInfo& executorInfo)
+  Result<Environment> slaveExecutorEnvironmentDecorator(
+      const ExecutorInfo& executorInfo) override
   {
     LOG(INFO) << "Executing 'slaveExecutorEnvironmentDecorator' hook";
 
@@ -192,14 +220,14 @@ public:
   // Otherwise we add an environment variable to the executor and task.
   // Additionally, this hook creates a file named "foo" in the container
   // work directory (sandbox).
-  virtual Future<Option<DockerTaskExecutorPrepareInfo>>
+  Future<Option<DockerTaskExecutorPrepareInfo>>
     slavePreLaunchDockerTaskExecutorDecorator(
         const Option<TaskInfo>& taskInfo,
         const ExecutorInfo& executorInfo,
         const string& containerName,
         const string& containerWorkDirectory,
         const string& mappedSandboxDirectory,
-        const Option<map<string, string>>& env)
+        const Option<map<string, string>>& env) override
   {
     LOG(INFO) << "Executing 'slavePreLaunchDockerTaskExecutorDecorator' hook";
 
@@ -231,9 +259,9 @@ public:
   }
 
 
-  virtual Try<Nothing> slavePostFetchHook(
+  Try<Nothing> slavePostFetchHook(
       const ContainerID& containerId,
-      const string& directory)
+      const string& directory) override
   {
     LOG(INFO) << "Executing 'slavePostFetchHook'";
 
@@ -249,9 +277,9 @@ public:
 
   // This hook locates the file created by environment decorator hook
   // and deletes it.
-  virtual Try<Nothing> slaveRemoveExecutorHook(
+  Try<Nothing> slaveRemoveExecutorHook(
       const FrameworkInfo& frameworkInfo,
-      const ExecutorInfo& executorInfo)
+      const ExecutorInfo& executorInfo) override
   {
     LOG(INFO) << "Executing 'slaveRemoveExecutorHook'";
 
@@ -277,9 +305,9 @@ public:
   }
 
 
-  virtual Result<TaskStatus> slaveTaskStatusDecorator(
+  Result<TaskStatus> slaveTaskStatusDecorator(
       const FrameworkID& frameworkId,
-      const TaskStatus& status)
+      const TaskStatus& status) override
   {
     LOG(INFO) << "Executing 'slaveTaskStatusDecorator' hook";
 
@@ -318,8 +346,8 @@ public:
   }
 
 
-  virtual Result<Resources> slaveResourcesDecorator(
-      const SlaveInfo& slaveInfo)
+  Result<Resources> slaveResourcesDecorator(
+      const SlaveInfo& slaveInfo) override
   {
     LOG(INFO) << "Executing 'slaveResourcesDecorator' hook";
 
@@ -340,8 +368,8 @@ public:
   }
 
 
-  virtual Result<Attributes> slaveAttributesDecorator(
-      const SlaveInfo& slaveInfo)
+  Result<Attributes> slaveAttributesDecorator(
+      const SlaveInfo& slaveInfo) override
   {
     LOG(INFO) << "Executing 'slaveAttributesDecorator' hook";
 

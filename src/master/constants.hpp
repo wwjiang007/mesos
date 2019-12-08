@@ -20,6 +20,7 @@
 #include <stdint.h>
 
 #include <mesos/mesos.hpp>
+#include <mesos/quota/quota.hpp>
 
 #include <stout/bytes.hpp>
 #include <stout/duration.hpp>
@@ -46,6 +47,14 @@ constexpr double MIN_CPUS = 0.01;
 
 // Minimum amount of memory per offer.
 constexpr Bytes MIN_MEM = Megabytes(32);
+
+// Default timeout for v0 framework and agent authentication
+// before the master cancels an in-progress authentication.
+//
+// TODO(bmahler): Ideally, we remove this v0-style authentication
+// in favor of just using HTTP authentication at the libprocess
+// layer.
+constexpr Duration DEFAULT_AUTHENTICATION_V0_TIMEOUT = Seconds(15);
 
 // Default interval the master uses to send heartbeats to an HTTP
 // scheduler.
@@ -83,6 +92,10 @@ constexpr double RECOVERY_AGENT_REMOVAL_PERCENT_LIMIT = 1.0; // 100%.
 // Maximum number of removed slaves to store in the cache.
 constexpr size_t MAX_REMOVED_SLAVES = 100000;
 
+// Default maximum number of subscribers to the master's event stream
+// to keep active at any time.
+constexpr size_t DEFAULT_MAX_OPERATOR_EVENT_STREAM_SUBSCRIBERS = 1000;
+
 // Default maximum number of completed frameworks to store in the cache.
 constexpr size_t DEFAULT_MAX_COMPLETED_FRAMEWORKS = 50;
 
@@ -93,6 +106,13 @@ constexpr size_t DEFAULT_MAX_COMPLETED_TASKS_PER_FRAMEWORK = 1000;
 // Default maximum number of unreachable tasks per framework
 // to store in the cache.
 constexpr size_t DEFAULT_MAX_UNREACHABLE_TASKS_PER_FRAMEWORK = 1000;
+
+// The minimum amount of time the master waits for a framework to reregister
+// before the master adopts any operations originating from that
+// framework. This applies to any framework not explicitly marked "completed"
+// in the master's memory.
+// Adopted operations will be acknowledged by the master.
+constexpr Duration MIN_WAIT_BEFORE_ORPHAN_OPERATION_ADOPTION = Minutes(10);
 
 // Time interval to check for updated watchers list.
 constexpr Duration WHITELIST_WATCH_INTERVAL = Seconds(5);
@@ -127,8 +147,8 @@ constexpr Duration ZOOKEEPER_SESSION_TIMEOUT = Seconds(10);
 // Name of the default, CRAM-MD5 authenticator.
 constexpr char DEFAULT_AUTHENTICATOR[] = "crammd5";
 
-// Name of the default, HierarchicalDRF authenticator.
-constexpr char DEFAULT_ALLOCATOR[] = "HierarchicalDRF";
+// Name of the default hierarchical allocator.
+constexpr char DEFAULT_ALLOCATOR[] = "hierarchical";
 
 // The default interval between allocations.
 constexpr Duration DEFAULT_ALLOCATION_INTERVAL = Seconds(1);
@@ -152,6 +172,12 @@ constexpr char DEFAULT_HTTP_FRAMEWORK_AUTHENTICATION_REALM[] =
 const Version MINIMUM_AGENT_VERSION = Version(1, 0, 0);
 
 std::vector<MasterInfo::Capability> MASTER_CAPABILITIES();
+
+// A role's default quota: no guarantees and no limits.
+const Quota DEFAULT_QUOTA;
+
+// Default weight for a role.
+constexpr double DEFAULT_WEIGHT = 1.0;
 
 } // namespace master {
 } // namespace internal {

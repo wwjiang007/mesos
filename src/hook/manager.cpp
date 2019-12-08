@@ -14,7 +14,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <list>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -36,7 +35,6 @@
 #include "hook/manager.hpp"
 #include "module/manager.hpp"
 
-using std::list;
 using std::map;
 using std::string;
 using std::vector;
@@ -112,14 +110,14 @@ Labels HookManager::masterLaunchTaskLabelDecorator(
     const FrameworkInfo& frameworkInfo,
     const SlaveInfo& slaveInfo)
 {
-  synchronized (mutex) {
-    // We need a mutable copy of the task info and set the new
-    // labels after each hook invocation. Otherwise, the last hook
-    // will be the only effective hook setting the labels.
-    TaskInfo taskInfo_ = taskInfo;
+  // We need a mutable copy of the task info and set the new
+  // labels after each hook invocation. Otherwise, the last hook
+  // will be the only effective hook setting the labels.
+  TaskInfo taskInfo_ = taskInfo;
 
+  synchronized (mutex) {
     foreachpair (const string& name, Hook* hook, availableHooks) {
-      const Result<Labels> result =
+      Result<Labels> result =
         hook->masterLaunchTaskLabelDecorator(
             taskInfo_,
             frameworkInfo,
@@ -128,15 +126,40 @@ Labels HookManager::masterLaunchTaskLabelDecorator(
       // NOTE: If the hook returns None(), the task labels won't be
       // changed.
       if (result.isSome()) {
-        taskInfo_.mutable_labels()->CopyFrom(result.get());
+        *taskInfo_.mutable_labels() = std::move(result.get());
       } else if (result.isError()) {
         LOG(WARNING) << "Master label decorator hook failed for module '"
                     << name << "': " << result.error();
       }
     }
-
-    return taskInfo_.labels();
   }
+
+  return std::move(*taskInfo_.mutable_labels());
+}
+
+
+Resources HookManager::masterLaunchTaskResourceDecorator(
+    const TaskInfo& taskInfo,
+    const Resources& slaveResources)
+{
+  TaskInfo taskInfo_ = taskInfo;
+
+  synchronized (mutex) {
+    foreachpair (const string& name, Hook* hook, availableHooks) {
+      Result<Resources> result =
+        hook->masterLaunchTaskResourceDecorator(
+          taskInfo_,
+          slaveResources);
+
+      if (result.isSome()) {
+        *taskInfo_.mutable_resources() = std::move(result.get());
+      } else if (result.isError()) {
+        LOG(WARNING) << "Master resource decorator hook failed for module '"
+                     << name << "': " << result.error();
+      }
+    }
+  }
+  return std::move(*taskInfo_.mutable_resources());
 }
 
 
@@ -216,7 +239,8 @@ Future<DockerTaskExecutorPrepareInfo>
   // We execute these hooks according to their ordering so any conflicting
   // `DockerTaskExecutorPrepareInfo` can be deterministically resolved
   // (the last hook takes priority).
-  list<Future<Option<DockerTaskExecutorPrepareInfo>>> futures;
+  vector<Future<Option<DockerTaskExecutorPrepareInfo>>> futures;
+  futures.reserve(availableHooks.size());
 
   foreachvalue (Hook* hook, availableHooks) {
     // Chain together each hook.
@@ -231,7 +255,7 @@ Future<DockerTaskExecutorPrepareInfo>
   }
 
   return collect(futures)
-    .then([](const list<Option<DockerTaskExecutorPrepareInfo>>& results)
+    .then([](const vector<Option<DockerTaskExecutorPrepareInfo>>& results)
         -> Future<DockerTaskExecutorPrepareInfo> {
       DockerTaskExecutorPrepareInfo taskExecutorDecoratorInfo;
 

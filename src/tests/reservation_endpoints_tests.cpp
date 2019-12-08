@@ -74,7 +74,7 @@ class ReservationEndpointsTest : public MesosTest
 public:
   // Set up the master flags such that it allows registration of the framework
   // created with 'createFrameworkInfo'.
-  virtual master::Flags CreateMasterFlags()
+  master::Flags CreateMasterFlags() override
   {
     // Turn off periodic allocations to avoid the race between
     // `HierarchicalAllocator::updateAvailable()` and periodic allocations.
@@ -1559,6 +1559,7 @@ TEST_F(ReservationEndpointsTest, AgentStateEndpointResources)
   // the agent to receive and process the `ApplyOperationMessage` and respond
   // with an initial operation status update.
   AWAIT_READY(updateOperationStatusMessage);
+  EXPECT_TRUE(metricEquals("master/operations/finished", 1));
 
   // Make sure CheckpointResourcesMessage handling is completed
   // before proceeding.

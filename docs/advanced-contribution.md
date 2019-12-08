@@ -14,12 +14,18 @@ If you'd like to make significant contributions to Mesos, then you'll want to be
     + Apache JIRA Account
 <br/><br/>
 * Required installations
-    + RBtools
+    + RBtools (0.7.10 is known to work, 1.0.1 appears to have an issue)
+    + [pre-commit](https://pre-commit.com/#install)
 
 ## Issue Tracking, Code Review, and Mailing Lists
 
 * We use [Apache Software Foundation JIRA](https://issues.apache.org/jira/browse/mesos/) to track and manage issues. If you don't already have an account, you'll need to create one.
-* We use [Apache Review Board](https://reviews.apache.org) for code reviews. If you don't already have an account, you'll need to create one (it's separate from your Apache JIRA account).
+
+* We use [Apache Review Board](https://reviews.apache.org) for code reviews.
+
+  **NOTE**: Apache Review Board currently does not allow creation of new accounts. We are aware of this and are looking into possible solutions;
+  in the meantime please coordinate with your shepherd on how to best transmit your patches.
+
     * A code review request should be created for every JIRA that involves a change to the codebase.
 * Once your JIRA and Review Board accounts are in place please go ahead and create a review or GitHub pull request with an entry for yourself in [contributors.yaml](https://github.com/apache/mesos/blob/master/docs/contributors.yaml) file.
     * The file is used to map contributions to the JIRA and Review Board accounts of their respective authors. We also use this mapping to track contributions of various organizations to Apache Mesos.
@@ -43,7 +49,7 @@ Here is the standard procedure for proposing and making changes to Mesos:
     3. Issues marked with the "[newbie](https://issues.apache.org/jira/browse/MESOS-1?jql=project%20%3D%20MESOS%20AND%20status%20%3D%20Accepted%20AND%20labels%20%3D%20newbie)" label can be good candidates for "starter" projects. You can also look for the labels "newbie++", "beginner", and "beginners".
     4. When identifying a JIRA issue to work on, it is recommended to work on items that are relevant to the next release. Selecting work items important for the next release increases the priority for reviewers during the contribution process. See the tracking ticket for the release to figure out the high priority projects or ask the release manager to guide you.
 2. Assign the JIRA to yourself.
-    1. You will be able to assign the JIRA to yourself as soon as your pull request with additions to the contributors.yaml file is merged.
+    1. You will be able to assign the JIRA to yourself as soon as a JIRA admin updates your account to 'contributor' status. This will usually be done soon after your pull request with additions to the contributors.yaml file is merged.
 3. Formulate a plan for resolving the issue. Guidelines to consider when designing a solution can be found in the [effective-code-reviewing](effective-code-reviewing.md) document. It is important to discuss your proposed solution within the JIRA ticket early in the resolution process in order to get feedback from reviewers. Early discussions will help:
     1. ensure the solution will be scoped in a consumable fashion;
     2. eliminate duplicate work with other contributions; and
@@ -59,9 +65,9 @@ Here is the standard procedure for proposing and making changes to Mesos:
 1. Create one or more test cases to exercise the bug or the feature (the Mesos team uses [test-driven development](http://en.wikipedia.org/wiki/Test-driven_development)). Before you start coding, make sure these test cases all fail.
     1. The [testing patterns](testing-patterns.md) page has some suggestions for writing test cases.
 2. Make your changes to the code (using whatever IDE/editor you choose) to actually fix the bug or implement the feature.
-    1. Before beginning, please read the [Mesos C++ Style Guide](c++-style-guide.md). It is recommended to use the git pre-commit hook (`support/hooks/pre-commit`) to automatically check for style errors. See the hook script for instructions to enable it.
+    1. Before beginning, please read the [Mesos C++ Style Guide](c++-style-guide.md). It is recommended to use the git pre-commit hook to automatically check for style errors. The hooks are set up by invoking `./support/setup_dev.sh`.
     2. Most of your changes will probably be to files inside of `BASE_MESOS_DIR`
-    3. From inside of the root Mesos directory: `./bootstrap` (Only required if building from git repository).
+    3. From inside of the root Mesos directory: `./bootstrap` and `./support/setup-dev.sh`.
     4. To build, we recommend that you don't build inside of the src directory. We recommend you do the following:
         1. From inside of the root Mesos directory: `mkdir build && cd build`
         2. `../configure`
@@ -89,7 +95,7 @@ Here is the standard procedure for proposing and making changes to Mesos:
 1. You're ready to submit your patch for review!
     1. Log in or create an account at [Apache Review Board](http://reviews.apache.org).
     2. The easiest (and recommended) way to submit reviews is through `post-reviews.py` a wrapper around post-review.
-    3. First, install RBTools. [See Instructions](https://www.reviewboard.org/docs/rbtools/dev/).
+    3. First, install RBTools (0.7.10 is recommended, 1.0.1 appears to have an issue). [See Instructions](https://www.reviewboard.org/docs/rbtools/dev/).
     4. Configure post-review. The easiest method is to symlink to the sample config: `ln -s support/reviewboardrc .reviewboardrc`.
     5. Log into Review Board from the command line: run `rbt status`.
     6. From your local branch run `support/post-reviews.py`.
@@ -123,4 +129,4 @@ The following links provide additional guidance as you get started contributing 
 
 ## Core Libraries
 
-There are two core libraries in Mesos: *stout* and *libprocess*. *stout* is the low level operating system abstraction tooling that should be used in place of writing your own low level tools. *libprocess* is a library used to support building compatible concurrent components (see [video](https://www.youtube.com/watch?v=5EIiU6R_6KE) for an introduction to the *libprocess* library). New contributors to Mesos should become familiar with these libraries and utilize them where appropriate. Additional documentation can be found in the following two README files: [3rdparty/libprocess/README.md](https://github.com/apache/mesos/blob/master/3rdparty/libprocess/README.md) and [3rdparty/stout/README.md](https://github.com/apache/mesos/blob/master/3rdparty/stout/README.md).
+There are two core libraries in Mesos: *stout* and *libprocess*. *stout* is the low level operating system abstraction tooling that should be used in place of writing your own low level tools. *libprocess* is a library used to support building compatible concurrent components. New contributors to Mesos should become familiar with these libraries and utilize them where appropriate. Additional documentation can be found in the following two README files: [3rdparty/libprocess/README.md](https://github.com/apache/mesos/blob/master/3rdparty/libprocess/README.md) and [3rdparty/stout/README.md](https://github.com/apache/mesos/blob/master/3rdparty/stout/README.md).

@@ -20,14 +20,15 @@ MAINTAINER The Apache Mesos Developers <dev@mesos.apache.org>
 WORKDIR /tmp/build
 
 # Build Mesos-flavored `clang-tidy`.
-RUN apt-get update
-RUN apt-get install -qy --no-install-recommends \
+RUN apt-get update && \
+  apt-get install -qy --no-install-recommends \
   build-essential \
   ca-certificates \
   curl \
   git \
   python-dev && \
-  apt-get clean
+  apt-get clean && \
+  rm -rf /var/lib/apt/lists/*
 
 # Mesos requires at least cmake-3.7.0 on Linux and cmake-3.8.0 on Windows.
 #
@@ -38,9 +39,9 @@ RUN curl -sSL https://cmake.org/files/v3.8/cmake-3.8.2-Linux-x86_64.sh \
     sh /tmp/install-cmake.sh --skip-license --prefix=/usr/local
 
 RUN \
-  git clone --depth 1 -b release_50 http://llvm.org/git/llvm /tmp/llvm && \
-  git clone --depth 1 -b mesos_50 http://github.com/mesos/clang.git /tmp/llvm/tools/clang && \
-  git clone --depth 1 -b mesos_50 http://github.com/mesos/clang-tools-extra.git /tmp/llvm/tools/clang/tools/extra && \
+  git clone --depth 1 -b release_90 http://llvm.org/git/llvm /tmp/llvm && \
+  git clone --depth 1 -b mesos_90 http://github.com/mesos/clang.git /tmp/llvm/tools/clang && \
+  git clone --depth 1 -b mesos_90 http://github.com/mesos/clang-tools-extra.git /tmp/llvm/tools/clang/tools/extra && \
   \
   cmake /tmp/llvm -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt && \
   cmake --build tools/clang/lib/Headers --target install -- -j $(nproc) && \
@@ -54,7 +55,8 @@ ENV PATH /opt/bin:$PATH
 
 # Install Mesos dependencies
 # TODO(mpark): Remove `libssl-dev` from this list once `MESOS-6942` is resolved.
-RUN apt-get install -qy \
+RUN apt-get update && \
+  apt-get install -qy \
   autoconf \
   libapr1-dev \
   libcurl4-nss-dev \
@@ -64,13 +66,16 @@ RUN apt-get install -qy \
   libsvn-dev \
   libtool \
   zlib1g-dev && \
-  apt-get clean
+  apt-get clean && \
+  rm -rf /var/lib/apt/lists/*
 
 # Install `jq` and `parallel` for `clang-tidy` invocation.
-RUN apt-get install -qy \
+RUN apt-get update && \
+  apt-get install -qy \
   jq \
   parallel && \
-  apt-get clean
+  apt-get clean && \
+  rm -rf /var/lib/apt/lists/*
 
 # Wire up the script which performs the actual work.
 WORKDIR /BUILD

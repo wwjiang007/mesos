@@ -47,16 +47,21 @@ public:
 
   static Try<process::Owned<Fetcher::Plugin>> create(const Flags& flags);
 
-  virtual ~DockerFetcherPlugin();
+  static std::string getBlobPath(
+      const std::string& directory,
+      const std::string& blobSum);
 
-  virtual std::set<std::string> schemes() const;
+  ~DockerFetcherPlugin() override;
 
-  virtual std::string name() const;
+  std::set<std::string> schemes() const override;
 
-  virtual process::Future<Nothing> fetch(
+  std::string name() const override;
+
+  process::Future<Nothing> fetch(
       const URI& uri,
       const std::string& directory,
-      const Option<std::string>& data = None()) const;
+      const Option<std::string>& data = None(),
+      const Option<std::string>& outputFileName = None()) const override;
 
 private:
   explicit DockerFetcherPlugin(

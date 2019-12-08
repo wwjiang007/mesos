@@ -59,6 +59,7 @@
 #include <stout/try.hpp>
 #include <stout/version.hpp>
 
+#include "common/authorization.hpp"
 #include "common/build.hpp"
 #include "common/http.hpp"
 #include "common/protobuf_utils.hpp"
@@ -200,7 +201,6 @@ int main(int argc, char** argv)
   }
 
   if (flags.ip_discovery_command.isSome()) {
-#ifndef __WINDOWS__
     Try<string> ipAddress = os::shell(flags.ip_discovery_command.get());
 
     if (ipAddress.isError()) {
@@ -208,11 +208,6 @@ int main(int argc, char** argv)
     }
 
     os::setenv("LIBPROCESS_IP", strings::trim(ipAddress.get()));
-#else
-    // TODO(andschwa): Support this when `os::shell` is enabled.
-    EXIT(EXIT_FAILURE)
-      << "The `--ip.discovery_command` is not yet supported on Windows";
-#endif // __WINDOWS__
   } else if (flags.ip.isSome()) {
     os::setenv("LIBPROCESS_IP", flags.ip.get());
   }
@@ -335,17 +330,19 @@ int main(int argc, char** argv)
   }
 
   // Create an instance of allocator.
-  const string allocatorName = flags.allocator;
-  Try<Allocator*> allocator = Allocator::create(allocatorName);
+  Try<Allocator*> allocator = Allocator::create(
+      flags.allocator,
+      flags.role_sorter,
+      flags.framework_sorter);
 
   if (allocator.isError()) {
     EXIT(EXIT_FAILURE)
-      << "Failed to create '" << allocatorName
-      << "' allocator: " << allocator.error();
+      << "Failed to create allocator '" << flags.allocator << "'"
+      << ": " << allocator.error();
   }
 
   CHECK_NOTNULL(allocator.get());
-  LOG(INFO) << "Using '" << allocatorName << "' allocator";
+  LOG(INFO) << "Using '" << flags.allocator << "' allocator";
 
   Storage* storage = nullptr;
 #ifndef __WINDOWS__
@@ -484,7 +481,7 @@ int main(int argc, char** argv)
     // future it becomes possible to dynamically set the authorizer, this would
     // break.
     process::http::authorization::setCallbacks(
-        createAuthorizationCallbacks(authorizer_.get()));
+        mesos::authorization::createAuthorizationCallbacks(authorizer_.get()));
   }
 
   Files files(READONLY_HTTP_AUTHENTICATION_REALM, authorizer_);

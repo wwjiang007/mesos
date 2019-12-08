@@ -71,13 +71,17 @@ public:
       const Option<process::http::authentication::Principal>&) const;
 
   // /slave/monitor/statistics
-  // /slave/monitor/statistics.json
   process::Future<process::http::Response> statistics(
       const process::http::Request& request,
       const Option<process::http::authentication::Principal>& principal) const;
 
   // /slave/containers
   process::Future<process::http::Response> containers(
+      const process::http::Request& request,
+      const Option<process::http::authentication::Principal>& principal) const;
+
+  // /slave/containerizer/debug
+  process::Future<process::http::Response> containerizerDebug(
       const process::http::Request& request,
       const Option<process::http::authentication::Principal>& principal) const;
 
@@ -89,6 +93,7 @@ public:
   static std::string STATE_HELP();
   static std::string STATISTICS_HELP();
   static std::string CONTAINERS_HELP();
+  static std::string CONTAINERIZER_DEBUG_HELP();
 
 private:
   JSON::Object _flags() const;
@@ -120,6 +125,9 @@ private:
       Option<IDAcceptor<ContainerID>> selectContainerId,
       bool showNestedContainers,
       bool showStandaloneContainers) const;
+
+  // Continuation for `/containerizer/debug` endpoint
+  process::Future<JSON::Object> _containerizerDebug() const;
 
   // Helper routines for endpoint authorization.
   Try<std::string> extractEndpoint(const process::http::URL& url) const;
@@ -327,6 +335,9 @@ private:
       process::Owned<recordio::Reader<agent::Call>>&& decoder,
       const RequestMediaTypes& mediaTypes) const;
 
+  process::Future<process::http::Response> acknowledgeContainerInputResponse(
+      const ContainerID& containerId) const;
+
   process::Future<process::http::Response> attachContainerOutput(
       const mesos::agent::Call& call,
       const RequestMediaTypes& mediaTypes,
@@ -345,6 +356,10 @@ private:
       const Option<process::http::authentication::Principal>& principal) const;
 
   process::Future<process::http::Response> removeResourceProviderConfig(
+      const mesos::agent::Call& call,
+      const Option<process::http::authentication::Principal>& principal) const;
+
+  process::Future<process::http::Response> markResourceProviderGone(
       const mesos::agent::Call& call,
       const Option<process::http::authentication::Principal>& principal) const;
 

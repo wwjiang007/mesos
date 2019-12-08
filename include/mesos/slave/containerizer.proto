@@ -24,6 +24,8 @@ import "mesos/appc/spec.proto";
 
 import "mesos/docker/v1.proto";
 
+import "mesos/seccomp/seccomp.proto";
+
 /**
  * Some containers are launched in conjunction with a specific
  * `ContainerClass`. These classes allow an isolator to customize
@@ -69,6 +71,9 @@ message ContainerState {
   // This field only exists for top level containers.
   optional ExecutorInfo executor_info = 1;
 
+  // This field only exists for nested containers and standalone containers.
+  optional ContainerInfo container_info = 6;
+
   // The container Id.
   required ContainerID container_id = 2;
 
@@ -77,6 +82,9 @@ message ContainerState {
 
   // The sandbox directory.
   required string directory = 4;
+
+  // Ephemeral path volumes subject to container disk quota.
+  repeated string ephemeral_volumes = 5;
 }
 
 
@@ -140,6 +148,9 @@ message ContainerConfig {
   // The work directory for the container in the host filesystem.
   required string directory = 3;
 
+  // Ephemeral path volumes subject to container disk quota.
+  repeated string ephemeral_volumes = 15;
+
   // The user that should be used to run the `command_info`.
   // The sandbox directory and any artifacts from the Mesos fetcher will
   // be made accessible to this user.
@@ -191,6 +202,52 @@ message ContainerMountInfo {
 
 
 /**
+ * Describes a file operation to be applied to the container at
+ * launch time.
+ */
+message ContainerFileOperation {
+  enum Operation {
+    // Create a symlink that points to `source` at `target`.
+    SYMLINK = 1;
+
+    // Perform a container mount. This can be used when a mount is part
+    // of a sequence of steps involving other filesystem operations.
+    MOUNT = 2;
+
+    // Rename a path;
+    RENAME = 3;
+
+    // Create a directory.
+    MKDIR = 4;
+  };
+
+  message Symlink {
+    optional string source = 1;
+    optional string target = 2;
+  }
+
+  message Rename {
+    optional string source = 1;
+    optional string target = 2;
+  }
+
+  message Mkdir {
+    optional string target = 1;
+    optional bool recursive = 2;
+  }
+
+  optional Operation operation = 1;
+
+  oneof parameters {
+    Symlink symlink = 2;
+    Mkdir mkdir = 3;
+    Rename rename = 4;
+    ContainerMountInfo mount = 5;
+  }
+}
+
+
+/**
  * Protobuf returned by Isolator::prepare(). The command is executed
  * by the Launcher in the containerized context.
  * Note: Currently, any URIs or Environment in the CommandInfo will be
@@ -200,7 +257,7 @@ message ContainerMountInfo {
 message ContainerLaunchInfo {
   // The additional preparation commands to execute before
   // executing the command.
-  repeated CommandInfo pre_exec_commands = 1;
+  repeated CommandInfo pre_exec_commands = 1 [deprecated=true];
 
   // The environment set for the container.
   optional Environment environment = 2;
@@ -218,6 +275,9 @@ message ContainerLaunchInfo {
 
   // (POSIX only) The user to launch the command as.
   optional string user = 10;
+
+  // (POSIX only) The supplementary group IDs to launch the command as.
+  repeated uint32 supplementary_groups = 19;
 
   // If specified, it'll become the launch command for the custom
   // executor, or the launch command for the user task in the case of
@@ -237,6 +297,19 @@ message ContainerLaunchInfo {
   // The additional mounts for the container. The mounts specified in
   // this list will be mounted in order.
   repeated ContainerMountInfo mounts = 17;
+
+  // The set of paths to mask in the container. Files are masked by mounting
+  // `/dev/null` and directories are masked by mounting a zero-sized `tmpfs.
+  // Paths are masked after all other mounts are made.
+  repeated string masked_paths = 21;
+
+  // The list of filesystem operations to perform after the container
+  // mounts, but before launching the container process.
+  repeated ContainerFileOperation file_operations = 22;
+
+  // (Linux only) The Seccomp profile for the container.
+  // The profile is used to configure syscall filtering via `libseccomp`.
+  optional seccomp.ContainerSeccompProfile seccomp_profile = 18;
 
   // (Linux only) The capabilities requested for the container.
   // The capabilities are set while launching the container.
@@ -259,6 +332,13 @@ message ContainerLaunchInfo {
   // TODO(tillt): Remove this once we no longer support the old style
   // command task (i.e., that uses mesos-execute).
   optional Environment task_environment = 15;
+
+  // (POSIX only) The supplementary group IDs specific for command task
+  // with its own rootfs.
+  repeated uint32 task_supplementary_groups = 20;
+
+  // (Linux only) Set the NO_NEW_PRIVILEGES flag.
+  optional bool no_new_privileges = 23;
 }
 
 
@@ -292,4 +372,9 @@ message ContainerTermination {
 message ContainerLayers {
   // Paths of all layers used to provision the container.
   repeated string paths = 1;
+
+  // Path of docker manifest v2 schema2 config. If an image is
+  // downloaded via docker manifest v2s2, the config will be
+  // persisted in the image store.
+  optional string config = 2;
 }

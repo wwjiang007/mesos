@@ -15,14 +15,20 @@
 // limitations under the License.
 
 #include <mesos/executor.hpp>
+#include <mesos/http.hpp>
 #include <mesos/scheduler.hpp>
+
+#include <mesos/v1/master/master.hpp>
 
 #include <process/collect.hpp>
 #include <process/future.hpp>
+#include <process/http.hpp>
 #include <process/owned.hpp>
 #include <process/pid.hpp>
 
 #include "checks/health_checker.hpp"
+
+#include "common/validation.hpp"
 
 #include "docker/docker.hpp"
 
@@ -47,6 +53,8 @@
 
 namespace http = process::http;
 
+using mesos::internal::common::validation::validateHealthCheck;
+
 using mesos::internal::master::Master;
 
 using mesos::internal::slave::Containerizer;
@@ -61,6 +69,7 @@ using mesos::master::detector::MasterDetector;
 using mesos::slave::ContainerLogger;
 using mesos::slave::ContainerTermination;
 
+using process::Failure;
 using process::Future;
 using process::Owned;
 using process::PID;
@@ -199,11 +208,11 @@ TEST_F(HealthCheckTest, HealthCheckProtobufValidation)
   {
     HealthCheck healthCheckProto;
 
-    Option<Error> validate = validation::healthCheck(healthCheckProto);
+    Option<Error> validate = validateHealthCheck(healthCheckProto);
     EXPECT_SOME(validate);
 
     healthCheckProto.set_type(HealthCheck::UNKNOWN);
-    validate = validation::healthCheck(healthCheckProto);
+    validate = validateHealthCheck(healthCheckProto);
     EXPECT_SOME(validate);
   }
 
@@ -212,15 +221,15 @@ TEST_F(HealthCheckTest, HealthCheckProtobufValidation)
     HealthCheck healthCheckProto;
 
     healthCheckProto.set_type(HealthCheck::COMMAND);
-    Option<Error> validate = validation::healthCheck(healthCheckProto);
+    Option<Error> validate = validateHealthCheck(healthCheckProto);
     EXPECT_SOME(validate);
 
     healthCheckProto.set_type(HealthCheck::HTTP);
-    validate = validation::healthCheck(healthCheckProto);
+    validate = validateHealthCheck(healthCheckProto);
     EXPECT_SOME(validate);
 
     healthCheckProto.set_type(HealthCheck::TCP);
-    validate = validation::healthCheck(healthCheckProto);
+    validate = validateHealthCheck(healthCheckProto);
     EXPECT_SOME(validate);
   }
 
@@ -232,21 +241,21 @@ TEST_F(HealthCheckTest, HealthCheckProtobufValidation)
     healthCheckProto.mutable_http()->set_port(8080);
 
     healthCheckProto.set_delay_seconds(-1.0);
-    Option<Error> validate = validation::healthCheck(healthCheckProto);
+    Option<Error> validate = validateHealthCheck(healthCheckProto);
     EXPECT_SOME(validate);
 
     healthCheckProto.set_delay_seconds(0.0);
     healthCheckProto.set_interval_seconds(-1.0);
-    validate = validation::healthCheck(healthCheckProto);
+    validate = validateHealthCheck(healthCheckProto);
     EXPECT_SOME(validate);
 
     healthCheckProto.set_interval_seconds(0.0);
     healthCheckProto.set_timeout_seconds(-1.0);
-    validate = validation::healthCheck(healthCheckProto);
+    validate = validateHealthCheck(healthCheckProto);
     EXPECT_SOME(validate);
 
     healthCheckProto.set_timeout_seconds(0.0);
-    validate = validation::healthCheck(healthCheckProto);
+    validate = validateHealthCheck(healthCheckProto);
     EXPECT_NONE(validate);
   }
 
@@ -256,7 +265,7 @@ TEST_F(HealthCheckTest, HealthCheckProtobufValidation)
 
     healthCheckProto.set_type(HealthCheck::COMMAND);
     healthCheckProto.mutable_command()->CopyFrom(CommandInfo());
-    Option<Error> validate = validation::healthCheck(healthCheckProto);
+    Option<Error> validate = validateHealthCheck(healthCheckProto);
     EXPECT_SOME(validate);
   }
 
@@ -267,7 +276,7 @@ TEST_F(HealthCheckTest, HealthCheckProtobufValidation)
     healthCheckProto.set_type(HealthCheck::COMMAND);
     healthCheckProto.mutable_command()->CopyFrom(createCommandInfo("exit 0"));
 
-    Option<Error> validate = validation::healthCheck(healthCheckProto);
+    Option<Error> validate = validateHealthCheck(healthCheckProto);
     EXPECT_NONE(validate);
 
     Environment::Variable* variable =
@@ -275,7 +284,7 @@ TEST_F(HealthCheckTest, HealthCheckProtobufValidation)
           ->mutable_variables()->Add();
     variable->set_name("ENV_VAR_KEY");
 
-    validate = validation::healthCheck(healthCheckProto);
+    validate = validateHealthCheck(healthCheckProto);
     EXPECT_SOME(validate);
   }
 
@@ -286,16 +295,16 @@ TEST_F(HealthCheckTest, HealthCheckProtobufValidation)
     healthCheckProto.set_type(HealthCheck::HTTP);
     healthCheckProto.mutable_http()->set_port(8080);
 
-    Option<Error> validate = validation::healthCheck(healthCheckProto);
+    Option<Error> validate = validateHealthCheck(healthCheckProto);
     EXPECT_NONE(validate);
 
     healthCheckProto.mutable_http()->set_scheme("ftp");
-    validate = validation::healthCheck(healthCheckProto);
+    validate = validateHealthCheck(healthCheckProto);
     EXPECT_SOME(validate);
 
     healthCheckProto.mutable_http()->set_scheme("https");
     healthCheckProto.mutable_http()->set_path("healthz");
-    validate = validation::healthCheck(healthCheckProto);
+    validate = validateHealthCheck(healthCheckProto);
     EXPECT_SOME(validate);
   }
 }
@@ -330,8 +339,15 @@ TEST_F(HealthCheckTest, HealthyTask)
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->empty());
 
-  vector<TaskInfo> tasks =
-    populateTasks(SLEEP_COMMAND(120), "exit 0", offers.get()[0]);
+  vector<TaskInfo> tasks = populateTasks(
+      SLEEP_COMMAND(120),
+      "exit 0",
+      offers.get()[0],
+      1,
+      1,
+      None(),
+      None(),
+      1);
 
   Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
@@ -394,7 +410,8 @@ TEST_F(HealthCheckTest, HealthyTask)
   EXPECT_TRUE(implicitReconciliation->has_healthy());
   EXPECT_TRUE(implicitReconciliation->healthy());
 
-  // Verify that task health is exposed in the master's state endpoint.
+  // Verify that task's health check definition and current health status
+  // are exposed in the master's state endpoint.
   {
     Future<http::Response> response = http::get(
         master.get()->pid,
@@ -410,9 +427,38 @@ TEST_F(HealthCheckTest, HealthyTask)
     Result<JSON::Value> find = parse->find<JSON::Value>(
         "frameworks[0].tasks[0].statuses[1].healthy");
     EXPECT_SOME_TRUE(find);
+
+    find = parse->find<JSON::Value>(
+        "frameworks[0].tasks[0].health_check.type");
+    EXPECT_SOME_EQ("COMMAND", find);
+
+    find = parse->find<JSON::Value>(
+        "frameworks[0].tasks[0].health_check.command.value");
+    EXPECT_SOME_EQ("exit 0", find);
+
+    find = parse->find<JSON::Value>(
+        "frameworks[0].tasks[0].health_check.delay_seconds");
+    EXPECT_SOME_EQ(0, find);
+
+    find = parse->find<JSON::Value>(
+        "frameworks[0].tasks[0].health_check.interval_seconds");
+    EXPECT_SOME_EQ(0, find);
+
+    find = parse->find<JSON::Value>(
+        "frameworks[0].tasks[0].health_check.timeout_seconds");
+    EXPECT_SOME_EQ(1, find);
+
+    find = parse->find<JSON::Value>(
+        "frameworks[0].tasks[0].health_check.consecutive_failures");
+    EXPECT_SOME_EQ(1u, find);
+
+    find = parse->find<JSON::Value>(
+        "frameworks[0].tasks[0].health_check.grace_period_seconds");
+    EXPECT_SOME_EQ(1, find);
   }
 
-  // Verify that task health is exposed in the agent's state endpoint.
+  // Verify that the task's health definition and current health status
+  // are exposed in the agent's state endpoint.
   {
     Future<http::Response> response = http::get(
         agent.get()->pid,
@@ -428,6 +474,14 @@ TEST_F(HealthCheckTest, HealthyTask)
     Result<JSON::Value> find = parse->find<JSON::Value>(
         "frameworks[0].executors[0].tasks[0].statuses[1].healthy");
     EXPECT_SOME_TRUE(find);
+
+    find = parse->find<JSON::Value>(
+        "frameworks[0].executors[0].tasks[0].health_check.type");
+    EXPECT_SOME_EQ("COMMAND", find);
+
+    find = parse->find<JSON::Value>(
+        "frameworks[0].executors[0].tasks[0].health_check.command.value");
+    EXPECT_SOME_EQ("exit 0", find);
   }
 
   driver.stop();
@@ -616,7 +670,7 @@ TEST_F(HealthCheckTest, HealthyTaskNonShell)
   driver.launchTasks(offers.get()[0].id(), tasks);
 
   AWAIT_READY(statusStarting);
-  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -1354,7 +1408,8 @@ TEST_F(HealthCheckTest, HealthyTaskViaTCP)
 // Tests a healthy task via HTTP with a container image using mesos
 // containerizer. To emulate a task responsive to HTTP health checks,
 // starts Netcat in the docker "alpine" image.
-TEST_F(HealthCheckTest, ROOT_INTERNET_CURL_HealthyTaskViaHTTPWithContainerImage)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(
+    HealthCheckTest, ROOT_INTERNET_CURL_HealthyTaskViaHTTPWithContainerImage)
 {
   master::Flags masterFlags = CreateMasterFlags();
   masterFlags.allocation_interval = Milliseconds(50);
@@ -1447,8 +1502,8 @@ TEST_F(HealthCheckTest, ROOT_INTERNET_CURL_HealthyTaskViaHTTPWithContainerImage)
 // Tests a healthy task via HTTPS with a container image using mesos
 // containerizer. To emulate a task responsive to HTTPS health checks,
 // starts an HTTPS server in the docker "haosdent/https-server" image.
-TEST_F(HealthCheckTest,
-       ROOT_INTERNET_CURL_HealthyTaskViaHTTPSWithContainerImage)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(
+    HealthCheckTest, ROOT_INTERNET_CURL_HealthyTaskViaHTTPSWithContainerImage)
 {
   master::Flags masterFlags = CreateMasterFlags();
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
@@ -1547,7 +1602,8 @@ TEST_F(HealthCheckTest,
 // NOTE: This test is almost identical to
 // ROOT_INTERNET_CURL_HealthyTaskViaHTTPWithContainerImage
 // with the difference being TCP health check.
-TEST_F(HealthCheckTest, ROOT_INTERNET_CURL_HealthyTaskViaTCPWithContainerImage)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(
+    HealthCheckTest, ROOT_INTERNET_CURL_HealthyTaskViaTCPWithContainerImage)
 {
   master::Flags masterFlags = CreateMasterFlags();
   masterFlags.allocation_interval = Milliseconds(50);
@@ -1736,7 +1792,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   driver.acceptOffers(
       {offers->front().id()}, {LAUNCH_GROUP(executor, taskGroup)});
 
-  AWAIT_READY(statusRunning);
+  AWAIT_READY(statusStarting);
   EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
@@ -1763,11 +1819,11 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   }
 }
 
-
+#ifdef __linux__
 // Tests a healthy docker task via CMD health checks using the
 // DefaultExecutor.
 TEST_F_TEMP_DISABLED_ON_WINDOWS(
-    HealthCheckTest, DefaultExecutorWithDockerImageCommandHealthCheck)
+    HealthCheckTest, ROOT_DefaultExecutorWithDockerImageCommandHealthCheck)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -1782,6 +1838,17 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
 
   flags.acls = acls;
 #endif // USE_SSL_SOCKET
+
+  const string directory = path::join(os::getcwd(), "archives");
+
+  Future<Nothing> testImage = DockerArchive::create(directory, "alpine");
+  AWAIT_READY(testImage);
+  ASSERT_TRUE(os::exists(path::join(directory, "alpine.tar")));
+
+  flags.isolation = "docker/runtime,filesystem/linux";
+  flags.image_providers = "docker";
+  flags.docker_registry = directory;
+  flags.docker_store_dir = path::join(os::getcwd(), "store");
 
   Fetcher fetcher(flags);
 
@@ -1833,9 +1900,13 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   TaskInfo task = createTask(offers->front(), "sleep 120");
 
   // TODO(tnachen): Use local image to test if possible.
+  Image image;
+  image.set_type(Image::DOCKER);
+  image.mutable_docker()->set_name("alpine");
+
   ContainerInfo containerInfo;
   containerInfo.set_type(ContainerInfo::MESOS);
-  containerInfo.mutable_docker()->set_image("alpine");
+  containerInfo.mutable_mesos()->mutable_image()->CopyFrom(image);
 
   task.mutable_container()->CopyFrom(containerInfo);
 
@@ -1898,6 +1969,148 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
     AWAIT_READY(containerizer->wait(containerId));
   }
 }
+#endif  // __linux__
+
+
+// This test verifies that the debug container launched by the command health
+// check will be run as the user of its parent container rather than the user
+// of the default executor. This is a regression test for MESOS-9332.
+TEST_F_TEMP_DISABLED_ON_WINDOWS(
+    HealthCheckTest, ROOT_UNPRIVILEGED_USER_DefaultExecutorCommandHealthCheck)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+#ifndef USE_SSL_SOCKET
+  // Set permissive ACLs in the agent so that the local authorizer will be
+  // loaded and implicit executor authorization will be tested.
+  ACLs acls;
+  acls.set_permissive(true);
+
+  flags.acls = acls;
+#endif // USE_SSL_SOCKET
+
+  Fetcher fetcher(flags);
+
+  // We have to explicitly create a `Containerizer` in non-local mode,
+  // because `LaunchNestedContainerSession` (used by command health
+  // checks) tries to start a IO switchboard, which doesn't work in
+  // local mode yet.
+  Try<MesosContainerizer*> _containerizer =
+    MesosContainerizer::create(flags, false, &fetcher);
+
+  ASSERT_SOME(_containerizer);
+
+  Owned<slave::Containerizer> containerizer(_containerizer.get());
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> agent =
+    StartSlave(detector.get(), containerizer.get(), flags);
+
+  ASSERT_SOME(agent);
+
+  Option<string> user = os::getenv("SUDO_USER");
+  ASSERT_SOME(user);
+
+  // Set the framework user to a non-root user so the default executor will
+  // also be run as this non-root user since the default executor always runs
+  // as the same user of the framework.
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_user(user.get());
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+    &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusHealthy;
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusHealthy));
+
+  // Launch a task as root user to create a file.
+  TaskInfo task = createTask(offers->front(), "touch file && sleep 120");
+  task.mutable_command()->set_user("root");
+
+  // Run the command health check without specifying user in its `CommandInfo`,
+  // and the health check will try to write to the file created by the task.
+  // Since the debug container launched by the health check will run as the same
+  // user (i.e., root user) of its parent container (i.e., the task), it will
+  // have the permission to write to the file.
+  HealthCheck healthCheck;
+  healthCheck.set_type(HealthCheck::COMMAND);
+  healthCheck.mutable_command()->set_value("echo abc > file");
+  healthCheck.set_delay_seconds(0);
+  healthCheck.set_interval_seconds(0);
+  healthCheck.set_grace_period_seconds(0);
+
+  task.mutable_health_check()->CopyFrom(healthCheck);
+
+  Resources executorResources =
+    allocatedResources(Resources::parse("cpus:0.1;mem:32;disk:32").get(), "*");
+
+  task.mutable_resources()->CopyFrom(task.resources() - executorResources);
+
+  TaskGroupInfo taskGroup;
+  taskGroup.add_tasks()->CopyFrom(task);
+
+  ExecutorInfo executor;
+  executor.mutable_executor_id()->set_value("default");
+  executor.set_type(ExecutorInfo::DEFAULT);
+  executor.mutable_framework_id()->CopyFrom(frameworkId.get());
+  executor.mutable_resources()->CopyFrom(executorResources);
+  executor.mutable_shutdown_grace_period()->set_nanoseconds(Seconds(10).ns());
+
+  driver.acceptOffers(
+      {offers->front().id()}, {LAUNCH_GROUP(executor, taskGroup)});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  AWAIT_READY(statusHealthy);
+  EXPECT_EQ(TASK_RUNNING, statusHealthy->state());
+  EXPECT_EQ(
+      TaskStatus::REASON_TASK_HEALTH_CHECK_STATUS_UPDATED,
+      statusHealthy->reason());
+  EXPECT_TRUE(statusHealthy->has_healthy());
+  EXPECT_TRUE(statusHealthy->healthy());
+
+  Future<hashset<ContainerID>> containerIds = containerizer->containers();
+
+  AWAIT_READY(containerIds);
+
+  driver.stop();
+  driver.join();
+
+  // Cleanup all mesos launched containers.
+  foreach (const ContainerID& containerId, containerIds.get()) {
+    AWAIT_READY(containerizer->wait(containerId));
+  }
+}
 
 
 // Fixture for testing TCP/HTTP(S) health check support
@@ -1907,8 +2120,10 @@ class DockerContainerizerHealthCheckTest
     public ::testing::WithParamInterface<NetworkInfo::Protocol>
 {
 protected:
-  virtual void SetUp()
+  void SetUp() override
   {
+    MesosTest::SetUp();
+
     Future<std::tuple<Nothing, Nothing, Nothing>> pulls = process::collect(
         pullDockerImage(DOCKER_TEST_IMAGE),
         pullDockerImage(DOCKER_HTTP_IMAGE),
@@ -1930,7 +2145,7 @@ protected:
     createDockerIPv6UserNetwork();
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     Try<Owned<Docker>> docker = Docker::create(
         tests::flags.docker,
@@ -1939,7 +2154,7 @@ protected:
 
     ASSERT_SOME(docker);
 
-    Future<std::list<Docker::Container>> containers =
+    Future<std::vector<Docker::Container>> containers =
       docker.get()->ps(true, slave::DOCKER_NAME_PREFIX);
 
     AWAIT_READY(containers);
@@ -1950,6 +2165,8 @@ protected:
     }
 
     removeDockerIPv6UserNetwork();
+
+    MesosTest::TearDown();
   }
 };
 
@@ -2348,15 +2565,6 @@ TEST_F(DockerContainerizerHealthCheckTest, ROOT_DOCKER_DockerHealthyTask)
   Shared<Docker> docker(
       new MockDocker(tests::flags.docker, tests::flags.docker_socket));
 
-  Try<Nothing> validateResult = docker->validateVersion(Version(1, 3, 0));
-  ASSERT_SOME(validateResult)
-    << "-------------------------------------------------------------\n"
-    << "We cannot run this test because of 'docker exec' command \n"
-    << "require docker version greater than '1.3.0'. You won't be \n"
-    << "able to use the docker exec method, but feel free to disable\n"
-    << "this test.\n"
-    << "-------------------------------------------------------------";
-
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
@@ -2396,7 +2604,7 @@ TEST_F(DockerContainerizerHealthCheckTest, ROOT_DOCKER_DockerHealthyTask)
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->empty());
 
-  TaskInfo task = createTask(offers.get()[0], DOCKER_SLEEP_CMD(120));
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(120));
 
   // TODO(tnachen): Use local image to test if possible.
   ContainerInfo containerInfo;
@@ -2459,7 +2667,7 @@ TEST_F(DockerContainerizerHealthCheckTest, ROOT_DOCKER_DockerHealthyTask)
   agent.get()->terminate();
   agent->reset();
 
-  Future<std::list<Docker::Container>> containers =
+  Future<std::vector<Docker::Container>> containers =
     docker->ps(true, slave::DOCKER_NAME_PREFIX);
 
   AWAIT_READY(containers);
@@ -2477,15 +2685,6 @@ TEST_F(DockerContainerizerHealthCheckTest, ROOT_DOCKER_DockerHealthStatusChange)
 {
   Shared<Docker> docker(
       new MockDocker(tests::flags.docker, tests::flags.docker_socket));
-
-  Try<Nothing> validateResult = docker->validateVersion(Version(1, 3, 0));
-  ASSERT_SOME(validateResult)
-    << "-------------------------------------------------------------\n"
-    << "We cannot run this test because of 'docker exec' command \n"
-    << "require docker version greater than '1.3.0'. You won't be \n"
-    << "able to use the docker exec method, but feel free to disable\n"
-    << "this test.\n"
-    << "-------------------------------------------------------------";
 
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -2526,7 +2725,7 @@ TEST_F(DockerContainerizerHealthCheckTest, ROOT_DOCKER_DockerHealthStatusChange)
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->empty());
 
-  TaskInfo task = createTask(offers.get()[0], DOCKER_SLEEP_CMD(120));
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(120));
 
   // TODO(tnachen): Use local image to test if possible.
   ContainerInfo containerInfo;
@@ -2550,15 +2749,16 @@ TEST_F(DockerContainerizerHealthCheckTest, ROOT_DOCKER_DockerHealthStatusChange)
   //
   // Case 1:
   //   - Remove the temporary file.
+  //
+  // NOTE: On Windows, we delete a temporary directory instead since `del`
+  // doesn't return an error if it tries to delete a nonexistent file, but
+  // `rmdir` does. Also, we hard code a path starting with `C:\` instead
+  // of using `tmpPath` since the path might not be possible to make inside
+  // the container (for example, if the `tmpPath` is in the `D:\` drive).
 #ifdef __WINDOWS__
+  const string dockerPath = path::join("C:", id::UUID::random().toString());
   const string healthCheckCmd =
-    "pwsh -Command "
-    "Remove-Item -ErrorAction SilentlyContinue \"" + tmpPath + "\"; "
-    "if (-Not $?) { "
-      "New-Item -ItemType Directory -Force \"" + os::getcwd() + "\"; "
-      "Set-Content -Path \"" + tmpPath + "\" -Value foo; "
-      "exit 1 "
-    "}";
+    "rmdir /s /q " + dockerPath + " || (mkdir " + dockerPath + " && exit 1)";
 #else
   const string healthCheckCmd =
     "rm " + tmpPath + " || "
@@ -2640,7 +2840,7 @@ TEST_F(DockerContainerizerHealthCheckTest, ROOT_DOCKER_DockerHealthStatusChange)
   agent.get()->terminate();
   agent->reset();
 
-  Future<std::list<Docker::Container>> containers =
+  Future<std::vector<Docker::Container>> containers =
     docker->ps(true, slave::DOCKER_NAME_PREFIX);
 
   AWAIT_READY(containers);
@@ -2660,15 +2860,6 @@ TEST_F(
 {
   Shared<Docker> docker(
       new MockDocker(tests::flags.docker, tests::flags.docker_socket));
-
-  Try<Nothing> validateResult = docker->validateVersion(Version(1, 3, 0));
-  ASSERT_SOME(validateResult)
-    << "-------------------------------------------------------------\n"
-    << "We cannot run this test because of 'docker exec' command \n"
-    << "require docker version greater than '1.3.0'. You won't be \n"
-    << "able to use the docker exec method, but feel free to disable\n"
-    << "this test.\n"
-    << "-------------------------------------------------------------";
 
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -2709,7 +2900,7 @@ TEST_F(
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->empty());
 
-  TaskInfo task = createTask(offers.get()[0], DOCKER_SLEEP_CMD(120));
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(120));
 
   // TODO(akagup): Use local image to test if possible.
   ContainerInfo containerInfo;
@@ -2772,7 +2963,7 @@ TEST_F(
   agent.get()->terminate();
   agent->reset();
 
-  Future<std::list<Docker::Container>> containers =
+  Future<std::vector<Docker::Container>> containers =
     docker->ps(true, slave::DOCKER_NAME_PREFIX);
 
   AWAIT_READY(containers);

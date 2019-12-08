@@ -162,6 +162,58 @@ TEST_P(SchedulerTest, Subscribe)
 }
 
 
+// Test validates that the scheduler library will not allow multiple
+// SUBSCRIBE requests over the same connection.
+TEST_P(SchedulerTest, SubscribeDrop)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  Future<Nothing> connected;
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(FutureSatisfy(&connected));
+
+  ContentType contentType = GetParam();
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      contentType,
+      scheduler);
+
+  AWAIT_READY(connected);
+
+  Future<Nothing> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureSatisfy(&subscribed));
+
+  Future<Nothing> heartbeat;
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillOnce(FutureSatisfy(&heartbeat));
+
+  Clock::pause();
+
+  mesos.send(v1::createCallSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
+
+  // Send another SUBSCRIBE request. This one should get dropped as we
+  // already have a SUBSCRIBE in flight on that same connection.
+
+  mesos.send(v1::createCallSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
+
+  AWAIT_READY(subscribed);
+  AWAIT_READY(heartbeat);
+
+  Clock::resume();
+
+  {
+    JSON::Object metrics = Metrics();
+
+    EXPECT_EQ(1u, metrics.values["master/messages_register_framework"]);
+  }
+}
+
+
 // This test verifies that a scheduler can subscribe with the master after
 // failing over to another instance.
 TEST_P(SchedulerTest, SchedulerFailover)
@@ -292,15 +344,18 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(SchedulerTest, MasterFailover)
     .WillRepeatedly(Return()); // Ignore future invocations.
 
   // Failover the master.
+  // Also wipe the leading master from the detector, so the scheduler
+  // does not try to reconnect while the master actor is not routable.
   master->reset();
+  detector->appoint(None());
+
   master = StartMaster();
   ASSERT_SOME(master);
 
   AWAIT_READY(disconnected);
 
-  // Scheduler library can fire new master detection more than once.
   EXPECT_CALL(*scheduler, connected(_))
-    .WillRepeatedly(
+    .WillOnce(
         v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO, frameworkId));
 
   Future<Event::Subscribed> subscribed2;
@@ -308,6 +363,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(SchedulerTest, MasterFailover)
     .WillOnce(FutureArg<1>(&subscribed2))
     .WillRepeatedly(Return());
 
+  // Give the master leadership now that our scheduler expectations are set up.
   detector->appoint(master.get()->pid);
 
   AWAIT_READY(subscribed2);
@@ -1176,9 +1232,8 @@ TEST_P(SchedulerTest, OperationFeedbackValidationNoResourceProviderCapability)
   const v1::Offer& offer = offers->offers(0);
 
   v1::Resources resources = v1::Resources::parse("cpus:0.1").get();
-  resources.pushReservation(v1::createDynamicReservationInfo(
-      frameworkInfo.roles(1),
-      frameworkInfo.principal()));
+  resources = resources.pushReservation(v1::createDynamicReservationInfo(
+      frameworkInfo.roles(1), frameworkInfo.principal()));
 
   v1::Offer::Operation operation = v1::RESERVE(resources);
   operation.mutable_id()->set_value("RESERVE_OPERATION");
@@ -1190,69 +1245,8 @@ TEST_P(SchedulerTest, OperationFeedbackValidationNoResourceProviderCapability)
   EXPECT_EQ(
       mesos::v1::OPERATION_ERROR,
       updateOperationStatus->status().state());
-}
 
-
-// Verifies invalidation of RESERVE operations with `id` set, when sent by a
-// `SchedulerDriver` framework.
-TEST_P(SchedulerTest, OperationFeedbackValidationSchedulerDriverFramework)
-{
-  Clock::pause();
-
-  master::Flags masterFlags = CreateMasterFlags();
-  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
-  ASSERT_SOME(master);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
-  ASSERT_SOME(slave);
-
-  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
-  frameworkInfo.add_roles("framework-role");
-
-  MockScheduler scheduler;
-  MesosSchedulerDriver driver(
-      &scheduler,
-      frameworkInfo,
-      master.get()->pid,
-      DEFAULT_CREDENTIAL);
-
-  Future<FrameworkID> frameworkId;
-  EXPECT_CALL(scheduler, registered(&driver, _, _))
-    .WillOnce(FutureArg<1>(&frameworkId));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(scheduler, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers));
-
-  driver.start();
-
-  AWAIT_READY(frameworkId);
-
-  Clock::advance(masterFlags.allocation_interval);
-  Clock::settle();
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->empty());
-
-  Future<Nothing> schedulerError;
-  EXPECT_CALL(scheduler, error(_, _))
-    .WillOnce(FutureSatisfy(&schedulerError));
-
-  const Offer& offer = offers->at(0);
-
-  Resources resources = Resources::parse("cpus:0.1").get();
-  resources.pushReservation(createDynamicReservationInfo(
-      frameworkInfo.roles(1),
-      frameworkInfo.principal()));
-
-  Offer::Operation operation = RESERVE(resources);
-  operation.mutable_id()->set_value("RESERVE_OPERATION");
-
-  driver.acceptOffers({offer.id()}, {operation});
-
-  AWAIT_READY(schedulerError);
+  EXPECT_TRUE(metricEquals("master/operations/error", 1));
 }
 
 
@@ -1578,6 +1572,8 @@ TEST_P(SchedulerTest, Revive)
 
 TEST_P(SchedulerTest, Suppress)
 {
+  const string ROLE = "foo";
+
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
@@ -1611,12 +1607,17 @@ TEST_P(SchedulerTest, Suppress)
   EXPECT_CALL(*scheduler, offers(_, _))
     .WillOnce(FutureArg<1>(&offers1));
 
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+
+  frameworkInfo.clear_roles();
+  frameworkInfo.add_roles(ROLE);
+
   {
     Call call;
     call.set_type(Call::SUBSCRIBE);
 
     Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
+    subscribe->mutable_framework_info()->CopyFrom(frameworkInfo);
 
     mesos.send(call);
   }
@@ -1624,6 +1625,8 @@ TEST_P(SchedulerTest, Suppress)
   AWAIT_READY(subscribed);
 
   v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  frameworkInfo.mutable_id()->CopyFrom(frameworkId);
 
   AWAIT_READY(offers1);
   ASSERT_FALSE(offers1->offers().empty());
@@ -1650,6 +1653,20 @@ TEST_P(SchedulerTest, Suppress)
     mesos.send(call);
   }
 
+  // Wait for the master to process the DECLINE call.
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
+
+  JSON::Object metrics1 = Metrics();
+
+  const string prefix =
+    master::getFrameworkMetricPrefix(devolve(frameworkInfo));
+
+  EXPECT_EQ(1, metrics1.values[prefix + "subscribed"]);
+  EXPECT_EQ(1, metrics1.values[prefix + "offers/declined"]);
+  EXPECT_EQ(0, metrics1.values[prefix + "roles/" + ROLE + "/suppressed"]);
+
   Future<Nothing> suppressOffers =
     FUTURE_DISPATCH(_, &MesosAllocatorProcess::suppressOffers);
 
@@ -1666,6 +1683,10 @@ TEST_P(SchedulerTest, Suppress)
   // Wait for allocator to finish executing 'suppressOffers()'.
   Clock::pause();
   Clock::settle();
+
+  JSON::Object metrics2 = Metrics();
+
+  EXPECT_EQ(1, metrics2.values[prefix + "roles/" + ROLE + "/suppressed"]);
 
   // No offers should be sent within 100 mins because the framework
   // suppressed offers.
@@ -2326,7 +2347,7 @@ class SchedulerSSLTest
 // These test setup/teardown methods are only needed when compiled with SSL.
 #ifdef USE_SSL_SOCKET
 protected:
-  virtual void SetUp()
+  void SetUp() override
   {
     MesosTest::SetUp();
 

@@ -56,6 +56,7 @@
 #include "authentication/executor/jwt_secret_generator.hpp"
 #endif // USE_SSL_SOCKET
 
+#include "common/authorization.hpp"
 #include "common/build.hpp"
 #include "common/http.hpp"
 
@@ -151,16 +152,7 @@ static Try<Nothing> assignCgroups(const slave::Flags& flags)
     // Create a cgroup for the slave.
     string cgroup = path::join(flags.cgroups_root, "slave");
 
-    Try<bool> exists = cgroups::exists(hierarchy.get(), cgroup);
-    if (exists.isError()) {
-      return Error(
-          "Failed to find cgroup " + cgroup +
-          " for subsystem " + subsystem +
-          " under hierarchy " + hierarchy.get() +
-          " for agent: " + exists.error());
-    }
-
-    if (!exists.get()) {
+    if (!cgroups::exists(hierarchy.get(), cgroup)) {
       Try<Nothing> create = cgroups::create(hierarchy.get(), cgroup);
       if (create.isError()) {
         return Error(
@@ -211,7 +203,7 @@ static Try<Nothing> assignCgroups(const slave::Flags& flags)
 
       LOG(INFO) << "An agent (or child process) is still running, please"
                 << " consider checking the following process(es) listed in "
-                << path::join(hierarchy.get(), cgroup, "cgroups.proc")
+                << path::join(hierarchy.get(), cgroup, "cgroup.procs")
                 << ":\n" << strings::join("\n", infos);
     }
 
@@ -320,7 +312,6 @@ int main(int argc, char** argv)
   }
 
   if (flags.ip_discovery_command.isSome()) {
-#ifndef __WINDOWS__
     Try<string> ipAddress = os::shell(flags.ip_discovery_command.get());
 
     if (ipAddress.isError()) {
@@ -328,28 +319,17 @@ int main(int argc, char** argv)
     }
 
     os::setenv("LIBPROCESS_IP", strings::trim(ipAddress.get()));
-#else
-    // TODO(andschwa): Support this when `os::shell` is enabled.
-    EXIT(EXIT_FAILURE)
-      << "The `--ip_discovery_command` is not yet supported on Windows";
-#endif // __WINDOWS__
   } else if (flags.ip.isSome()) {
     os::setenv("LIBPROCESS_IP", flags.ip.get());
   }
 
   if (flags.ip6_discovery_command.isSome()) {
-#ifndef __WINDOWS__
     Try<string> ip6Address = os::shell(flags.ip6_discovery_command.get());
     if (ip6Address.isError()) {
       EXIT(EXIT_FAILURE) << ip6Address.error();
     }
 
     os::setenv("LIBPROCESS_IP6", strings::trim(ip6Address.get()));
-#else
-    // TODO(andschwa): Support this when `os::shell` is enabled.
-    EXIT(EXIT_FAILURE)
-      << "The `--ip6_discovery_command` is not yet supported on Windows";
-#endif // __WINDOWS__
   } else if (flags.ip6.isSome()) {
     os::setenv("LIBPROCESS_IP6", flags.ip6.get());
   }
@@ -486,6 +466,7 @@ int main(int argc, char** argv)
 #endif // __linux__
 
   Fetcher* fetcher = new Fetcher(flags);
+  GarbageCollector* gc = new GarbageCollector(flags.work_dir);
 
   // Initialize SecretResolver.
   Try<SecretResolver*> secretResolver =
@@ -496,8 +477,35 @@ int main(int argc, char** argv)
         << "Failed to initialize secret resolver: " << secretResolver.error();
   }
 
-  Try<Containerizer*> containerizer =
-    Containerizer::create(flags, false, fetcher, secretResolver.get());
+  VolumeGidManager* volumeGidManager = nullptr;
+
+#ifndef __WINDOWS__
+  if (flags.volume_gid_range.isSome()) {
+    Try<VolumeGidManager*> _volumeGidManager = VolumeGidManager::create(flags);
+    if (_volumeGidManager.isError()) {
+      EXIT(EXIT_FAILURE) << "Failed to initialize volume gid manager: "
+                         << _volumeGidManager.error();
+    }
+
+    volumeGidManager = _volumeGidManager.get();
+  }
+#endif // __WINDOWS__
+
+  // Initialize PendingFutureTracker.
+  Try<PendingFutureTracker*> futureTracker = PendingFutureTracker::create();
+  if (futureTracker.isError()) {
+    EXIT(EXIT_FAILURE) << "Failed to initialize pending future tracker: "
+                       << futureTracker.error();
+  }
+
+  Try<Containerizer*> containerizer = Containerizer::create(
+      flags,
+      false,
+      fetcher,
+      gc,
+      secretResolver.get(),
+      volumeGidManager,
+      futureTracker.get());
 
   if (containerizer.isError()) {
     EXIT(EXIT_FAILURE)
@@ -547,11 +555,10 @@ int main(int argc, char** argv)
     // future it becomes possible to dynamically set the authorizer, this would
     // break.
     process::http::authorization::setCallbacks(
-        createAuthorizationCallbacks(authorizer_.get()));
+        mesos::authorization::createAuthorizationCallbacks(authorizer_.get()));
   }
 
   Files* files = new Files(READONLY_HTTP_AUTHENTICATION_REALM, authorizer_);
-  GarbageCollector* gc = new GarbageCollector();
   TaskStatusUpdateManager* taskStatusUpdateManager =
     new TaskStatusUpdateManager(flags);
 
@@ -611,6 +618,8 @@ int main(int argc, char** argv)
       resourceEstimator.get(),
       qosController.get(),
       secretGenerator,
+      volumeGidManager,
+      futureTracker.get(),
       authorizer_);
 
   process::spawn(slave);
@@ -626,8 +635,6 @@ int main(int argc, char** argv)
 
   delete taskStatusUpdateManager;
 
-  delete gc;
-
   delete files;
 
   if (authorizer_.isSome()) {
@@ -637,6 +644,16 @@ int main(int argc, char** argv)
   delete detector;
 
   delete containerizer.get();
+
+  delete futureTracker.get();
+
+#ifndef __WINDOWS__
+  delete volumeGidManager;
+#endif // __WINDOWS__
+
+  delete secretResolver.get();
+
+  delete gc;
 
   delete fetcher;
 

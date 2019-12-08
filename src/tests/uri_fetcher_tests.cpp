@@ -35,7 +35,9 @@
 
 #include <stout/tests/utils.hpp>
 
+#ifndef __WINDOWS__
 #include <mesos/docker/spec.hpp>
+#endif // __WINDOWS__
 
 #include "uri/fetcher.hpp"
 
@@ -48,6 +50,10 @@ namespace http = process::http;
 
 using std::list;
 using std::string;
+
+#ifndef __WINDOWS__
+using mesos::uri::DockerFetcherPlugin;
+#endif // __WINDOWS__
 
 using process::Future;
 using process::Owned;
@@ -75,14 +81,14 @@ public:
 class CurlFetcherPluginTest : public TemporaryDirectoryTest
 {
 protected:
-  virtual void SetUp()
+  void SetUp() override
   {
     TemporaryDirectoryTest::SetUp();
 
     spawn(server);
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     terminate(server);
     wait(server);
@@ -110,6 +116,25 @@ TEST_F(CurlFetcherPluginTest, CURL_ValidUri)
   AWAIT_READY(fetcher.get()->fetch(uri, os::getcwd()));
 
   EXPECT_TRUE(os::exists(path::join(os::getcwd(), "test")));
+}
+
+
+TEST_F(CurlFetcherPluginTest, CURL_ValidUriWithOutputFileName)
+{
+  URI uri = uri::http(
+      stringify(server.self().address.ip),
+      "/TestHttpServer/test",
+      server.self().address.port);
+
+  EXPECT_CALL(server, test(_))
+    .WillOnce(Return(http::OK("test")));
+
+  Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
+  ASSERT_SOME(fetcher);
+
+  AWAIT_READY(fetcher.get()->fetch(uri, os::getcwd(), None(), "file"));
+
+  EXPECT_TRUE(os::exists(path::join(os::getcwd(), "file")));
 }
 
 
@@ -144,7 +169,7 @@ TEST_F(CurlFetcherPluginTest, CURL_InvokeFetchByName)
   Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
   ASSERT_SOME(fetcher);
 
-  AWAIT_READY(fetcher.get()->fetch(uri, os::getcwd(), "curl", None()));
+  AWAIT_READY(fetcher.get()->fetch(uri, os::getcwd(), "curl", None(), None()));
 
   EXPECT_TRUE(os::exists(path::join(os::getcwd(), "test")));
 }
@@ -153,7 +178,7 @@ TEST_F(CurlFetcherPluginTest, CURL_InvokeFetchByName)
 class HadoopFetcherPluginTest : public TemporaryDirectoryTest
 {
 public:
-  virtual void SetUp()
+  void SetUp() override
   {
     TemporaryDirectoryTest::SetUp();
 
@@ -264,7 +289,7 @@ TEST_F(HadoopFetcherPluginTest, InvokeFetchByName)
 
   string dir = path::join(os::getcwd(), "dir");
 
-  AWAIT_READY(fetcher.get()->fetch(uri, dir, "hadoop", None()));
+  AWAIT_READY(fetcher.get()->fetch(uri, dir, "hadoop", None(), None()));
 
   EXPECT_SOME_EQ("abc", os::read(path::join(dir, "file")));
 }
@@ -274,16 +299,27 @@ TEST_F(HadoopFetcherPluginTest, InvokeFetchByName)
 // tests can use this as well.
 static constexpr char DOCKER_REGISTRY_HOST[] = "registry-1.docker.io";
 
+#ifdef __WINDOWS__
+static constexpr char TEST_REPOSITORY[] = "microsoft/nanoserver";
+static constexpr char TEST_DIGEST[] = "sha256:54389c2d19b423943102864aaf3fc"
+                                      "1296e5dd140a074b5bd6700de858a8e5479";
+#else
+static constexpr char TEST_REPOSITORY[] = "library/busybox";
+static constexpr char TEST_DIGEST[] = "sha256:a3ed95caeb02ffe68cdd9fd844066"
+                                      "80ae93d633cb16422d00e8a7c22955b46d4";
+#endif // __WINDOWS__
 
+
+// NOTE: Windows images exist and can be fetched, but there is no Windows
+// provisioner in the Mesos containerizer that can use these images.
+#ifndef __WINDOWS__
 class DockerFetcherPluginTest : public TemporaryDirectoryTest {};
 
 
-TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchManifest)
+TEST_F(DockerFetcherPluginTest, DISABLED_INTERNET_CURL_FetchManifest)
 {
   URI uri = uri::docker::manifest(
-      "library/busybox",
-      "latest",
-      DOCKER_REGISTRY_HOST);
+      TEST_REPOSITORY, "latest", DOCKER_REGISTRY_HOST);
 
   Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
   ASSERT_SOME(fetcher);
@@ -292,27 +328,24 @@ TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchManifest)
 
   AWAIT_READY_FOR(fetcher.get()->fetch(uri, dir), Seconds(60));
 
+  // Version 2 schema 2 image manifest test
   Try<string> _manifest = os::read(path::join(dir, "manifest"));
   ASSERT_SOME(_manifest);
 
-  Try<docker::spec::v2::ImageManifest> manifest =
-    docker::spec::v2::parse(_manifest.get());
+  Try<docker::spec::v2_2::ImageManifest> manifest =
+    docker::spec::v2_2::parse(_manifest.get());
 
   ASSERT_SOME(manifest);
-  EXPECT_EQ("library/busybox", manifest->name());
-  EXPECT_EQ("latest", manifest->tag());
+  EXPECT_EQ(2u, manifest->schemaversion());
+  EXPECT_EQ("application/vnd.docker.distribution.manifest.v2+json",
+            manifest->mediatype());
 }
 
 
 TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchBlob)
 {
-  const string digest =
-    "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4";
-
   URI uri = uri::docker::blob(
-      "library/busybox",
-      digest,
-      DOCKER_REGISTRY_HOST);
+      TEST_REPOSITORY, TEST_DIGEST, DOCKER_REGISTRY_HOST);
 
   Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
   ASSERT_SOME(fetcher);
@@ -321,17 +354,15 @@ TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchBlob)
 
   AWAIT_READY_FOR(fetcher.get()->fetch(uri, dir), Seconds(60));
 
-  EXPECT_TRUE(os::exists(path::join(dir, digest)));
+  EXPECT_TRUE(os::exists(DockerFetcherPlugin::getBlobPath(dir, TEST_DIGEST)));
 }
 
 
 // Fetches the image manifest and all blobs in that image.
-TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchImage)
+TEST_F(DockerFetcherPluginTest, DISABLED_INTERNET_CURL_FetchImage)
 {
   URI uri = uri::docker::image(
-      "library/busybox",
-      "latest",
-      DOCKER_REGISTRY_HOST);
+      TEST_REPOSITORY, "latest", DOCKER_REGISTRY_HOST);
 
   Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
   ASSERT_SOME(fetcher);
@@ -343,26 +374,31 @@ TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchImage)
   Try<string> _manifest = os::read(path::join(dir, "manifest"));
   ASSERT_SOME(_manifest);
 
-  Try<docker::spec::v2::ImageManifest> manifest =
-    docker::spec::v2::parse(_manifest.get());
+  Try<docker::spec::v2_2::ImageManifest> manifest =
+      docker::spec::v2_2::parse(_manifest.get());
 
   ASSERT_SOME(manifest);
-  EXPECT_EQ("library/busybox", manifest->name());
-  EXPECT_EQ("latest", manifest->tag());
+  EXPECT_EQ(2u, manifest->schemaversion());
+  EXPECT_EQ("application/vnd.docker.distribution.manifest.v2+json",
+            manifest->mediatype());
 
-  for (int i = 0; i < manifest->fslayers_size(); i++) {
-    EXPECT_TRUE(os::exists(path::join(dir, manifest->fslayers(i).blobsum())));
+  EXPECT_TRUE(os::exists(DockerFetcherPlugin::getBlobPath(
+      dir, manifest->config().digest())));
+
+  for (int i = 0; i < manifest->layers_size(); i++) {
+    EXPECT_TRUE(os::exists(
+        DockerFetcherPlugin::getBlobPath(
+            dir,
+            manifest->layers(i).digest())));
   }
 }
 
 
 // This test verifies invoking 'fetch' by plugin name.
-TEST_F(DockerFetcherPluginTest, INTERNET_CURL_InvokeFetchByName)
+TEST_F(DockerFetcherPluginTest, DISABLED_INTERNET_CURL_InvokeFetchByName)
 {
   URI uri = uri::docker::image(
-      "library/busybox",
-      "latest",
-      DOCKER_REGISTRY_HOST);
+      TEST_REPOSITORY, "latest", DOCKER_REGISTRY_HOST);
 
   Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
   ASSERT_SOME(fetcher);
@@ -370,23 +406,31 @@ TEST_F(DockerFetcherPluginTest, INTERNET_CURL_InvokeFetchByName)
   string dir = path::join(os::getcwd(), "dir");
 
   AWAIT_READY_FOR(
-      fetcher.get()->fetch(uri, dir, "docker", None()),
+      fetcher.get()->fetch(uri, dir, "docker", None(), None()),
       Seconds(60));
 
   Try<string> _manifest = os::read(path::join(dir, "manifest"));
   ASSERT_SOME(_manifest);
 
-  Try<docker::spec::v2::ImageManifest> manifest =
-    docker::spec::v2::parse(_manifest.get());
+  Try<docker::spec::v2_2::ImageManifest> manifest =
+      docker::spec::v2_2::parse(_manifest.get());
 
   ASSERT_SOME(manifest);
-  EXPECT_EQ("library/busybox", manifest->name());
-  EXPECT_EQ("latest", manifest->tag());
+  EXPECT_EQ(2u, manifest->schemaversion());
+  EXPECT_EQ("application/vnd.docker.distribution.manifest.v2+json",
+            manifest->mediatype());
 
-  for (int i = 0; i < manifest->fslayers_size(); i++) {
-    EXPECT_TRUE(os::exists(path::join(dir, manifest->fslayers(i).blobsum())));
+  EXPECT_TRUE(os::exists(DockerFetcherPlugin::getBlobPath(
+      dir, manifest->config().digest())));
+
+  for (int i = 0; i < manifest->layers_size(); i++) {
+    EXPECT_TRUE(os::exists(
+        DockerFetcherPlugin::getBlobPath(
+            dir,
+            manifest->layers(i).digest())));
   }
 }
+#endif // __WINDOWS__
 
 
 class CopyFetcherPluginTest : public TemporaryDirectoryTest {};
@@ -447,7 +491,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(CopyFetcherPluginTest, InvokeFetchByName)
 
   const string dir = path::join(os::getcwd(), "dir");
 
-  AWAIT_READY(fetcher.get()->fetch(uri, dir, "copy", None()));
+  AWAIT_READY(fetcher.get()->fetch(uri, dir, "copy", None(), None()));
 
   // Validate the fetched file's content.
   EXPECT_SOME_EQ("abc", os::read(path::join(dir, "file")));

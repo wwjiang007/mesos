@@ -257,6 +257,85 @@
         templateUrl: 'app/shared/timestamp.html'
       }
     }])
+    .directive('mFrameworkRoles', function() {
+      return {
+        restrict: 'E',
+        scope: {roles: '=', frameworkId: '='},
+        templateUrl: 'app/frameworks/roles.html'
+      }
+    })
+    .directive('mFrameworkRolesTree', function() {
+      // This helper builds a prefix tree from a list of roles.
+      // Each role from the list corresponds to a leaf node in the tree.
+      // The path to that leaf node equals to the role (with '/.' added if this
+      // path is a prefix of other roles).
+      //
+      // For example, given a list of roles ['a/b','a', 'e/f', 'e/g']
+      // the following tree will be built:
+      // {'a': {'.': {}, 'b' : {}}, 'e': {'f': {}, 'g': '{}'}}
+      // (corresponding paths are 'a/.', 'a/b', 'e/f' and 'e/g')
+      function buildTree(roles) {
+        var root = {};
+
+        for (var roleIndex = 0; roleIndex < roles.length; roleIndex += 1) {
+          var tokens = roles[roleIndex].split('/');
+          var i = 0;
+          var node = root;
+          for (i = 0; i < tokens.length && (tokens[i] in node); i += 1) {
+            node = node[tokens[i]];
+          }
+
+          if (i > 0 && (i == tokens.length || Object.keys(node).length == 0)) {
+            node['.'] = {};
+          }
+
+          for (; i < tokens.length; i += 1) {
+            node[tokens[i]] = {};
+            node = node[tokens[i]];
+          }
+        }
+
+        return root;
+      }
+
+      function prepareTree(path, name, node) {
+        var prefix = path ? path + '/' : '';
+        return {
+          "children": Object.keys(node).sort().map(function(k) {
+              return prepareTree(prefix + k, k, node[k]);
+            }),
+          "name": name,
+          "path": path
+          }
+      }
+
+      return {
+        restrict: 'E',
+        scope: {roles: '=', frameworkId: '='},
+        link: function($scope, _element, _attrs) {
+
+          // TODO (asekretenko): after MESOS-9915 consider getting the roles
+          // hierarchy from master directly (instead of buildTree()).
+          $scope.node = prepareTree("", "", buildTree($scope.roles));
+
+          $scope.storagePrefix = 'framework-roles-tree.' + $scope.frameworkId;
+          $scope.visible = JSON.parse(
+              localStorage.getItem($scope.storagePrefix) || '{}');
+
+          $scope.toggle = function(path) {
+            if (path in $scope.visible) {
+              delete $scope.visible[path];
+            } else {
+              $scope.visible[path] = true;
+            }
+
+            localStorage.setItem($scope.storagePrefix,
+                                 JSON.stringify($scope.visible));
+          };
+        },
+        templateUrl: 'app/frameworks/roles-tree-root.html'
+      }
+    })
     .directive('mPagination', function() {
       return { templateUrl: 'app/shared/pagination.html' }
     })

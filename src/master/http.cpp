@@ -25,6 +25,12 @@
 #include <utility>
 #include <vector>
 
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/wire_format_lite.h>
+
+#include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
+
 #include <mesos/attributes.hpp>
 #include <mesos/type_utils.hpp>
 
@@ -36,8 +42,10 @@
 
 #include <mesos/v1/master/master.hpp>
 
+#include <process/async.hpp>
 #include <process/collect.hpp>
 #include <process/defer.hpp>
+#include <process/future.hpp>
 #include <process/help.hpp>
 #include <process/logging.hpp>
 
@@ -66,7 +74,7 @@
 #include <stout/utils.hpp>
 #include <stout/uuid.hpp>
 
-#include "common/build.hpp"
+#include "common/authorization.hpp"
 #include "common/http.hpp"
 #include "common/protobuf_utils.hpp"
 #include "common/resources_utils.hpp"
@@ -88,6 +96,8 @@
 
 using google::protobuf::RepeatedPtrField;
 
+using google::protobuf::internal::WireFormatLite;
+
 using process::AUTHENTICATION;
 using process::AUTHORIZATION;
 using process::Clock;
@@ -96,6 +106,7 @@ using process::Failure;
 using process::Future;
 using process::HELP;
 using process::Logging;
+using process::Promise;
 using process::TLDR;
 
 using process::http::Accepted;
@@ -117,6 +128,7 @@ using process::http::URL;
 using process::http::authentication::Principal;
 
 using std::copy_if;
+using std::function;
 using std::list;
 using std::map;
 using std::set;
@@ -126,9 +138,12 @@ using std::tuple;
 using std::vector;
 
 using mesos::authorization::createSubject;
+using mesos::authorization::DEACTIVATE_AGENT;
+using mesos::authorization::DRAIN_AGENT;
 using mesos::authorization::GET_MAINTENANCE_SCHEDULE;
 using mesos::authorization::GET_MAINTENANCE_STATUS;
 using mesos::authorization::MARK_AGENT_GONE;
+using mesos::authorization::REACTIVATE_AGENT;
 using mesos::authorization::SET_LOG_LEVEL;
 using mesos::authorization::START_MAINTENANCE;
 using mesos::authorization::STOP_MAINTENANCE;
@@ -139,67 +154,9 @@ using mesos::authorization::VIEW_FRAMEWORK;
 using mesos::authorization::VIEW_ROLE;
 using mesos::authorization::VIEW_TASK;
 
+using mesos::internal::protobuf::WireFormatLite2;
+
 namespace mesos {
-
-static void json(
-    JSON::StringWriter* writer,
-    const FrameworkInfo::Capability& capability)
-{
-  writer->append(FrameworkInfo::Capability::Type_Name(capability.type()));
-}
-
-
-static void json(
-    JSON::StringWriter* writer,
-    const SlaveInfo::Capability& capability)
-{
-  writer->append(SlaveInfo::Capability::Type_Name(capability.type()));
-}
-
-
-static void json(
-    JSON::StringWriter* writer,
-    const MasterInfo::Capability& capability)
-{
-  writer->append(MasterInfo::Capability::Type_Name(capability.type()));
-}
-
-
-static void json(JSON::ObjectWriter* writer, const Offer& offer)
-{
-  writer->field("id", offer.id().value());
-  writer->field("framework_id", offer.framework_id().value());
-  writer->field("allocation_info", JSON::Protobuf(offer.allocation_info()));
-  writer->field("slave_id", offer.slave_id().value());
-  writer->field("resources", Resources(offer.resources()));
-}
-
-
-static void json(JSON::ObjectWriter* writer, const MasterInfo& info)
-{
-  writer->field("id", info.id());
-  writer->field("pid", info.pid());
-  writer->field("port", info.port());
-  writer->field("hostname", info.hostname());
-
-  if (info.has_domain()) {
-    writer->field("domain", info.domain());
-  }
-}
-
-
-static void json(JSON::ObjectWriter* writer, const SlaveInfo& slaveInfo)
-{
-  writer->field("id", slaveInfo.id().value());
-  writer->field("hostname", slaveInfo.hostname());
-  writer->field("port", slaveInfo.port());
-  writer->field("attributes", Attributes(slaveInfo.attributes()));
-
-  if (slaveInfo.has_domain()) {
-    writer->field("domain", slaveInfo.domain());
-  }
-}
-
 namespace internal {
 namespace master {
 
@@ -210,379 +167,6 @@ using mesos::internal::model;
 using process::http::Response;
 using process::http::Request;
 using process::Owned;
-
-
-// The summary representation of `T` to support the `/state-summary` endpoint.
-// e.g., `Summary<Slave>`.
-template <typename T>
-struct Summary : Representation<T>
-{
-  using Representation<T>::Representation;
-};
-
-
-// The full representation of `T` to support the `/state` endpoint.
-// e.g., `Full<Slave>`.
-template <typename T>
-struct Full : Representation<T>
-{
-  using Representation<T>::Representation;
-};
-
-
-// Forward declaration for `FullFrameworkWriter`.
-static void json(JSON::ObjectWriter* writer, const Summary<Framework>& summary);
-
-
-// Filtered representation of Full<Framework>.
-// Executors and Tasks are filtered based on whether the
-// user is authorized to view them.
-struct FullFrameworkWriter {
-  FullFrameworkWriter(
-      const Owned<ObjectApprovers>& approvers,
-      const Framework* framework)
-    : approvers_(approvers),
-      framework_(framework) {}
-
-  void operator()(JSON::ObjectWriter* writer) const
-  {
-    json(writer, Summary<Framework>(*framework_));
-
-    // Add additional fields to those generated by the
-    // `Summary<Framework>` overload.
-    writer->field("user", framework_->info.user());
-    writer->field("failover_timeout", framework_->info.failover_timeout());
-    writer->field("checkpoint", framework_->info.checkpoint());
-    writer->field("registered_time", framework_->registeredTime.secs());
-    writer->field("unregistered_time", framework_->unregisteredTime.secs());
-
-    if (framework_->info.has_principal()) {
-      writer->field("principal", framework_->info.principal());
-    }
-
-    // TODO(bmahler): Consider deprecating this in favor of the split
-    // used and offered resources added in `Summary<Framework>`.
-    writer->field(
-        "resources",
-        framework_->totalUsedResources + framework_->totalOfferedResources);
-
-    // TODO(benh): Consider making reregisteredTime an Option.
-    if (framework_->registeredTime != framework_->reregisteredTime) {
-      writer->field("reregistered_time", framework_->reregisteredTime.secs());
-    }
-
-    // For multi-role frameworks the `role` field will be unset.
-    // Note that we could set `roles` here for both cases, which
-    // would make tooling simpler (only need to look for `roles`).
-    // However, we opted to just mirror the protobuf akin to how
-    // generic protobuf -> JSON translation works.
-    if (framework_->capabilities.multiRole) {
-      writer->field("roles", framework_->info.roles());
-    } else {
-      writer->field("role", framework_->info.role());
-    }
-
-    // Model all of the tasks associated with a framework.
-    writer->field("tasks", [this](JSON::ArrayWriter* writer) {
-      foreachvalue (const TaskInfo& taskInfo, framework_->pendingTasks) {
-        // Skip unauthorized tasks.
-        if (!approvers_->approved<VIEW_TASK>(taskInfo, framework_->info)) {
-          continue;
-        }
-
-        writer->element([this, &taskInfo](JSON::ObjectWriter* writer) {
-          writer->field("id", taskInfo.task_id().value());
-          writer->field("name", taskInfo.name());
-          writer->field("framework_id", framework_->id().value());
-
-          writer->field(
-              "executor_id",
-              taskInfo.executor().executor_id().value());
-
-          writer->field("slave_id", taskInfo.slave_id().value());
-          writer->field("state", TaskState_Name(TASK_STAGING));
-          writer->field("resources", Resources(taskInfo.resources()));
-
-          // Tasks are not allowed to mix resources allocated to
-          // different roles, see MESOS-6636.
-          writer->field(
-              "role",
-              taskInfo.resources().begin()->allocation_info().role());
-
-          writer->field("statuses", std::initializer_list<TaskStatus>{});
-
-          if (taskInfo.has_labels()) {
-            writer->field("labels", taskInfo.labels());
-          }
-
-          if (taskInfo.has_discovery()) {
-            writer->field("discovery", JSON::Protobuf(taskInfo.discovery()));
-          }
-
-          if (taskInfo.has_container()) {
-            writer->field("container", JSON::Protobuf(taskInfo.container()));
-          }
-        });
-      }
-
-      foreachvalue (Task* task, framework_->tasks) {
-        // Skip unauthorized tasks.
-        if (!approvers_->approved<VIEW_TASK>(*task, framework_->info)) {
-          continue;
-        }
-
-        writer->element(*task);
-      }
-    });
-
-    writer->field("unreachable_tasks", [this](JSON::ArrayWriter* writer) {
-      foreachvalue (const Owned<Task>& task, framework_->unreachableTasks) {
-        // Skip unauthorized tasks.
-        if (!approvers_->approved<VIEW_TASK>(*task, framework_->info)) {
-          continue;
-        }
-
-        writer->element(*task);
-      }
-    });
-
-    writer->field("completed_tasks", [this](JSON::ArrayWriter* writer) {
-      foreach (const Owned<Task>& task, framework_->completedTasks) {
-        // Skip unauthorized tasks.
-        if (!approvers_->approved<VIEW_TASK>(*task, framework_->info)) {
-          continue;
-        }
-
-        writer->element(*task);
-      }
-    });
-
-    // Model all of the offers associated with a framework.
-    writer->field("offers", [this](JSON::ArrayWriter* writer) {
-      foreach (Offer* offer, framework_->offers) {
-        writer->element(*offer);
-      }
-    });
-
-    // Model all of the executors of a framework.
-    writer->field("executors", [this](JSON::ArrayWriter* writer) {
-      foreachpair (
-          const SlaveID& slaveId,
-          const auto& executorsMap,
-          framework_->executors) {
-        foreachvalue (const ExecutorInfo& executor, executorsMap) {
-          writer->element([this,
-                           &executor,
-                           &slaveId](JSON::ObjectWriter* writer) {
-            // Skip unauthorized executors.
-            if (!approvers_->approved<VIEW_EXECUTOR>(
-                    executor, framework_->info)) {
-              return;
-            }
-
-            json(writer, executor);
-            writer->field("slave_id", slaveId.value());
-          });
-        }
-      }
-    });
-
-    // Model all of the labels associated with a framework.
-    if (framework_->info.has_labels()) {
-      writer->field("labels", framework_->info.labels());
-    }
-  }
-
-  const Owned<ObjectApprovers>& approvers_;
-  const Framework* framework_;
-};
-
-
-struct SlaveWriter
-{
-  SlaveWriter(
-      const Slave& slave,
-      const Owned<ObjectApprovers>& approvers)
-    : slave_(slave), approvers_(approvers) {}
-
-  void operator()(JSON::ObjectWriter* writer) const
-  {
-    json(writer, slave_.info);
-
-    writer->field("pid", string(slave_.pid));
-    writer->field("registered_time", slave_.registeredTime.secs());
-
-    if (slave_.reregisteredTime.isSome()) {
-      writer->field("reregistered_time", slave_.reregisteredTime->secs());
-    }
-
-    const Resources& totalResources = slave_.totalResources;
-    writer->field("resources", totalResources);
-    writer->field("used_resources", Resources::sum(slave_.usedResources));
-    writer->field("offered_resources", slave_.offeredResources);
-    writer->field(
-        "reserved_resources",
-        [&totalResources, this](JSON::ObjectWriter* writer) {
-          foreachpair (const string& role, const Resources& reservation,
-                       totalResources.reservations()) {
-            // TODO(arojas): Consider showing unapproved resources in an
-            // aggregated special field, so that all resource values add up
-            // MESOS-7779.
-            if (approvers_->approved<VIEW_ROLE>(role)) {
-              writer->field(role, reservation);
-            }
-          }
-        });
-    writer->field("unreserved_resources", totalResources.unreserved());
-
-    writer->field("active", slave_.active);
-    writer->field("version", slave_.version);
-    writer->field("capabilities", slave_.capabilities.toRepeatedPtrField());
-  }
-
-  const Slave& slave_;
-  const Owned<ObjectApprovers>& approvers_;
-};
-
-
-struct SlavesWriter
-{
-  SlavesWriter(
-      const Master::Slaves& slaves,
-      const Owned<ObjectApprovers>& approvers,
-      const IDAcceptor<SlaveID>& selectSlaveId)
-    : slaves_(slaves),
-      approvers_(approvers),
-      selectSlaveId_(selectSlaveId) {}
-
-  void operator()(JSON::ObjectWriter* writer) const
-  {
-    writer->field("slaves", [this](JSON::ArrayWriter* writer) {
-      foreachvalue (const Slave* slave, slaves_.registered) {
-        if (!selectSlaveId_.accept(slave->id)) {
-          continue;
-        }
-
-        writer->element([this, &slave](JSON::ObjectWriter* writer) {
-          writeSlave(slave, writer);
-        });
-      }
-    });
-
-    writer->field("recovered_slaves", [this](JSON::ArrayWriter* writer) {
-      foreachvalue (const SlaveInfo& slaveInfo, slaves_.recovered) {
-        if (!selectSlaveId_.accept(slaveInfo.id())) {
-          continue;
-        }
-
-        writer->element([&slaveInfo](JSON::ObjectWriter* writer) {
-          json(writer, slaveInfo);
-        });
-      }
-    });
-  }
-
-  void writeSlave(const Slave* slave, JSON::ObjectWriter* writer) const
-  {
-    SlaveWriter(*slave, approvers_)(writer);
-
-    // Add the complete protobuf->JSON for all used, reserved,
-    // and offered resources. The other endpoints summarize
-    // resource information, which omits the details of
-    // reservations and persistent volumes. Full resource
-    // information is necessary so that operators can use the
-    // `/unreserve` and `/destroy-volumes` endpoints.
-
-    hashmap<string, Resources> reserved = slave->totalResources.reservations();
-
-    writer->field(
-        "reserved_resources_full",
-        [&reserved, this](JSON::ObjectWriter* writer) {
-          foreachpair (const string& role,
-                       const Resources& resources,
-                       reserved) {
-            if (approvers_->approved<VIEW_ROLE>(role)) {
-              writer->field(role, [&resources, this](
-                  JSON::ArrayWriter* writer) {
-                foreach (Resource resource, resources) {
-                  if (approvers_->approved<VIEW_ROLE>(resource)) {
-                    convertResourceFormat(&resource, ENDPOINT);
-                    writer->element(JSON::Protobuf(resource));
-                  }
-                }
-              });
-            }
-          }
-        });
-
-    Resources unreservedResources = slave->totalResources.unreserved();
-
-    writer->field(
-        "unreserved_resources_full",
-        [&unreservedResources, this](JSON::ArrayWriter* writer) {
-          foreach (Resource resource, unreservedResources) {
-            if (approvers_->approved<VIEW_ROLE>(resource)) {
-              convertResourceFormat(&resource, ENDPOINT);
-              writer->element(JSON::Protobuf(resource));
-            }
-          }
-        });
-
-    Resources usedResources = Resources::sum(slave->usedResources);
-
-    writer->field(
-        "used_resources_full",
-        [&usedResources, this](JSON::ArrayWriter* writer) {
-          foreach (Resource resource, usedResources) {
-            if (approvers_->approved<VIEW_ROLE>(resource)) {
-              convertResourceFormat(&resource, ENDPOINT);
-              writer->element(JSON::Protobuf(resource));
-            }
-          }
-        });
-
-    const Resources& offeredResources = slave->offeredResources;
-
-    writer->field(
-        "offered_resources_full",
-        [&offeredResources, this](JSON::ArrayWriter* writer) {
-          foreach (Resource resource, offeredResources) {
-            if (approvers_->approved<VIEW_ROLE>(resource)) {
-              convertResourceFormat(&resource, ENDPOINT);
-              writer->element(JSON::Protobuf(resource));
-            }
-          }
-        });
-  }
-
-  const Master::Slaves& slaves_;
-  const Owned<ObjectApprovers>& approvers_;
-  const IDAcceptor<SlaveID>& selectSlaveId_;
-};
-
-
-static void json(JSON::ObjectWriter* writer, const Summary<Framework>& summary)
-{
-  const Framework& framework = summary;
-
-  writer->field("id", framework.id().value());
-  writer->field("name", framework.info.name());
-
-  // Omit pid for http frameworks.
-  if (framework.pid.isSome()) {
-    writer->field("pid", string(framework.pid.get()));
-  }
-
-  // TODO(bmahler): Use these in the webui.
-  writer->field("used_resources", framework.totalUsedResources);
-  writer->field("offered_resources", framework.totalOfferedResources);
-  writer->field("capabilities", framework.info.capabilities());
-  writer->field("hostname", framework.info.hostname());
-  writer->field("webui_url", framework.info.webui_url());
-  writer->field("active", framework.active());
-  writer->field("connected", framework.connected());
-  writer->field("recovered", framework.recovered());
-}
 
 
 string Master::Http::API_HELP()
@@ -681,7 +265,7 @@ Future<Response> Master::Http::api(
 
   mesos::master::Call call = devolve(v1Call);
 
-  Option<Error> error = validation::master::call::validate(call, principal);
+  Option<Error> error = validation::master::call::validate(call);
 
   if (error.isSome()) {
     return BadRequest("Failed to validate master::Call: " + error->message);
@@ -773,6 +357,12 @@ Future<Response> Master::Http::api(
     case mesos::master::Call::DESTROY_VOLUMES:
       return destroyVolumes(call, principal, acceptType);
 
+    case mesos::master::Call::GROW_VOLUME:
+      return growVolume(call, principal, acceptType);
+
+    case mesos::master::Call::SHRINK_VOLUME:
+      return shrinkVolume(call, principal, acceptType);
+
     case mesos::master::Call::GET_MAINTENANCE_STATUS:
       return getMaintenanceStatus(call, principal, acceptType);
 
@@ -788,12 +378,28 @@ Future<Response> Master::Http::api(
     case mesos::master::Call::STOP_MAINTENANCE:
       return stopMaintenance(call, principal, acceptType);
 
+    case mesos::master::Call::DRAIN_AGENT:
+      return drainAgent(call, principal, acceptType);
+
+    case mesos::master::Call::DEACTIVATE_AGENT:
+      return deactivateAgent(call, principal, acceptType);
+
+    case mesos::master::Call::REACTIVATE_AGENT:
+      return reactivateAgent(call, principal, acceptType);
+
     case mesos::master::Call::GET_QUOTA:
       return quotaHandler.status(call, principal, acceptType);
 
+    case mesos::master::Call::UPDATE_QUOTA:
+      return quotaHandler.update(call, principal);
+
+    // TODO(bmahler): Add this to a deprecated call section
+    // at the bottom once deprecated by `UPDATE_QUOTA`.
     case mesos::master::Call::SET_QUOTA:
       return quotaHandler.set(call, principal);
 
+    // TODO(bmahler): Add this to a deprecated call section
+    // at the bottom once deprecated by `UPDATE_QUOTA`.
     case mesos::master::Call::REMOVE_QUOTA:
       return quotaHandler.remove(call, principal);
 
@@ -829,21 +435,77 @@ Future<Response> Master::Http::subscribe(
           ok.type = Response::PIPE;
           ok.reader = pipe.reader();
 
-          HttpConnection http{pipe.writer(), contentType, id::UUID::random()};
+          StreamingHttpConnection<v1::master::Event> http(
+              pipe.writer(), contentType);
 
-          mesos::master::Event event;
-          event.set_type(mesos::master::Event::SUBSCRIBED);
-          *event.mutable_subscribed()->mutable_get_state() =
-            _getState(approvers);
+          // Serialize the following event:
+          //
+          //   mesos::master::Event event;
+          //   event.set_type(mesos::master::Event::SUBSCRIBED);
+          //   *event.mutable_subscribed()->mutable_get_state() =
+          //     _getState(approvers);
+          //   event.mutable_subscribed()->set_heartbeat_interval_seconds(
+          //       DEFAULT_HEARTBEAT_INTERVAL.secs());
+          //
+          //   http.send(event);
 
-          event.mutable_subscribed()->set_heartbeat_interval_seconds(
-              DEFAULT_HEARTBEAT_INTERVAL.secs());
+          switch (contentType) {
+            case ContentType::PROTOBUF: {
+              string serialized;
+              google::protobuf::io::StringOutputStream stream(&serialized);
+              google::protobuf::io::CodedOutputStream writer(&stream);
 
-          http.send<mesos::master::Event, v1::master::Event>(event);
+              WireFormatLite::WriteEnum(
+                  mesos::v1::master::Event::kTypeFieldNumber,
+                  mesos::v1::master::Event::SUBSCRIBED,
+                  &writer);
+
+              WireFormatLite::WriteBytes(
+                  mesos::v1::master::Event::kSubscribedFieldNumber,
+                  serializeSubscribe(approvers),
+                  &writer);
+
+              // We must manually trim the unused buffer space since
+              // we use the string before the coded output stream is
+              // destructed.
+              writer.Trim();
+
+              http.send(serialized);
+
+              break;
+            }
+
+            case ContentType::JSON: {
+              string serialized = jsonify([&](JSON::ObjectWriter* writer) {
+                const google::protobuf::Descriptor* descriptor =
+                  v1::master::Event::descriptor();
+
+                int field;
+
+                field = v1::master::Event::kTypeFieldNumber;
+                writer->field(
+                    descriptor->FindFieldByNumber(field)->name(),
+                    v1::master::Event::Type_Name(
+                        v1::master::Event::SUBSCRIBED));
+
+                field = v1::master::Event::kSubscribedFieldNumber;
+                writer->field(
+                    descriptor->FindFieldByNumber(field)->name(),
+                    jsonifySubscribe(master, approvers));
+              });
+
+              http.send(serialized);
+
+              break;
+            }
+
+            default:
+              return NotAcceptable("Request must accept json or protobuf");
+          }
 
           mesos::master::Event heartbeatEvent;
           heartbeatEvent.set_type(mesos::master::Event::HEARTBEAT);
-          http.send<mesos::master::Event, v1::master::Event>(heartbeatEvent);
+          http.send(heartbeatEvent);
 
           // Master::subscribe will start the heartbeater process, which should
           // only happen after `SUBSCRIBED` event is sent.
@@ -851,6 +513,73 @@ Future<Response> Master::Http::subscribe(
 
           return ok;
         }));
+}
+
+
+function<void(JSON::ObjectWriter*)> Master::Http::jsonifySubscribe(
+    const Master* master,
+    const Owned<ObjectApprovers>& approvers)
+{
+  // Jsonify the following message:
+  //
+  //   mesos::master::Event::Subscribed subscribed;
+  //   *subscribed.mutable_get_state() = _getState(approvers);
+  //   subscribed.set_heartbeat_interval_seconds(
+  //       DEFAULT_HEARTBEAT_INTERVAL.secs());
+
+  // TODO(bmahler): This copies the Owned object approvers.
+  return [=](JSON::ObjectWriter* writer) {
+    const google::protobuf::Descriptor* descriptor =
+      v1::master::Event::Subscribed::descriptor();
+
+    int field;
+
+    field = v1::master::Event::Subscribed::kGetStateFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        jsonifyGetState(master, approvers));
+
+    field = v1::master::Event::Subscribed::kHeartbeatIntervalSecondsFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        DEFAULT_HEARTBEAT_INTERVAL.secs());
+  };
+}
+
+
+string Master::Http::serializeSubscribe(
+    const Owned<ObjectApprovers>& approvers) const
+{
+  // Serialize the following message:
+  //
+  //   mesos::master::Event::Subscribed subscribed;
+  //   *subscribed.mutable_get_state() = _getState(approvers);
+  //   subscribed.set_heartbeat_interval_seconds(
+  //       DEFAULT_HEARTBEAT_INTERVAL.secs());
+
+  string output;
+  google::protobuf::io::StringOutputStream stream(&output);
+  google::protobuf::io::CodedOutputStream writer(&stream);
+
+  WireFormatLite::WriteBytes(
+      mesos::v1::master::Event::Subscribed::kGetStateFieldNumber,
+      serializeGetState(approvers),
+      &writer);
+
+  WireFormatLite::WriteDouble(
+      mesos::v1::master::Event::Subscribed
+        ::kHeartbeatIntervalSecondsFieldNumber,
+      DEFAULT_HEARTBEAT_INTERVAL.secs(),
+      &writer);
+
+  // While an explicit Trim() isn't necessary (since the coded
+  // output stream is destructed before the string is returned),
+  // it's a quite tricky bug to diagnose if Trim() is missed, so
+  // we always do it explicitly to signal the reader about this
+  // subtlety.
+  writer.Trim();
+
+  return output;
 }
 
 
@@ -956,12 +685,14 @@ Future<Response> Master::Http::scheduler(
     return BadRequest("Failed to validate scheduler::Call: " + error->message);
   }
 
-  if (call.type() == scheduler::Call::SUBSCRIBE) {
-    // We default to JSON 'Content-Type' in the response since an
-    // empty 'Accept' header results in all media types considered
-    // acceptable.
-    ContentType acceptType = ContentType::JSON;
+  ContentType acceptType;
 
+  // Ideally this handler would be consistent with the Operator API handler
+  // and determine the accept type regardless of the type of request.
+  // However, to maintain backwards compatibility, it determines the accept
+  // type only if the response will not be empty.
+  if (call.type() == scheduler::Call::SUBSCRIBE ||
+      call.type() == scheduler::Call::RECONCILE_OPERATIONS) {
     if (request.acceptsMediaType(APPLICATION_JSON)) {
       acceptType = ContentType::JSON;
     } else if (request.acceptsMediaType(APPLICATION_PROTOBUF)) {
@@ -971,7 +702,9 @@ Future<Response> Master::Http::scheduler(
           string("Expecting 'Accept' to allow ") +
           "'" + APPLICATION_PROTOBUF + "' or '" + APPLICATION_JSON + "'");
     }
+  }
 
+  if (call.type() == scheduler::Call::SUBSCRIBE) {
     // Make sure that a stream ID was not included in the request headers.
     if (request.headers.contains("Mesos-Stream-Id")) {
       return BadRequest(
@@ -1011,8 +744,10 @@ Future<Response> Master::Http::scheduler(
     id::UUID streamId = id::UUID::random();
     ok.headers["Mesos-Stream-Id"] = streamId.toString();
 
-    HttpConnection http {pipe.writer(), acceptType, streamId};
-    master->subscribe(http, call.subscribe());
+    StreamingHttpConnection<v1::scheduler::Event> http(
+        pipe.writer(), acceptType, streamId);
+
+    master->subscribe(http, std::move(*call.mutable_subscribe()));
 
     return ok;
   }
@@ -1024,6 +759,8 @@ Future<Response> Master::Http::scheduler(
   if (framework == nullptr) {
     return BadRequest("Framework cannot be found");
   }
+
+  framework->metrics.incrementCall(call.type());
 
   // TODO(greggomann): Move this implicit scheduler authorization
   // into the authorizer. See MESOS-7399.
@@ -1110,9 +847,10 @@ Future<Response> Master::Http::scheduler(
       master->reconcile(framework, std::move(*call.mutable_reconcile()));
       return Accepted();
 
-    // TODO(greggomann): Implement operation reconciliation.
     case scheduler::Call::RECONCILE_OPERATIONS:
-      return Forbidden("Operation reconciliation is not yet implemented");
+      master->reconcileOperations(
+          framework, std::move(*call.mutable_reconcile_operations()));
+      return Accepted();
 
     case scheduler::Call::MESSAGE:
       master->message(framework, std::move(*call.mutable_message()));
@@ -1122,25 +860,16 @@ Future<Response> Master::Http::scheduler(
       master->request(framework, call.request());
       return Accepted();
 
+    case scheduler::Call::UPDATE_FRAMEWORK:
+      return master->updateFramework(
+          std::move(*call.mutable_update_framework()));
+
     case scheduler::Call::UNKNOWN:
       LOG(WARNING) << "Received 'UNKNOWN' call";
       return NotImplemented();
   }
 
   return NotImplemented();
-}
-
-
-static Resources removeDiskInfos(const Resources& resources)
-{
-  Resources result;
-
-  foreach (Resource resource, resources) {
-    resource.clear_disk();
-    result += resource;
-  }
-
-  return result;
 }
 
 
@@ -1285,11 +1014,7 @@ Future<Response> Master::Http::_createVolumes(
         return Forbidden();
       }
 
-      // The resources required for this operation are equivalent to the
-      // volumes specified by the user minus any DiskInfo (DiskInfo will
-      // be created when this operation is applied).
-      return _operation(
-          slaveId, removeDiskInfos(operation.create().volumes()), operation);
+      return _operation(slaveId, operation);
     }));
 }
 
@@ -1457,7 +1182,7 @@ Future<Response> Master::Http::_destroyVolumes(
         return Forbidden();
       }
 
-      return _operation(slaveId, operation.destroy().volumes(), operation);
+      return _operation(slaveId, operation);
     }));
 }
 
@@ -1483,6 +1208,132 @@ Future<Response> Master::Http::destroyVolumes(
   const RepeatedPtrField<Resource>& volumes = call.destroy_volumes().volumes();
 
   return _destroyVolumes(slaveId, volumes, principal);
+}
+
+
+Future<Response> Master::Http::growVolume(
+    const mesos::master::Call& call,
+    const Option<Principal>& principal,
+    ContentType /*contentType*/) const
+{
+  // TODO(greggomann): Remove this check once the `Principal` type is used in
+  // `ReservationInfo`, `DiskInfo`, and within the master's `principals` map.
+  // See MESOS-7202.
+  if (principal.isSome() && principal->value.isNone()) {
+    return Forbidden(
+        "The request's authenticated principal contains claims, but no value "
+        "string. The master currently requires that principals have a value");
+  }
+
+  CHECK_EQ(mesos::master::Call::GROW_VOLUME, call.type());
+  CHECK(call.has_grow_volume());
+
+  // Only agent default resources are supported right now.
+  CHECK(call.grow_volume().has_slave_id());
+
+  const SlaveID& slaveId = call.grow_volume().slave_id();
+
+  Slave* slave = master->slaves.registered.get(slaveId);
+  if (slave == nullptr) {
+    return BadRequest("No agent found with specified ID");
+  }
+
+  // Create an operation.
+  Offer::Operation operation;
+  operation.set_type(Offer::Operation::GROW_VOLUME);
+
+  operation.mutable_grow_volume()->mutable_volume()->CopyFrom(
+      call.grow_volume().volume());
+
+  operation.mutable_grow_volume()->mutable_addition()->CopyFrom(
+      call.grow_volume().addition());
+
+  Option<Error> error = validateAndUpgradeResources(&operation);
+  if (error.isSome()) {
+    return BadRequest(error->message);
+  }
+
+  error = validation::operation::validate(
+      operation.grow_volume(), slave->capabilities);
+
+  if (error.isSome()) {
+    return BadRequest(
+        "Invalid GROW_VOLUME operation on agent " +
+        stringify(*slave) + ": " + error->message);
+  }
+
+  return master->authorizeResizeVolume(
+      operation.grow_volume().volume(), principal)
+    .then(defer(master->self(), [=](bool authorized) -> Future<Response> {
+      if (!authorized) {
+        return Forbidden();
+      }
+
+      return _operation(slaveId, operation);
+    }));
+}
+
+
+Future<Response> Master::Http::shrinkVolume(
+    const mesos::master::Call& call,
+    const Option<Principal>& principal,
+    ContentType /*contentType*/) const
+{
+  // TODO(greggomann): Remove this check once the `Principal` type is used in
+  // `ReservationInfo`, `DiskInfo`, and within the master's `principals` map.
+  // See MESOS-7202.
+  if (principal.isSome() && principal->value.isNone()) {
+    return Forbidden(
+        "The request's authenticated principal contains claims, but no value "
+        "string. The master currently requires that principals have a value");
+  }
+
+  CHECK_EQ(mesos::master::Call::SHRINK_VOLUME, call.type());
+  CHECK(call.has_shrink_volume());
+
+  // Only persistent volumes are supported right now.
+  CHECK(call.shrink_volume().has_slave_id());
+
+  const SlaveID& slaveId = call.shrink_volume().slave_id();
+
+  Slave* slave = master->slaves.registered.get(slaveId);
+  if (slave == nullptr) {
+    return BadRequest("No agent found with specified ID");
+  }
+
+  // Create an operation.
+  Offer::Operation operation;
+  operation.set_type(Offer::Operation::SHRINK_VOLUME);
+
+  operation.mutable_shrink_volume()->mutable_volume()->CopyFrom(
+      call.shrink_volume().volume());
+
+  operation.mutable_shrink_volume()->mutable_subtract()->CopyFrom(
+      call.shrink_volume().subtract());
+
+  Option<Error> error = validateAndUpgradeResources(&operation);
+  if (error.isSome()) {
+    return BadRequest(error->message);
+  }
+
+  error = validation::operation::validate(
+      operation.shrink_volume(), slave->capabilities);
+
+  if (error.isSome()) {
+    return BadRequest(
+        "Invalid SHRINK_VOLUME operation on agent " +
+        stringify(*slave) + ": " + error->message);
+  }
+
+  return master->authorizeResizeVolume(
+      operation.shrink_volume().volume(), principal)
+    .then(defer(master->self(), [=](bool authorized) -> Future<Response> {
+      if (!authorized) {
+        return Forbidden();
+      }
+
+      return _operation(slaveId, operation);
+    }));
 }
 
 
@@ -1533,56 +1384,12 @@ Future<Response> Master::Http::frameworks(
       {VIEW_FRAMEWORK, VIEW_TASK, VIEW_EXECUTOR})
     .then(defer(
         master->self(),
-        [this, request](const Owned<ObjectApprovers>& approvers) -> Response {
-          IDAcceptor<FrameworkID> selectFrameworkId(
-              request.url.query.get("framework_id"));
-          // This lambda is consumed before the outer lambda
-          // returns, hence capture by reference is fine here.
-          auto frameworks = [this, &approvers, &selectFrameworkId](
-              JSON::ObjectWriter* writer) {
-            // Model all of the frameworks.
-            writer->field(
-                "frameworks",
-                [this, &approvers, &selectFrameworkId](
-                    JSON::ArrayWriter* writer) {
-                  foreachvalue (
-                      Framework* framework, master->frameworks.registered) {
-                    // Skip unauthorized frameworks or frameworks
-                    // without a matching ID.
-                    if (!selectFrameworkId.accept(framework->id()) ||
-                        !approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
-                      continue;
-                    }
-
-                    writer->element(FullFrameworkWriter(approvers, framework));
-                  }
-                });
-
-            // Model all of the completed frameworks.
-            writer->field(
-                "completed_frameworks",
-                [this, &approvers, &selectFrameworkId](
-                    JSON::ArrayWriter* writer) {
-                  foreachvalue (const Owned<Framework>& framework,
-                                master->frameworks.completed) {
-                    // Skip unauthorized frameworks or frameworks
-                    // without a matching ID.
-                    if (!selectFrameworkId.accept(framework->id()) ||
-                        !approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
-                      continue;
-                    }
-
-                    writer->element(
-                        FullFrameworkWriter(approvers, framework.get()));
-                  }
-                });
-
-            // Unregistered frameworks are no longer possible. We emit an
-            // empty array for the sake of backward compatibility.
-            writer->field("unregistered_frameworks", [](JSON::ArrayWriter*) {});
-          };
-
-          return OK(jsonify(frameworks), request.url.query.get("jsonp"));
+        [this, request, principal](const Owned<ObjectApprovers>& approvers) {
+          return deferBatchedRequest(
+              &Master::ReadOnlyHandler::frameworks,
+              principal,
+              request.url.query,
+              approvers);
         }));
 }
 
@@ -1651,13 +1458,180 @@ Future<Response> Master::Http::getFrameworks(
     .then(defer(
         master->self(),
         [=](const Owned<ObjectApprovers>& approvers) -> Future<Response> {
-          mesos::master::Response response;
-          response.set_type(mesos::master::Response::GET_FRAMEWORKS);
-          *response.mutable_get_frameworks() = _getFrameworks(approvers);
+          // Serialize the following message:
+          //
+          //   mesos::master::Response response;
+          //   response.set_type(mesos::master::Response::GET_FRAMEWORKS);
+          //   *response.mutable_get_frameworks() = _getFrameworks(approvers);
 
-          return OK(
-              serialize(contentType, evolve(response)), stringify(contentType));
-        }));
+          switch (contentType) {
+            case ContentType::PROTOBUF: {
+              string output;
+              google::protobuf::io::StringOutputStream stream(&output);
+              google::protobuf::io::CodedOutputStream writer(&stream);
+
+              WireFormatLite::WriteEnum(
+                  mesos::v1::master::Response::kTypeFieldNumber,
+                  mesos::v1::master::Response::GET_FRAMEWORKS,
+                  &writer);
+
+              WireFormatLite::WriteBytes(
+                  mesos::v1::master::Response::kGetFrameworksFieldNumber,
+                  serializeGetFrameworks(approvers),
+                  &writer);
+
+              // We must manually trim the unused buffer space since
+              // we use the string before the coded output stream is
+              // destructed.
+              writer.Trim();
+
+              return OK(std::move(output), stringify(contentType));
+            }
+
+            case ContentType::JSON: {
+              string body = jsonify([&](JSON::ObjectWriter* writer) {
+                const google::protobuf::Descriptor* descriptor =
+                  v1::master::Response::descriptor();
+
+                int field;
+
+                field = v1::master::Response::kTypeFieldNumber;
+                writer->field(
+                    descriptor->FindFieldByNumber(field)->name(),
+                    v1::master::Response::Type_Name(
+                        v1::master::Response::GET_FRAMEWORKS));
+
+                field = v1::master::Response::kGetFrameworksFieldNumber;
+                writer->field(
+                    descriptor->FindFieldByNumber(field)->name(),
+                    jsonifyGetFrameworks(master, approvers));
+              });
+
+              // TODO(bmahler): Pass jsonp query parameter through here.
+              return OK(std::move(body), stringify(contentType));
+            }
+
+            default:
+              return NotAcceptable("Request must accept json or protobuf");
+          }
+      }));
+}
+
+
+function<void(JSON::ObjectWriter*)> Master::Http::jsonifyGetFrameworks(
+    const Master* master,
+    const Owned<ObjectApprovers>& approvers)
+{
+  // Serialize the following:
+  //
+  //   mesos::master::Response::GetFrameworks getFrameworks;
+  //   for each framework:
+  //     *getFrameworks.add_frameworks() = model(*framework);
+  //   for each completed framework:
+  //     *getFrameworks.add_completed_frameworks() = model(*framework);
+
+  // TODO(bmahler): Consider not constructing the temporary framework
+  // objects and instead serialize directly, but since we don't
+  // expect a large number of pending tasks, we currently don't
+  // bother with the more efficient approach.
+
+  // TODO(bmahler): This copies the Owned object approvers.
+  return [=](JSON::ObjectWriter* writer) {
+    const google::protobuf::Descriptor* descriptor =
+      v1::master::Response::GetFrameworks::descriptor();
+
+    int field;
+
+    field = v1::master::Response::GetFrameworks::kFrameworksFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        [&](JSON::ArrayWriter* writer) {
+      foreachvalue (const Framework* framework,
+                    master->frameworks.registered) {
+        // Skip unauthorized frameworks.
+        if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+          continue;
+        }
+
+        mesos::master::Response::GetFrameworks::Framework f = model(*framework);
+        writer->element(asV1Protobuf(f));
+      }
+    });
+
+    field =
+      v1::master::Response::GetFrameworks::kCompletedFrameworksFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        [&](JSON::ArrayWriter* writer) {
+      foreachvalue (const Owned<Framework>& framework,
+                    master->frameworks.completed) {
+        // Skip unauthorized frameworks.
+        if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+          continue;
+        }
+
+        mesos::master::Response::GetFrameworks::Framework f = model(*framework);
+        writer->element(asV1Protobuf(f));
+      }
+    });
+  };
+}
+
+
+string Master::Http::serializeGetFrameworks(
+    const Owned<ObjectApprovers>& approvers) const
+{
+  // Serialize the following:
+  //
+  //   mesos::master::Response::GetFrameworks getFrameworks;
+  //   for each framework:
+  //     *getFrameworks.add_frameworks() = model(*framework);
+  //   for each completed framework:
+  //     *getFrameworks.add_completed_frameworks() = model(*framework);
+
+  string output;
+  google::protobuf::io::StringOutputStream stream(&output);
+  google::protobuf::io::CodedOutputStream writer(&stream);
+
+  // TODO(bmahler): Consider not constructing the temporary framework
+  // objects and instead serialize directly, but since we don't
+  // expect a large number of pending tasks, we currently don't
+  // bother with the more efficient approach.
+
+  foreachvalue (const Framework* framework,
+                master->frameworks.registered) {
+    // Skip unauthorized frameworks.
+    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+      continue;
+    }
+
+    WireFormatLite2::WriteMessageWithoutCachedSizes(
+        mesos::master::Response::GetFrameworks::kFrameworksFieldNumber,
+        model(*framework),
+        &writer);
+  }
+
+  foreachvalue (const Owned<Framework>& framework,
+                master->frameworks.completed) {
+    // Skip unauthorized frameworks.
+    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+      continue;
+    }
+
+    WireFormatLite2::WriteMessageWithoutCachedSizes(
+        mesos::master::Response::GetFrameworks::kCompletedFrameworksFieldNumber,
+        model(*framework),
+        &writer);
+  }
+
+  // While an explicit Trim() isn't necessary (since the coded
+  // output stream is destructed before the string is returned),
+  // it's a quite tricky bug to diagnose if Trim() is missed, so
+  // we always do it explicitly to signal the reader about this
+  // subtlety.
+  writer.Trim();
+
+  return output;
 }
 
 
@@ -1703,19 +1677,246 @@ Future<Response> Master::Http::getExecutors(
     .then(defer(
         master->self(),
         [=](const Owned<ObjectApprovers>& approvers) -> Response {
-          mesos::master::Response response;
-          response.set_type(mesos::master::Response::GET_EXECUTORS);
+          // Serialize the following message:
+          //
+          //   mesos::master::Response response;
+          //   response.set_type(mesos::master::Response::GET_EXECUTORS);
+          //   *response.mutable_get_executors() = _getExecutors(approvers);
 
-          *response.mutable_get_executors() = _getExecutors(approvers);
+          switch (contentType) {
+            case ContentType::PROTOBUF: {
+              string output;
+              google::protobuf::io::StringOutputStream stream(&output);
+              google::protobuf::io::CodedOutputStream writer(&stream);
 
-          return OK(
-              serialize(contentType, evolve(response)), stringify(contentType));
-        }));
+              WireFormatLite::WriteEnum(
+                  mesos::v1::master::Response::kTypeFieldNumber,
+                  mesos::v1::master::Response::GET_EXECUTORS,
+                  &writer);
+
+              WireFormatLite::WriteBytes(
+                  mesos::v1::master::Response::kGetExecutorsFieldNumber,
+                  serializeGetExecutors(approvers),
+                  &writer);
+
+              // We must manually trim the unused buffer space since
+              // we use the string before the coded output stream is
+              // destructed.
+              writer.Trim();
+
+              return OK(std::move(output), stringify(contentType));
+            }
+
+            case ContentType::JSON: {
+              string body = jsonify([&](JSON::ObjectWriter* writer) {
+                const google::protobuf::Descriptor* descriptor =
+                  v1::master::Response::descriptor();
+
+                int field;
+
+                field = v1::master::Response::kTypeFieldNumber;
+                writer->field(
+                    descriptor->FindFieldByNumber(field)->name(),
+                    v1::master::Response::Type_Name(
+                        v1::master::Response::GET_EXECUTORS));
+
+                field = v1::master::Response::kGetExecutorsFieldNumber;
+                writer->field(
+                    descriptor->FindFieldByNumber(field)->name(),
+                    jsonifyGetExecutors(master, approvers));
+              });
+
+              // TODO(bmahler): Pass jsonp query parameter through here.
+              return OK(std::move(body), stringify(contentType));
+            }
+
+            default:
+              return NotAcceptable("Request must accept json or protobuf");
+          }
+      }));
+}
+
+
+function<void(JSON::ObjectWriter*)> Master::Http::jsonifyGetExecutors(
+    const Master* master,
+    const Owned<ObjectApprovers>& approvers)
+{
+  // Serialize the following:
+  //
+  //   mesos::master::Response::GetExecutors getExecutors;
+  //
+  //   for each (executor, agent):
+  //     mesos::master::Response::GetExecutors::Executor* executor =
+  //       getExecutors.add_executors();
+  //     *executor->mutable_executor_info() = executorInfo;
+  //     *executor->mutable_slave_id() = slaveId;
+
+  // TODO(bmahler): This copies the owned object approvers.
+  return [=](JSON::ObjectWriter* writer) {
+    // Construct framework list with both active and completed frameworks.
+    vector<const Framework*> frameworks;
+    foreachvalue (Framework* framework, master->frameworks.registered) {
+      // Skip unauthorized frameworks.
+      if (approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+        frameworks.push_back(framework);
+      }
+    }
+    foreachvalue (const Owned<Framework>& framework,
+                  master->frameworks.completed) {
+      // Skip unauthorized frameworks.
+      if (approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+        frameworks.push_back(framework.get());
+      }
+    }
+
+    const google::protobuf::Descriptor* descriptor =
+      v1::master::Response::GetExecutors::descriptor();
+
+    int field;
+
+    field = v1::master::Response::GetExecutors::kExecutorsFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        [&](JSON::ArrayWriter* writer) {
+      foreach (const Framework* framework, frameworks) {
+        foreachpair (const SlaveID& slaveId,
+                     const auto& executorsMap,
+                     framework->executors) {
+          foreachvalue (const ExecutorInfo& executorInfo, executorsMap) {
+            // Skip unauthorized executors.
+            if (!approvers->approved<VIEW_EXECUTOR>(
+                    executorInfo, framework->info)) {
+              continue;
+            }
+
+            writer->element([&](JSON::ObjectWriter* writer) {
+              const google::protobuf::Descriptor* descriptor =
+                v1::master::Response::GetExecutors::Executor::descriptor();
+
+              // Serialize the following message:
+              //
+              //   mesos::master::Response::GetExecutors::Executor executor;
+              //   *executor.mutable_executor_info() = executorInfo;
+              //   *executor.mutable_slave_id() = slaveId;
+              int field;
+
+              field = v1::master::Response::GetExecutors::Executor
+                ::kExecutorInfoFieldNumber;
+              writer->field(
+                  descriptor->FindFieldByNumber(field)->name(),
+                  asV1Protobuf(executorInfo));
+
+              field = v1::master::Response::GetExecutors::Executor
+                ::kAgentIdFieldNumber;
+              writer->field(
+                  descriptor->FindFieldByNumber(field)->name(),
+                  asV1Protobuf(slaveId));
+            });
+          }
+        }
+      }
+    });
+  };
+}
+
+
+string Master::Http::serializeGetExecutors(
+    const Owned<ObjectApprovers>& approvers) const
+{
+  // Construct framework list with both active and completed frameworks.
+  vector<const Framework*> frameworks;
+  foreachvalue (Framework* framework, master->frameworks.registered) {
+    // Skip unauthorized frameworks.
+    if (approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+      frameworks.push_back(framework);
+    }
+  }
+  foreachvalue (const Owned<Framework>& framework,
+                master->frameworks.completed) {
+    // Skip unauthorized frameworks.
+    if (approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+      frameworks.push_back(framework.get());
+    }
+  }
+
+  // Lambda for serializing the following message:
+  //
+  //   mesos::master::Response::GetExecutors::Executor executor;
+  //   *executor.mutable_executor_info() = executorInfo;
+  //   *executor.mutable_slave_id() = slaveId;
+  auto serializeExecutor = [](const ExecutorInfo& e, const SlaveID& s) {
+    string output;
+    google::protobuf::io::StringOutputStream stream(&output);
+    google::protobuf::io::CodedOutputStream writer(&stream);
+
+    WireFormatLite2::WriteMessageWithoutCachedSizes(
+        mesos::v1::master::Response::GetExecutors::Executor
+          ::kExecutorInfoFieldNumber,
+        e,
+        &writer);
+
+    WireFormatLite2::WriteMessageWithoutCachedSizes(
+        mesos::v1::master::Response::GetExecutors::Executor
+          ::kAgentIdFieldNumber,
+        s,
+        &writer);
+
+    // While an explicit Trim() isn't necessary (since the coded
+    // output stream is destructed before the string is returned),
+    // it's a quite tricky bug to diagnose if Trim() is missed, so
+    // we always do it explicitly to signal the reader about this
+    // subtlety.
+    writer.Trim();
+
+    return output;
+  };
+
+  string output;
+  google::protobuf::io::StringOutputStream stream(&output);
+  google::protobuf::io::CodedOutputStream writer(&stream);
+
+  // Serialize the following:
+  //
+  //   mesos::master::Response::GetExecutors getExecutors;
+  //
+  //   for each (executor, agent):
+  //     mesos::master::Response::GetExecutors::Executor* executor =
+  //       getExecutors.add_executors();
+  //     *executor->mutable_executor_info() = executorInfo;
+  //     *executor->mutable_slave_id() = slaveId;
+
+  foreach (const Framework* framework, frameworks) {
+    foreachpair (const SlaveID& slaveId,
+                 const auto& executorsMap,
+                 framework->executors) {
+      foreachvalue (const ExecutorInfo& executorInfo, executorsMap) {
+        // Skip unauthorized executors.
+        if (!approvers->approved<VIEW_EXECUTOR>(
+                executorInfo, framework->info)) {
+          continue;
+        }
+
+        WireFormatLite::WriteBytes(
+            mesos::v1::master::Response::GetExecutors::kExecutorsFieldNumber,
+            serializeExecutor(executorInfo, slaveId),
+            &writer);
+      }
+    }
+  }
+
+  // While an explicit Trim() isn't necessary (since the coded
+  // output stream is destructed before the string is returned),
+  // it's a quite tricky bug to diagnose if Trim() is missed, so
+  // we always do it explicitly to signal the reader about this
+  // subtlety.
+  writer.Trim();
+
+  return output;
 }
 
 
 mesos::master::Response::GetExecutors Master::Http::_getExecutors(
-      const Owned<ObjectApprovers>& approvers) const
+    const Owned<ObjectApprovers>& approvers) const
 {
   // Construct framework list with both active and completed frameworks.
   vector<const Framework*> frameworks;
@@ -1778,14 +1979,151 @@ Future<Response> Master::Http::getState(
     .then(defer(
         master->self(),
         [=](const Owned<ObjectApprovers>& approvers) -> Response {
-          mesos::master::Response response;
-          response.set_type(mesos::master::Response::GET_STATE);
+          // Serialize the following message:
+          //
+          //   mesos::master::Response response;
+          //   response.set_type(mesos::master::Response::GET_STATE);
+          //   *response.mutable_get_state() = _getState(approvers);
 
-          *response.mutable_get_state() = _getState(approvers);
+          switch (contentType) {
+            case ContentType::PROTOBUF: {
+              string output;
+              google::protobuf::io::StringOutputStream stream(&output);
+              google::protobuf::io::CodedOutputStream writer(&stream);
 
-          return OK(
-              serialize(contentType, evolve(response)), stringify(contentType));
+              WireFormatLite::WriteEnum(
+                  mesos::v1::master::Response::kTypeFieldNumber,
+                  mesos::v1::master::Response::GET_STATE,
+                  &writer);
+
+              WireFormatLite::WriteBytes(
+                  mesos::v1::master::Response::kGetStateFieldNumber,
+                  serializeGetState(approvers),
+                  &writer);
+
+              // We must manually trim the unused buffer space since
+              // we use the string before the coded output stream is
+              // destructed.
+              writer.Trim();
+
+              return OK(std::move(output), stringify(contentType));
+            }
+
+            case ContentType::JSON: {
+              string body = jsonify([&](JSON::ObjectWriter* writer) {
+                const google::protobuf::Descriptor* descriptor =
+                  v1::master::Response::descriptor();
+
+                int field;
+
+                field = v1::master::Response::kTypeFieldNumber;
+                writer->field(
+                    descriptor->FindFieldByNumber(field)->name(),
+                    v1::master::Response::Type_Name(
+                        v1::master::Response::GET_STATE));
+
+                field = v1::master::Response::kGetStateFieldNumber;
+                writer->field(
+                    descriptor->FindFieldByNumber(field)->name(),
+                    jsonifyGetState(master, approvers));
+              });
+
+              // TODO(bmahler): Pass jsonp query parameter through here.
+              return OK(std::move(body), stringify(contentType));
+            }
+
+            default:
+              return NotAcceptable("Request must accept json or protobuf");
+          }
         }));
+}
+
+
+function<void(JSON::ObjectWriter*)> Master::Http::jsonifyGetState(
+    const Master* master,
+    const Owned<ObjectApprovers>& approvers)
+{
+  // Jsonify the following message:
+  //
+  //   mesos::master::Response::GetState getState;
+  //   *getState.mutable_get_tasks() = _getTasks(approvers);
+  //   *getState.mutable_get_executors() = _getExecutors(approvers);
+  //   *getState.mutable_get_frameworks() = _getFrameworks(approvers);
+  //   *getState.mutable_get_agents() = _getAgents(approvers);
+
+  // TODO(bmahler): This copies the Owned object approvers.
+  return [=](JSON::ObjectWriter* writer) {
+    const google::protobuf::Descriptor* descriptor =
+      v1::master::Response::GetState::descriptor();
+
+    int field;
+
+    field = v1::master::Response::GetState::kGetTasksFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        jsonifyGetTasks(master, approvers));
+
+    field = v1::master::Response::GetState::kGetExecutorsFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        jsonifyGetExecutors(master, approvers));
+
+    field = v1::master::Response::GetState::kGetFrameworksFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        jsonifyGetFrameworks(master, approvers));
+
+    field = v1::master::Response::GetState::kGetAgentsFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        jsonifyGetAgents(master, approvers));
+  };
+}
+
+
+string Master::Http::serializeGetState(
+    const Owned<ObjectApprovers>& approvers) const
+{
+  // Serialize the following message:
+  //
+  //   mesos::master::Response::GetState getState;
+  //   *getState.mutable_get_tasks() = _getTasks(approvers);
+  //   *getState.mutable_get_executors() = _getExecutors(approvers);
+  //   *getState.mutable_get_frameworks() = _getFrameworks(approvers);
+  //   *getState.mutable_get_agents() = _getAgents(approvers);
+
+  string output;
+  google::protobuf::io::StringOutputStream stream(&output);
+  google::protobuf::io::CodedOutputStream writer(&stream);
+
+  WireFormatLite::WriteBytes(
+      mesos::v1::master::Response::GetState::kGetTasksFieldNumber,
+      serializeGetTasks(approvers),
+      &writer);
+
+  WireFormatLite::WriteBytes(
+      mesos::v1::master::Response::GetState::kGetExecutorsFieldNumber,
+      serializeGetExecutors(approvers),
+      &writer);
+
+  WireFormatLite::WriteBytes(
+      mesos::v1::master::Response::GetState::kGetFrameworksFieldNumber,
+      serializeGetFrameworks(approvers),
+      &writer);
+
+  WireFormatLite::WriteBytes(
+      mesos::v1::master::Response::GetState::kGetAgentsFieldNumber,
+      serializeGetAgents(approvers),
+      &writer);
+
+  // While an explicit Trim() isn't necessary (since the coded
+  // output stream is destructed before the string is returned),
+  // it's a quite tricky bug to diagnose if Trim() is missed, so
+  // we always do it explicitly to signal the reader about this
+  // subtlety.
+  writer.Trim();
+
+  return output;
 }
 
 
@@ -1863,19 +2201,19 @@ Future<Response> Master::Http::flags(
   Option<string> jsonp = request.url.query.get("jsonp");
 
   return _flags(principal)
-      .then([jsonp](const Try<JSON::Object, FlagsError>& flags)
-            -> Future<Response> {
-        if (flags.isError()) {
-          switch (flags.error().type) {
-            case FlagsError::Type::UNAUTHORIZED:
-              return Forbidden();
-          }
-
-          return InternalServerError(flags.error().message);
+    .then([jsonp](const Try<JSON::Object, FlagsError>& flags)
+          -> Future<Response> {
+      if (flags.isError()) {
+        switch (flags.error().type) {
+          case FlagsError::Type::UNAUTHORIZED:
+            return Forbidden();
         }
 
-        return OK(flags.get(), jsonp);
-      });
+        return InternalServerError(flags.error().message);
+      }
+
+      return OK(flags.get(), jsonp);
+    });
 }
 
 
@@ -1895,15 +2233,15 @@ Future<Try<JSON::Object, Master::Http::FlagsError>> Master::Http::_flags(
   }
 
   return master->authorizer.get()->authorized(authRequest)
-      .then(defer(
-          master->self(),
-          [this](bool authorized) -> Future<Try<JSON::Object, FlagsError>> {
-        if (authorized) {
-          return __flags();
-        } else {
-          return FlagsError(FlagsError::Type::UNAUTHORIZED);
-        }
-      }));
+    .then(defer(
+        master->self(),
+        [this](bool authorized) -> Future<Try<JSON::Object, FlagsError>> {
+      if (authorized) {
+        return __flags();
+      } else {
+        return FlagsError(FlagsError::Type::UNAUTHORIZED);
+      }
+    }));
 }
 
 
@@ -1934,22 +2272,22 @@ Future<Response> Master::Http::getFlags(
   CHECK_EQ(mesos::master::Call::GET_FLAGS, call.type());
 
   return _flags(principal)
-      .then([contentType](const Try<JSON::Object, FlagsError>& flags)
-            -> Future<Response> {
-        if (flags.isError()) {
-          switch (flags.error().type) {
-            case FlagsError::Type::UNAUTHORIZED:
-              return Forbidden();
-          }
-
-          return InternalServerError(flags.error().message);
+    .then([contentType](const Try<JSON::Object, FlagsError>& flags)
+          -> Future<Response> {
+      if (flags.isError()) {
+        switch (flags.error().type) {
+          case FlagsError::Type::UNAUTHORIZED:
+            return Forbidden();
         }
 
-        return OK(
-            serialize(contentType,
-                      evolve<v1::master::Response::GET_FLAGS>(flags.get())),
-            stringify(contentType));
-      });
+        return InternalServerError(flags.error().message);
+      }
+
+      return OK(
+          serialize(contentType,
+                    evolve<v1::master::Response::GET_FLAGS>(flags.get())),
+          stringify(contentType));
+    });
 }
 
 
@@ -2000,6 +2338,108 @@ Future<Response> Master::Http::getVersion(
 }
 
 
+// NOTE: The `metrics` object provided as an argument must outlive
+// the returned function, since the function captures `metrics`
+// by reference to avoid a really expensive map copy. This is a
+// rather unsafe approach, but in typical jsonify usage this is
+// not an issue.
+function<void(JSON::ObjectWriter*)> jsonifyGetMetrics(
+    const map<string, double>& metrics)
+{
+  // Serialize the following message:
+  //
+  //   mesos::master::Response::GetMetrics getMetrics;
+  //
+  //   foreachpair (const string& key, double value, metrics) {
+  //     Metric* metric = getMetrics->add_metrics();
+  //     metric->set_name(key);
+  //     metric->set_value(value);
+  //   }
+
+  return [&](JSON::ObjectWriter* writer) {
+    const google::protobuf::Descriptor* descriptor =
+      v1::master::Response::GetMetrics::descriptor();
+
+    int field;
+
+    field = v1::master::Response::GetMetrics::kMetricsFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        [&](JSON::ArrayWriter* writer) {
+          foreachpair (const string& key, double value, metrics) {
+            writer->element([&](JSON::ObjectWriter* writer) {
+              const google::protobuf::Descriptor* descriptor =
+                v1::Metric::descriptor();
+
+              int field;
+
+              field = v1::Metric::kNameFieldNumber;
+              writer->field(
+                  descriptor->FindFieldByNumber(field)->name(), key);
+
+              field = v1::Metric::kValueFieldNumber;
+              writer->field(
+                  descriptor->FindFieldByNumber(field)->name(), value);
+            });
+          }
+        });
+  };
+}
+
+
+string serializeGetMetrics(const map<string, double>& metrics)
+{
+  // Serialize the following message:
+  //
+  //   mesos::master::Response::GetMetrics getMetrics;
+  //
+  //   foreachpair (const string& key, double value, metrics) {
+  //     Metric* metric = getMetrics->add_metrics();
+  //     metric->set_name(key);
+  //     metric->set_value(value);
+  //   }
+
+  auto serializeMetric = [](const string& key, double value) {
+    string output;
+    google::protobuf::io::StringOutputStream stream(&output);
+    google::protobuf::io::CodedOutputStream writer(&stream);
+
+    WireFormatLite::WriteString(
+        mesos::v1::Metric::kNameFieldNumber, key, &writer);
+
+    WireFormatLite::WriteDouble(
+        mesos::v1::Metric::kValueFieldNumber, value, &writer);
+
+    // While an explicit Trim() isn't necessary (since the coded
+    // output stream is destructed before the string is returned),
+    // it's a quite tricky bug to diagnose if Trim() is missed, so
+    // we always do it explicitly to signal the reader about this
+    // subtlety.
+    writer.Trim();
+    return output;
+  };
+
+  string output;
+  google::protobuf::io::StringOutputStream stream(&output);
+  google::protobuf::io::CodedOutputStream writer(&stream);
+
+  foreachpair (const string& key, double value, metrics) {
+    WireFormatLite::WriteBytes(
+        mesos::v1::master::Response::GetMetrics::kMetricsFieldNumber,
+        serializeMetric(key, value),
+        &writer);
+  }
+
+  // While an explicit Trim() isn't necessary (since the coded
+  // output stream is destructed before the string is returned),
+  // it's a quite tricky bug to diagnose if Trim() is missed, so
+  // we always do it explicitly to signal the reader about this
+  // subtlety.
+  writer.Trim();
+  return output;
+}
+
+
 Future<Response> Master::Http::getMetrics(
     const mesos::master::Call& call,
     const Option<Principal>& principal,
@@ -2014,21 +2454,64 @@ Future<Response> Master::Http::getMetrics(
   }
 
   return process::metrics::snapshot(timeout)
-      .then([contentType](const hashmap<string, double>& metrics) -> Response {
-        mesos::master::Response response;
-        response.set_type(mesos::master::Response::GET_METRICS);
-        mesos::master::Response::GetMetrics* _getMetrics =
-          response.mutable_get_metrics();
+    .then([contentType](const map<string, double>& metrics) -> Response {
+      // Serialize the following message:
+      //
+      //   mesos::master::Response response;
+      //   response.set_type(mesos::master::Response::GET_METRICS);
+      //   mesos::master::Response::GetMetrics* getMetrics = ...;
 
-        foreachpair (const string& key, double value, metrics) {
-          Metric* metric = _getMetrics->add_metrics();
-          metric->set_name(key);
-          metric->set_value(value);
+      switch (contentType) {
+        case ContentType::PROTOBUF: {
+          string output;
+          google::protobuf::io::StringOutputStream stream(&output);
+          google::protobuf::io::CodedOutputStream writer(&stream);
+
+          WireFormatLite::WriteEnum(
+              mesos::v1::master::Response::kTypeFieldNumber,
+              mesos::v1::master::Response::GET_METRICS,
+              &writer);
+
+          WireFormatLite::WriteBytes(
+              mesos::v1::master::Response::kGetMetricsFieldNumber,
+              serializeGetMetrics(metrics),
+              &writer);
+
+          // We must manually trim the unused buffer space since
+          // we use the string before the coded output stream is
+          // destructed.
+          writer.Trim();
+
+          return OK(std::move(output), stringify(contentType));
         }
 
-        return OK(serialize(contentType, evolve(response)),
-                  stringify(contentType));
-      });
+        case ContentType::JSON: {
+          string body = jsonify([&](JSON::ObjectWriter* writer) {
+            const google::protobuf::Descriptor* descriptor =
+              v1::master::Response::descriptor();
+
+            int field;
+
+            field = v1::master::Response::kTypeFieldNumber;
+            writer->field(
+                descriptor->FindFieldByNumber(field)->name(),
+                v1::master::Response::Type_Name(
+                    v1::master::Response::GET_METRICS));
+
+            field = v1::master::Response::kGetMetricsFieldNumber;
+            writer->field(
+                descriptor->FindFieldByNumber(field)->name(),
+                jsonifyGetMetrics(metrics));
+          });
+
+          // TODO(bmahler): Pass jsonp query parameter through here.
+          return OK(std::move(body), stringify(contentType));
+        }
+
+        default:
+          return NotAcceptable("Request must accept json or protobuf");
+      }
+    });
 }
 
 
@@ -2240,11 +2723,45 @@ Future<Response> Master::Http::reserve(
     return BadRequest("Unable to decode query string: " + decode.error());
   }
 
+  // Helper function to parse a list of resource from query parameters.
+  auto parseResourcesList = [](
+      const std::string& key,
+      const hashmap<string, string>& queryParameters)
+    -> Try<RepeatedPtrField<Resource>>
+    {
+      Option<string> value = queryParameters.get(key);
+      if (value.isNone()) {
+        return Error(
+          "Missing '" + key + "' query parameter in the request body");
+      }
+
+      Try<JSON::Array> parse =
+        JSON::parse<JSON::Array>(value.get());
+
+      if (parse.isError()) {
+        return Error(
+            "Error parsing '" + key +
+            "' query parameter in the request body: " + parse.error());
+      }
+
+      RepeatedPtrField<Resource> resources;
+      foreach (const JSON::Value& value, parse->values) {
+        Try<Resource> resource = ::protobuf::parse<Resource>(value);
+        if (resource.isError()) {
+          return Error(
+              "Error parsing '" + key +
+              "' query parameter in the request body: " + resource.error());
+        }
+
+        resources.Add()->CopyFrom(resource.get());
+      }
+
+      return resources;
+    };
+
   const hashmap<string, string>& values = decode.get();
 
-  Option<string> value;
-
-  value = values.get("slaveId");
+  Option<string> value = values.get("slaveId");
   if (value.isNone()) {
     return BadRequest("Missing 'slaveId' query parameter in the request body");
   }
@@ -2252,39 +2769,32 @@ Future<Response> Master::Http::reserve(
   SlaveID slaveId;
   slaveId.set_value(value.get());
 
-  value = values.get("resources");
-  if (value.isNone()) {
-    return BadRequest(
-        "Missing 'resources' query parameter in the request body");
+  Try<RepeatedPtrField<Resource>> resources =
+    parseResourcesList("resources", values);
+
+  if (resources.isError()) {
+    return BadRequest(resources.error());
   }
 
-  Try<JSON::Array> parse =
-    JSON::parse<JSON::Array>(value.get());
+  RepeatedPtrField<Resource> source;
+  if (values.contains("source")) {
+    Try<RepeatedPtrField<Resource>> parsedSource =
+      parseResourcesList("source", values);
 
-  if (parse.isError()) {
-    return BadRequest(
-        "Error in parsing 'resources' query parameter in the request body: " +
-        parse.error());
-  }
-
-  RepeatedPtrField<Resource> resources;
-  foreach (const JSON::Value& value, parse->values) {
-    Try<Resource> resource = ::protobuf::parse<Resource>(value);
-    if (resource.isError()) {
-      return BadRequest(
-          "Error in parsing 'resources' query parameter in the request body: " +
-          resource.error());
+    if (parsedSource.isError()) {
+      return BadRequest(parsedSource.error());
     }
 
-    resources.Add()->CopyFrom(resource.get());
+    source = parsedSource.get();
   }
 
-  return _reserve(slaveId, resources, principal);
+  return _reserve(slaveId, source, resources.get(), principal);
 }
 
 
 Future<Response> Master::Http::_reserve(
     const SlaveID& slaveId,
+    const RepeatedPtrField<Resource>& source,
     const RepeatedPtrField<Resource>& resources,
     const Option<Principal>& principal) const
 {
@@ -2296,6 +2806,7 @@ Future<Response> Master::Http::_reserve(
   // Create an operation.
   Offer::Operation operation;
   operation.set_type(Offer::Operation::RESERVE);
+  operation.mutable_reserve()->mutable_source()->CopyFrom(source);
   operation.mutable_reserve()->mutable_resources()->CopyFrom(resources);
 
   Option<Error> error = validateAndUpgradeResources(&operation);
@@ -2318,12 +2829,7 @@ Future<Response> Master::Http::_reserve(
         return Forbidden();
       }
 
-      // We only allow "pushing" a single reservation at a time, so we require
-      // the resources with one reservation "popped" to be present on the agent.
-      Resources required =
-        Resources(operation.reserve().resources()).popReservation();
-
-      return _operation(slaveId, required, operation);
+      return _operation(slaveId, operation);
     }));
 }
 
@@ -2336,10 +2842,11 @@ Future<Response> Master::Http::reserveResources(
   CHECK_EQ(mesos::master::Call::RESERVE_RESOURCES, call.type());
 
   const SlaveID& slaveId = call.reserve_resources().slave_id();
+  const RepeatedPtrField<Resource>& source = call.reserve_resources().source();
   const RepeatedPtrField<Resource>& resources =
     call.reserve_resources().resources();
 
-  return _reserve(slaveId, resources, principal);
+  return _reserve(slaveId, source, resources, principal);
 }
 
 
@@ -2377,19 +2884,15 @@ Future<Response> Master::Http::slaves(
     return redirect(request);
   }
 
-  Option<string> slaveId = request.url.query.get("slave_id");
-  Option<string> jsonp = request.url.query.get("jsonp");
-
   return ObjectApprovers::create(master->authorizer, principal, {VIEW_ROLE})
     .then(defer(
         master->self(),
-        [this, slaveId, jsonp](const Owned<ObjectApprovers>& approvers)
-            -> Response {
-          IDAcceptor<SlaveID> selectSlaveId(slaveId);
-
-          return OK(
-              jsonify(SlavesWriter(master->slaves, approvers, selectSlaveId)),
-              jsonp);
+        [this, request, principal](const Owned<ObjectApprovers>& approvers) {
+          return deferBatchedRequest(
+              &Master::ReadOnlyHandler::slaves,
+              principal,
+              request.url.query,
+              approvers);
         }));
 }
 
@@ -2405,13 +2908,196 @@ Future<Response> Master::Http::getAgents(
     .then(defer(
         master->self(),
         [=](const Owned<ObjectApprovers>& approvers) -> Response {
-          mesos::master::Response response;
-          response.set_type(mesos::master::Response::GET_AGENTS);
-          *response.mutable_get_agents() = _getAgents(approvers);
+          // Serialize the following message:
+          //
+          //   mesos::master::Response response;
+          //   response.set_type(mesos::master::Response::GET_AGENTS);
+          //   *response.mutable_get_agents() = _getAgents(approvers);
 
-          return OK(
-              serialize(contentType, evolve(response)), stringify(contentType));
+          switch (contentType) {
+            case ContentType::PROTOBUF: {
+              string output;
+              google::protobuf::io::StringOutputStream stream(&output);
+              google::protobuf::io::CodedOutputStream writer(&stream);
+
+              WireFormatLite::WriteEnum(
+                  mesos::v1::master::Response::kTypeFieldNumber,
+                  mesos::v1::master::Response::GET_AGENTS,
+                  &writer);
+
+              WireFormatLite::WriteBytes(
+                  mesos::v1::master::Response::kGetAgentsFieldNumber,
+                  serializeGetAgents(approvers),
+                  &writer);
+
+              // We must manually trim the unused buffer space since
+              // we use the string before the coded output stream is
+              // destructed.
+              writer.Trim();
+
+              return OK(std::move(output), stringify(contentType));
+            }
+
+            case ContentType::JSON: {
+              string body = jsonify([&](JSON::ObjectWriter* writer) {
+                const google::protobuf::Descriptor* descriptor =
+                  v1::master::Response::descriptor();
+
+                int field;
+
+                field = v1::master::Response::kTypeFieldNumber;
+                writer->field(
+                    descriptor->FindFieldByNumber(field)->name(),
+                    v1::master::Response::Type_Name(
+                        v1::master::Response::GET_AGENTS));
+
+                field = v1::master::Response::kGetAgentsFieldNumber;
+                writer->field(
+                    descriptor->FindFieldByNumber(field)->name(),
+                    jsonifyGetAgents(master, approvers));
+              });
+
+              // TODO(bmahler): Pass jsonp query parameter through here.
+              return OK(std::move(body), stringify(contentType));
+            }
+
+            default:
+              return NotAcceptable("Request must accept json or protobuf");
+          }
     }));
+}
+
+
+function<void(JSON::ObjectWriter*)> Master::Http::jsonifyGetAgents(
+    const Master* master,
+    const Owned<ObjectApprovers>& approvers)
+{
+  // Serialize the following:
+  //
+  //   mesos::master::Response::GetAgents getAgents;
+  //   for each registered agent:
+  //     *getAgents.add_agents() = protobuf::master::event::createAgentResponse(
+  //         agent,
+  //         master->slaves.draining.get(slave->id),
+  //         master->slaves.deactivated.contains(slave->id),
+  //         approvers);
+  //   for each recovered agent:
+  //     SlaveInfo* agent = getAgents.add_recovered_agents();
+  //     agent->CopyFrom(slaveInfo);
+  //     agent->clear_resources();
+  //     foreach (const Resource& resource, slaveInfo.resources()):
+  //       if (approvers->approved<VIEW_ROLE>(resource)):
+  //         *agent->add_resources() = resource;
+
+  // TODO(bmahler): This copies the Owned object approvers.
+  return [=](JSON::ObjectWriter* writer) {
+    const google::protobuf::Descriptor* descriptor =
+      v1::master::Response::GetAgents::descriptor();
+
+    int field;
+
+    field = v1::master::Response::GetAgents::kAgentsFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        [&](JSON::ArrayWriter* writer) {
+      foreachvalue (const Slave* slave, master->slaves.registered) {
+        // TODO(bmahler): Consider not constructing the temporary
+        // agent object and instead serialize directly.
+        mesos::master::Response::GetAgents::Agent agent =
+            protobuf::master::event::createAgentResponse(
+                *slave,
+                master->slaves.draining.get(slave->id),
+                master->slaves.deactivated.contains(slave->id),
+                approvers);
+
+        writer->element(asV1Protobuf(agent));
+      }
+    });
+
+    field = v1::master::Response::GetAgents::kRecoveredAgentsFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        [&](JSON::ArrayWriter* writer) {
+      foreachvalue (const SlaveInfo& slaveInfo, master->slaves.recovered) {
+        // TODO(bmahler): Consider not constructing the temporary
+        // SlaveInfo object and instead serialize directly.
+        SlaveInfo agent = slaveInfo;
+        agent.clear_resources();
+        foreach (const Resource& resource, slaveInfo.resources()) {
+          if (approvers->approved<VIEW_ROLE>(resource)) {
+            *agent.add_resources() = resource;
+          }
+        }
+
+        writer->element(asV1Protobuf(agent));
+      }
+    });
+  };
+}
+
+
+string Master::Http::serializeGetAgents(
+    const Owned<ObjectApprovers>& approvers) const
+{
+  // Serialize the following:
+  //
+  //   mesos::master::Response::GetAgents getAgents;
+  //   for each registered agent:
+  //     *getAgents.add_agents() = protobuf::master::event::createAgentResponse(
+  //         agent,
+  //         master->slaves.draining.get(slave->id),
+  //         master->slaves.deactivated.contains(slave->id),
+  //         approvers);
+  //   for each recovered agent:
+  //     SlaveInfo* agent = getAgents.add_recovered_agents();
+  //     agent->CopyFrom(slaveInfo);
+  //     agent->clear_resources();
+  //     foreach (const Resource& resource, slaveInfo.resources()):
+  //       if (approvers->approved<VIEW_ROLE>(resource)):
+  //         *agent->add_resources() = resource;
+
+  string output;
+  google::protobuf::io::StringOutputStream stream(&output);
+  google::protobuf::io::CodedOutputStream writer(&stream);
+
+  foreachvalue (const Slave* slave, master->slaves.registered) {
+    // TODO(bmahler): Consider not constructing the temporary
+    // agent object and instead serialize directly.
+    WireFormatLite2::WriteMessageWithoutCachedSizes(
+        mesos::master::Response::GetAgents::kAgentsFieldNumber,
+        protobuf::master::event::createAgentResponse(
+            *slave,
+            master->slaves.draining.get(slave->id),
+            master->slaves.deactivated.contains(slave->id),
+            approvers),
+        &writer);
+  }
+
+  foreachvalue (const SlaveInfo& slaveInfo, master->slaves.recovered) {
+    // TODO(bmahler): Consider not constructing the temporary
+    // SlaveInfo object and instead serialize directly.
+    SlaveInfo agent = slaveInfo;
+    agent.clear_resources();
+    foreach (const Resource& resource, slaveInfo.resources()) {
+      if (approvers->approved<VIEW_ROLE>(resource)) {
+        *agent.add_resources() = resource;
+      }
+    }
+
+    WireFormatLite2::WriteMessageWithoutCachedSizes(
+        mesos::master::Response::GetAgents::kRecoveredAgentsFieldNumber,
+        agent,
+        &writer);
+  }
+
+  // While an explicit Trim() isn't necessary (since the coded
+  // output stream is destructed before the string is returned),
+  // it's a quite tricky bug to diagnose if Trim() is missed, so
+  // we always do it explicitly to signal the reader about this
+  // subtlety.
+  writer.Trim();
+
+  return output;
 }
 
 
@@ -2422,7 +3108,11 @@ mesos::master::Response::GetAgents Master::Http::_getAgents(
   foreachvalue (const Slave* slave, master->slaves.registered) {
     mesos::master::Response::GetAgents::Agent* agent = getAgents.add_agents();
     *agent =
-        protobuf::master::event::createAgentResponse(*slave, approvers);
+        protobuf::master::event::createAgentResponse(
+            *slave,
+            master->slaves.draining.get(slave->id),
+            master->slaves.deactivated.contains(slave->id),
+            approvers);
   }
 
   foreachvalue (const SlaveInfo& slaveInfo, master->slaves.recovered) {
@@ -2444,8 +3134,11 @@ string Master::Http::QUOTA_HELP()
 {
   return HELP(
     TLDR(
-        "Gets or updates quota for roles."),
+        "(Deprecated) Gets or updates quota for roles."),
     DESCRIPTION(
+        "NOTE: This endpoint is deprecated in favor of using the v1 master",
+        "calls: UPDATE_QUOTA and GET_QUOTA.",
+        "",
         "Returns 200 OK when the quota was queried or updated successfully.",
         "",
         "Returns 307 TEMPORARY_REDIRECT redirect to the leading master when",
@@ -2474,6 +3167,7 @@ string Master::Http::QUOTA_HELP()
 }
 
 
+// Deprecated in favor of v1 UPDATE_QUOTA and GET_QUOTA.
 Future<Response> Master::Http::quota(
     const Request& request,
     const Option<Principal>& principal) const
@@ -2689,144 +3383,106 @@ Future<Response> Master::Http::state(
       {VIEW_ROLE, VIEW_FRAMEWORK, VIEW_TASK, VIEW_EXECUTOR, VIEW_FLAGS})
     .then(defer(
         master->self(),
-        [this, request](const Owned<ObjectApprovers>& approvers) -> Response {
-          // This lambda is consumed before the outer lambda
-          // returns, hence capture by reference is fine here.
-          auto state = [this, &approvers](JSON::ObjectWriter* writer) {
-            writer->field("version", MESOS_VERSION);
-
-            if (build::GIT_SHA.isSome()) {
-              writer->field("git_sha", build::GIT_SHA.get());
-            }
-
-            if (build::GIT_BRANCH.isSome()) {
-              writer->field("git_branch", build::GIT_BRANCH.get());
-            }
-
-            if (build::GIT_TAG.isSome()) {
-              writer->field("git_tag", build::GIT_TAG.get());
-            }
-
-            writer->field("build_date", build::DATE);
-            writer->field("build_time", build::TIME);
-            writer->field("build_user", build::USER);
-            writer->field("start_time", master->startTime.secs());
-
-            if (master->electedTime.isSome()) {
-              writer->field("elected_time", master->electedTime->secs());
-            }
-
-            writer->field("id", master->info().id());
-            writer->field("pid", string(master->self()));
-            writer->field("hostname", master->info().hostname());
-            writer->field("capabilities", master->info().capabilities());
-            writer->field("activated_slaves", master->_slaves_active());
-            writer->field("deactivated_slaves", master->_slaves_inactive());
-            writer->field("unreachable_slaves", master->_slaves_unreachable());
-
-            if (master->info().has_domain()) {
-              writer->field("domain", master->info().domain());
-            }
-
-            // TODO(haosdent): Deprecated this in favor of `leader_info` below.
-            if (master->leader.isSome()) {
-              writer->field("leader", master->leader->pid());
-            }
-
-            if (master->leader.isSome()) {
-              writer->field("leader_info", [this](JSON::ObjectWriter* writer) {
-                json(writer, master->leader.get());
-              });
-            }
-
-            if (approvers->approved<VIEW_FLAGS>()) {
-              if (master->flags.cluster.isSome()) {
-                writer->field("cluster", master->flags.cluster.get());
-              }
-
-              if (master->flags.log_dir.isSome()) {
-                writer->field("log_dir", master->flags.log_dir.get());
-              }
-
-              if (master->flags.external_log_file.isSome()) {
-                writer->field("external_log_file",
-                              master->flags.external_log_file.get());
-              }
-
-              writer->field("flags", [this](JSON::ObjectWriter* writer) {
-                  foreachvalue (const flags::Flag& flag, master->flags) {
-                    Option<string> value = flag.stringify(master->flags);
-                    if (value.isSome()) {
-                      writer->field(flag.effective_name().value, value.get());
-                    }
-                  }
-                });
-            }
-
-            // Model all of the registered slaves.
-            writer->field(
-                "slaves",
-                [this, &approvers](JSON::ArrayWriter* writer) {
-                  foreachvalue (Slave* slave, master->slaves.registered) {
-                    writer->element(SlaveWriter(*slave, approvers));
-                  }
-                });
-
-            // Model all of the recovered slaves.
-            writer->field(
-                "recovered_slaves",
-                [this](JSON::ArrayWriter* writer) {
-                  foreachvalue (
-                      const SlaveInfo& slaveInfo, master->slaves.recovered) {
-                    writer->element([&slaveInfo](JSON::ObjectWriter* writer) {
-                      json(writer, slaveInfo);
-                    });
-                  }
-                });
-
-            // Model all of the frameworks.
-            writer->field(
-                "frameworks",
-                [this, &approvers](JSON::ArrayWriter* writer) {
-                  foreachvalue (
-                      Framework* framework, master->frameworks.registered) {
-                    // Skip unauthorized frameworks.
-                    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
-                      continue;
-                    }
-
-                    writer->element(FullFrameworkWriter(approvers, framework));
-                  }
-                });
-
-            // Model all of the completed frameworks.
-            writer->field(
-                "completed_frameworks",
-                [this, &approvers](JSON::ArrayWriter* writer) {
-                  foreachvalue (
-                      const Owned<Framework>& framework,
-                      master->frameworks.completed) {
-                    // Skip unauthorized frameworks.
-                    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
-                      continue;
-                    }
-
-                    writer->element(
-                        FullFrameworkWriter(approvers, framework.get()));
-                  }
-                });
-
-            // Orphan tasks are no longer possible. We emit an empty array
-            // for the sake of backward compatibility.
-            writer->field("orphan_tasks", [](JSON::ArrayWriter*) {});
-
-            // Unregistered frameworks are no longer possible. We emit an
-            // empty array for the sake of backward compatibility.
-            writer->field("unregistered_frameworks", [](JSON::ArrayWriter*) {});
-          };
-
-          return OK(jsonify(state), request.url.query.get("jsonp"));
+        [this, request, principal](const Owned<ObjectApprovers>& approvers) {
+          return deferBatchedRequest(
+              &Master::ReadOnlyHandler::state,
+              principal,
+              request.url.query,
+              approvers);
         }));
+}
+
+
+Future<Response> Master::Http::deferBatchedRequest(
+    ReadOnlyRequestHandler handler,
+    const Option<Principal>& principal,
+    const hashmap<std::string, std::string>& queryParameters,
+    const Owned<ObjectApprovers>& approvers) const
+{
+  bool scheduleBatch = batchedRequests.empty();
+
+  auto it = std::find_if(batchedRequests.begin(), batchedRequests.end(),
+      [handler, &principal, &queryParameters](
+          const BatchedRequest& batchedRequest) {
+        // NOTE: This is not a general-purpose request comparison, but
+        // specific to the batched requests which are always members of
+        // `ReadOnlyHandler`, since we rely on the response only depending
+        // on query parameters and the current master state.
+        return handler == batchedRequest.handler &&
+               principal == batchedRequest.principal &&
+               queryParameters == batchedRequest.queryParameters;
+      });
+
+  Future<Response> future;
+  if (it != batchedRequests.end()) {
+    // Return the existing future if we have a matching request.
+    // NOTE: This is effectively adding a layer of authorization permissions
+    // caching since we only checked the equality of principals, not the
+    // equality of the approvers themselves.
+    // On heavily-loaded masters, this could lead to a delay of several seconds
+    // before permission changes for a principal take effect.
+    future = it->promise.future();
+    ++master->metrics->http_cache_hits;
+  } else {
+    // Add an element to the batched state requests.
+    Promise<Response> promise;
+    future = promise.future();
+    batchedRequests.push_back(BatchedRequest{
+        handler,
+        queryParameters,
+        principal,
+        approvers,
+        std::move(promise)});
+  }
+
+  // Schedule processing of batched requests if not yet scheduled.
+  if (scheduleBatch) {
+    dispatch(master->self(), [this]() {
+      processRequestsBatch();
+    });
+  }
+
+  return future;
+}
+
+
+void Master::Http::processRequestsBatch() const
+{
+  CHECK(!batchedRequests.empty())
+    << "Bug in state batching logic: No requests to process";
+
+  // Produce the responses in parallel.
+  //
+  // TODO(alexr): Consider abstracting this into `parallel_async` or
+  // `foreach_parallel`, see MESOS-8587.
+  //
+  // TODO(alexr): Consider moving `BatchedStateRequest`'s fields into
+  // `process::async` once it supports moving.
+  foreach (BatchedRequest& request, batchedRequests) {
+    request.promise.associate(process::async(
+        [this](ReadOnlyRequestHandler handler,
+               const hashmap<std::string, std::string>& queryParameters,
+               const process::Owned<ObjectApprovers>& approvers) {
+          return (readonlyHandler.*handler)(queryParameters, approvers);
+        },
+        request.handler,
+        request.queryParameters,
+        request.approvers));
+  }
+
+  // Block the master actor until all workers have generated state responses.
+  // It is crucial not to allow the master actor to continue and possibly
+  // modify its state while a worker is reading it.
+  //
+  // NOTE: There is the potential for deadlock since we are blocking 1 working
+  // thread here, see MESOS-8256.
+  vector<Future<Response>> responses;
+  foreach (const BatchedRequest& request, batchedRequests) {
+    responses.push_back(request.promise.future());
+  }
+  process::await(responses).await();
+
+  batchedRequests.clear();
 }
 
 
@@ -2878,181 +3534,6 @@ Future<Response> Master::Http::readFile(
                 stringify(contentType));
     });
 }
-
-
-// This abstraction has no side-effects. It factors out computing the
-// mapping from 'slaves' to 'frameworks' to answer the questions 'what
-// frameworks are running on a given slave?' and 'what slaves are
-// running the given framework?'.
-class SlaveFrameworkMapping
-{
-public:
-  SlaveFrameworkMapping(const hashmap<FrameworkID, Framework*>& frameworks)
-  {
-    foreachpair (const FrameworkID& frameworkId,
-                 const Framework* framework,
-                 frameworks) {
-      foreachvalue (const TaskInfo& taskInfo, framework->pendingTasks) {
-        frameworksToSlaves[frameworkId].insert(taskInfo.slave_id());
-        slavesToFrameworks[taskInfo.slave_id()].insert(frameworkId);
-      }
-
-      foreachvalue (const Task* task, framework->tasks) {
-        frameworksToSlaves[frameworkId].insert(task->slave_id());
-        slavesToFrameworks[task->slave_id()].insert(frameworkId);
-      }
-
-      foreachvalue (const Owned<Task>& task, framework->unreachableTasks) {
-        frameworksToSlaves[frameworkId].insert(task->slave_id());
-        slavesToFrameworks[task->slave_id()].insert(frameworkId);
-      }
-
-      foreach (const Owned<Task>& task, framework->completedTasks) {
-        frameworksToSlaves[frameworkId].insert(task->slave_id());
-        slavesToFrameworks[task->slave_id()].insert(frameworkId);
-      }
-    }
-  }
-
-  const hashset<FrameworkID>& frameworks(const SlaveID& slaveId) const
-  {
-    const auto iterator = slavesToFrameworks.find(slaveId);
-    return iterator != slavesToFrameworks.end() ?
-      iterator->second : hashset<FrameworkID>::EMPTY;
-  }
-
-  const hashset<SlaveID>& slaves(const FrameworkID& frameworkId) const
-  {
-    const auto iterator = frameworksToSlaves.find(frameworkId);
-    return iterator != frameworksToSlaves.end() ?
-      iterator->second : hashset<SlaveID>::EMPTY;
-  }
-
-private:
-  hashmap<SlaveID, hashset<FrameworkID>> slavesToFrameworks;
-  hashmap<FrameworkID, hashset<SlaveID>> frameworksToSlaves;
-};
-
-
-// This abstraction has no side-effects. It factors out the accounting
-// for a 'TaskState' summary. We use this to summarize 'TaskState's
-// for both frameworks as well as slaves.
-struct TaskStateSummary
-{
-  // TODO(jmlvanre): Possibly clean this up as per MESOS-2694.
-  const static TaskStateSummary EMPTY;
-
-  TaskStateSummary()
-    : staging(0),
-      starting(0),
-      running(0),
-      killing(0),
-      finished(0),
-      killed(0),
-      failed(0),
-      lost(0),
-      error(0),
-      dropped(0),
-      unreachable(0),
-      gone(0),
-      gone_by_operator(0),
-      unknown(0) {}
-
-  // Account for the state of the given task.
-  void count(const Task& task)
-  {
-    switch (task.state()) {
-      case TASK_STAGING: { ++staging; break; }
-      case TASK_STARTING: { ++starting; break; }
-      case TASK_RUNNING: { ++running; break; }
-      case TASK_KILLING: { ++killing; break; }
-      case TASK_FINISHED: { ++finished; break; }
-      case TASK_KILLED: { ++killed; break; }
-      case TASK_FAILED: { ++failed; break; }
-      case TASK_LOST: { ++lost; break; }
-      case TASK_ERROR: { ++error; break; }
-      case TASK_DROPPED: { ++dropped; break; }
-      case TASK_UNREACHABLE: { ++unreachable; break; }
-      case TASK_GONE: { ++gone; break; }
-      case TASK_GONE_BY_OPERATOR: { ++gone_by_operator; break; }
-      case TASK_UNKNOWN: { ++unknown; break; }
-      // No default case allows for a helpful compiler error if we
-      // introduce a new state.
-    }
-  }
-
-  size_t staging;
-  size_t starting;
-  size_t running;
-  size_t killing;
-  size_t finished;
-  size_t killed;
-  size_t failed;
-  size_t lost;
-  size_t error;
-  size_t dropped;
-  size_t unreachable;
-  size_t gone;
-  size_t gone_by_operator;
-  size_t unknown;
-};
-
-
-const TaskStateSummary TaskStateSummary::EMPTY;
-
-
-// This abstraction has no side-effects. It factors out computing the
-// 'TaskState' summaries for frameworks and slaves. This answers the
-// questions 'How many tasks are in each state for a given framework?'
-// and 'How many tasks are in each state for a given slave?'.
-class TaskStateSummaries
-{
-public:
-  TaskStateSummaries(const hashmap<FrameworkID, Framework*>& frameworks)
-  {
-    foreachpair (const FrameworkID& frameworkId,
-                 const Framework* framework,
-                 frameworks) {
-      foreachvalue (const TaskInfo& taskInfo, framework->pendingTasks) {
-        frameworkTaskSummaries[frameworkId].staging++;
-        slaveTaskSummaries[taskInfo.slave_id()].staging++;
-      }
-
-      foreachvalue (const Task* task, framework->tasks) {
-        frameworkTaskSummaries[frameworkId].count(*task);
-        slaveTaskSummaries[task->slave_id()].count(*task);
-      }
-
-      foreachvalue (const Owned<Task>& task, framework->unreachableTasks) {
-        frameworkTaskSummaries[frameworkId].count(*task);
-        slaveTaskSummaries[task->slave_id()].count(*task);
-      }
-
-      foreach (const Owned<Task>& task, framework->completedTasks) {
-        frameworkTaskSummaries[frameworkId].count(*task);
-        slaveTaskSummaries[task->slave_id()].count(*task);
-      }
-    }
-  }
-
-  const TaskStateSummary& framework(const FrameworkID& frameworkId) const
-  {
-    const auto iterator = frameworkTaskSummaries.find(frameworkId);
-    return iterator != frameworkTaskSummaries.end() ?
-      iterator->second : TaskStateSummary::EMPTY;
-  }
-
-  const TaskStateSummary& slave(const SlaveID& slaveId) const
-  {
-    const auto iterator = slaveTaskSummaries.find(slaveId);
-    return iterator != slaveTaskSummaries.end() ?
-      iterator->second : TaskStateSummary::EMPTY;
-  }
-
-private:
-  hashmap<FrameworkID, TaskStateSummary> frameworkTaskSummaries;
-  hashmap<SlaveID, TaskStateSummary> slaveTaskSummaries;
-};
 
 
 string Master::Http::STATESUMMARY_HELP()
@@ -3107,190 +3588,13 @@ Future<Response> Master::Http::stateSummary(
       {VIEW_ROLE, VIEW_FRAMEWORK})
     .then(defer(
         master->self(),
-        [this, request](const Owned<ObjectApprovers>& approvers) -> Response {
-          auto stateSummary = [this, &approvers](JSON::ObjectWriter* writer) {
-            writer->field("hostname", master->info().hostname());
-
-            if (master->flags.cluster.isSome()) {
-              writer->field("cluster", master->flags.cluster.get());
-            }
-
-            // We use the tasks in the 'Frameworks' struct to compute summaries
-            // for this endpoint. This is done 1) for consistency between the
-            // 'slaves' and 'frameworks' subsections below 2) because we want to
-            // provide summary information for frameworks that are currently
-            // registered 3) the frameworks keep a circular buffer of completed
-            // tasks that we can use to keep a limited view on the history of
-            // recent completed / failed tasks.
-
-            // Generate mappings from 'slave' to 'framework' and reverse.
-            SlaveFrameworkMapping slaveFrameworkMapping(
-                master->frameworks.registered);
-
-            // Generate 'TaskState' summaries for all framework and slave ids.
-            TaskStateSummaries taskStateSummaries(
-                master->frameworks.registered);
-
-            // Model all of the slaves.
-            writer->field(
-                "slaves",
-                [this,
-                 &slaveFrameworkMapping,
-                 &taskStateSummaries,
-                 &approvers](JSON::ArrayWriter* writer) {
-                  foreachvalue (Slave* slave, master->slaves.registered) {
-                    writer->element(
-                        [&slave,
-                         &slaveFrameworkMapping,
-                         &taskStateSummaries,
-                         &approvers](JSON::ObjectWriter* writer) {
-                          SlaveWriter slaveWriter(*slave, approvers);
-                          slaveWriter(writer);
-
-                          // Add the 'TaskState' summary for this slave.
-                          const TaskStateSummary& summary =
-                              taskStateSummaries.slave(slave->id);
-
-                          // Certain per-agent status totals will always be zero
-                          // (e.g., TASK_ERROR, TASK_UNREACHABLE). We report
-                          // them here anyway, for completeness.
-                          //
-                          // TODO(neilc): Update for TASK_GONE and
-                          // TASK_GONE_BY_OPERATOR.
-                          writer->field("TASK_STAGING", summary.staging);
-                          writer->field("TASK_STARTING", summary.starting);
-                          writer->field("TASK_RUNNING", summary.running);
-                          writer->field("TASK_KILLING", summary.killing);
-                          writer->field("TASK_FINISHED", summary.finished);
-                          writer->field("TASK_KILLED", summary.killed);
-                          writer->field("TASK_FAILED", summary.failed);
-                          writer->field("TASK_LOST", summary.lost);
-                          writer->field("TASK_ERROR", summary.error);
-                          writer->field(
-                              "TASK_UNREACHABLE",
-                              summary.unreachable);
-
-                          // Add the ids of all the frameworks running on this
-                          // slave.
-                          const hashset<FrameworkID>& frameworks =
-                              slaveFrameworkMapping.frameworks(slave->id);
-
-                          writer->field(
-                              "framework_ids",
-                              [&frameworks](JSON::ArrayWriter* writer) {
-                                foreach (
-                                    const FrameworkID& frameworkId,
-                                    frameworks) {
-                                  writer->element(frameworkId.value());
-                                }
-                              });
-                        });
-                  }
-                });
-
-            // Model all of the frameworks.
-            writer->field(
-                "frameworks",
-                [this,
-                 &slaveFrameworkMapping,
-                 &taskStateSummaries,
-                 &approvers](JSON::ArrayWriter* writer) {
-                  foreachpair (const FrameworkID& frameworkId,
-                               Framework* framework,
-                               master->frameworks.registered) {
-                    // Skip unauthorized frameworks.
-                    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
-                      continue;
-                    }
-
-                    writer->element(
-                        [&frameworkId,
-                         &framework,
-                         &slaveFrameworkMapping,
-                         &taskStateSummaries](JSON::ObjectWriter* writer) {
-                          json(writer, Summary<Framework>(*framework));
-
-                          // Add the 'TaskState' summary for this framework.
-                          const TaskStateSummary& summary =
-                              taskStateSummaries.framework(frameworkId);
-
-                          // TODO(neilc): Update for TASK_GONE and
-                          // TASK_GONE_BY_OPERATOR.
-                          writer->field("TASK_STAGING", summary.staging);
-                          writer->field("TASK_STARTING", summary.starting);
-                          writer->field("TASK_RUNNING", summary.running);
-                          writer->field("TASK_KILLING", summary.killing);
-                          writer->field("TASK_FINISHED", summary.finished);
-                          writer->field("TASK_KILLED", summary.killed);
-                          writer->field("TASK_FAILED", summary.failed);
-                          writer->field("TASK_LOST", summary.lost);
-                          writer->field("TASK_ERROR", summary.error);
-                          writer->field(
-                              "TASK_UNREACHABLE",
-                              summary.unreachable);
-
-                          // Add the ids of all the slaves running
-                          // this framework.
-                          const hashset<SlaveID>& slaves =
-                              slaveFrameworkMapping.slaves(frameworkId);
-
-                          writer->field(
-                              "slave_ids",
-                              [&slaves](JSON::ArrayWriter* writer) {
-                                foreach (const SlaveID& slaveId, slaves) {
-                                  writer->element(slaveId.value());
-                                }
-                              });
-                        });
-                  }
-                });
-          };
-
-          return OK(jsonify(stateSummary), request.url.query.get("jsonp"));
+        [this, request, principal](const Owned<ObjectApprovers>& approvers) {
+          return deferBatchedRequest(
+              &Master::ReadOnlyHandler::stateSummary,
+              principal,
+              request.url.query,
+              approvers);
         }));
-}
-
-
-// Returns a JSON object modeled after a role.
-JSON::Object model(
-    const string& name,
-    Option<double> weight,
-    Option<Quota> quota,
-    Option<Role*> _role)
-{
-  JSON::Object object;
-  object.values["name"] = name;
-
-  if (weight.isSome()) {
-    object.values["weight"] = weight.get();
-  } else {
-    object.values["weight"] = 1.0; // Default weight.
-  }
-
-  if (quota.isSome()) {
-    object.values["quota"] = model(quota->info);
-  }
-
-  if (_role.isNone()) {
-    object.values["resources"] = model(Resources());
-    object.values["frameworks"] = JSON::Array();
-  } else {
-    Role* role = _role.get();
-
-    object.values["resources"] = model(role->allocatedResources());
-
-    {
-      JSON::Array array;
-
-      foreachkey (const FrameworkID& frameworkId, role->frameworks) {
-        array.values.push_back(frameworkId.value());
-      }
-
-      object.values["frameworks"] = std::move(array);
-    }
-  }
-
-  return object;
 }
 
 
@@ -3317,54 +3621,6 @@ string Master::Http::ROLES_HELP()
 }
 
 
-Future<vector<string>> Master::Http::_roles(
-    const Option<Principal>& principal) const
-{
-  return ObjectApprovers::create(master->authorizer, principal, {VIEW_ROLE})
-    .then(defer(master->self(),
-        [this](const Owned<ObjectApprovers>& approvers)
-          -> vector<string> {
-      JSON::Object object;
-
-      // Compute the role names to return results for. When an explicit
-      // role whitelist has been configured, we use that list of names.
-      // When using implicit roles, the right behavior is a bit more
-      // subtle. There are no constraints on possible role names, so we
-      // instead list all the "interesting" roles: all roles with one or
-      // more registered frameworks, and all roles with a non-default
-      // weight or quota.
-      //
-      // NOTE: we use a `std::set` to store the role names to ensure a
-      // deterministic output order.
-      set<string> roleList;
-      if (master->roleWhitelist.isSome()) {
-        const hashset<string>& whitelist = master->roleWhitelist.get();
-        roleList.insert(whitelist.begin(), whitelist.end());
-      } else {
-        hashset<string> roles = master->roles.keys();
-        roleList.insert(roles.begin(), roles.end());
-
-        hashset<string> weights = master->weights.keys();
-        roleList.insert(weights.begin(), weights.end());
-
-        hashset<string> quotas = master->quotas.keys();
-        roleList.insert(quotas.begin(), quotas.end());
-      }
-
-      vector<string> filteredRoleList;
-      filteredRoleList.reserve(roleList.size());
-
-      foreach (const string& role, roleList) {
-        if (approvers->approved<VIEW_ROLE>(role)) {
-          filteredRoleList.push_back(role);
-        }
-      }
-
-      return filteredRoleList;
-    }));
-}
-
-
 Future<Response> Master::Http::roles(
     const Request& request,
     const Option<Principal>& principal) const
@@ -3383,39 +3639,15 @@ Future<Response> Master::Http::roles(
     return redirect(request);
   }
 
-  return _roles(principal)
+  return ObjectApprovers::create(master->authorizer, principal, {VIEW_ROLE})
     .then(defer(master->self(),
-        [this, request](const vector<string>& filteredRoles)
-          -> Response {
-      JSON::Object object;
-
-      {
-        JSON::Array array;
-
-        foreach (const string& name, filteredRoles) {
-          Option<double> weight = None();
-          if (master->weights.contains(name)) {
-            weight = master->weights[name];
-          }
-
-          Option<Quota> quota = None();
-          if (master->quotas.contains(name)) {
-            quota = master->quotas.at(name);
-          }
-
-          Option<Role*> role = None();
-          if (master->roles.contains(name)) {
-            role = master->roles.at(name);
-          }
-
-          array.values.push_back(model(name, weight, quota, role));
-        }
-
-        object.values["roles"] = std::move(array);
-      }
-
-      return OK(object, request.url.query.get("jsonp"));
-    }));
+        [this, request, principal](const Owned<ObjectApprovers>& approvers) {
+            return deferBatchedRequest(
+                &Master::ReadOnlyHandler::roles,
+                principal,
+                request.url.query,
+                approvers);
+          }));
 }
 
 
@@ -3477,39 +3709,56 @@ Future<Response> Master::Http::getRoles(
     ContentType contentType) const
 {
   CHECK_EQ(mesos::master::Call::GET_ROLES, call.type());
-
-  return _roles(principal)
+  return ObjectApprovers::create(master->authorizer, principal, {VIEW_ROLE})
     .then(defer(master->self(),
-        [this, contentType](const vector<string>& filteredRoles)
+        [this, contentType](const Owned<ObjectApprovers>& approvers)
           -> Response {
+      const vector<string> knownRoles = master->knownRoles();
+
       mesos::master::Response response;
       response.set_type(mesos::master::Response::GET_ROLES);
 
       mesos::master::Response::GetRoles* getRoles =
         response.mutable_get_roles();
 
-      foreach (const string& name, filteredRoles) {
-        mesos::Role role;
-
-        if (master->weights.contains(name)) {
-          role.set_weight(master->weights[name]);
-        } else {
-          role.set_weight(1.0);
+      foreach (const string& name, knownRoles) {
+        if (!approvers->approved<VIEW_ROLE>(name)) {
+          continue;
         }
 
-        if (master->roles.contains(name)) {
-          Role* role_ = master->roles.at(name);
+        mesos::Role* role = getRoles->add_roles();
 
-          role.mutable_resources()->CopyFrom(role_->allocatedResources());
+        role->set_name(name);
 
-          foreachkey (const FrameworkID& frameworkId, role_->frameworks) {
-            role.add_frameworks()->CopyFrom(frameworkId);
+        role->set_weight(master->weights.get(name).getOrElse(DEFAULT_WEIGHT));
+
+        RoleResourceBreakdown resourceBreakdown(master, name);
+
+        ResourceQuantities allocatedAndOffered =
+          resourceBreakdown.allocated() + resourceBreakdown.offered();
+
+        // `resources` will be deprecated in favor of
+        // `offered`, `allocated`, `reserved`, and quota consumption.
+        // As a result, we don't bother trying to expose more
+        // than {cpus, mem, disk, gpus} since we don't know if
+        // anything outside this set is of type SCALAR.
+        foreach (const auto& quantity, allocatedAndOffered) {
+          if (quantity.first == "cpus" || quantity.first == "mem" ||
+              quantity.first == "disk" || quantity.first == "gpus") {
+            Resource* resource = role->add_resources();
+            resource->set_name(quantity.first);
+            resource->set_type(Value::SCALAR);
+            *resource->mutable_scalar() = quantity.second;
           }
         }
 
-        role.set_name(name);
+        Option<Role*> role_ = master->roles.get(name);
 
-        getRoles->add_roles()->CopyFrom(role);
+        if (role_.isSome()) {
+          foreachkey (const FrameworkID& frameworkId, (*role_)->frameworks) {
+            *role->add_frameworks() = frameworkId;
+          }
+        }
       }
 
       return OK(serialize(contentType, evolve(response)),
@@ -3663,74 +3912,63 @@ Future<Response> Master::Http::getOperations(
 {
   CHECK_EQ(mesos::master::Call::GET_OPERATIONS, call.type());
 
-  // TODO(nfnt): Authorize this call (MESOS-8473).
+  return ObjectApprovers::create(master->authorizer, principal, {VIEW_ROLE})
+    .then(defer(
+        master->self(),
+        [=](const Owned<ObjectApprovers>& approvers) -> Response {
+          // We consider a principal to be authorized to view an operation if it
+          // is authorized to view the resources the operation is performed on.
+          auto approved = [&approvers](const Operation& operation) {
+            Try<Resources> consumedResources =
+              protobuf::getConsumedResources(operation.info());
 
-  mesos::master::Response response;
-  response.set_type(mesos::master::Response::GET_OPERATIONS);
+            if (consumedResources.isError()) {
+              LOG(WARNING)
+                << "Could not approve operation " << operation.uuid()
+                << " since its consumed resources could not be determined:"
+                << consumedResources.error();
 
-  mesos::master::Response::GetOperations* operations =
-    response.mutable_get_operations();
+              return false;
+            }
 
-  foreachvalue (const Slave* slave, master->slaves.registered) {
-    foreachvalue (Operation* operation, slave->operations) {
-      operations->add_operations()->CopyFrom(*operation);
-    }
+            foreach (const Resource& resource, consumedResources.get()) {
+              if (!approvers->approved<VIEW_ROLE>(resource)) {
+                return false;
+              }
+            }
 
-    foreachvalue (
-        const Slave::ResourceProvider resourceProvider,
-        slave->resourceProviders) {
-      foreachvalue (Operation* operation, resourceProvider.operations) {
-        operations->add_operations()->CopyFrom(*operation);
-      }
-    }
-  }
+            return true;
+          };
 
-  return OK(serialize(contentType, evolve(response)), stringify(contentType));
+          mesos::master::Response response;
+          response.set_type(mesos::master::Response::GET_OPERATIONS);
+
+          mesos::master::Response::GetOperations* operations =
+            response.mutable_get_operations();
+
+          foreachvalue (const Slave* slave, master->slaves.registered) {
+            foreachvalue (Operation* operation, slave->operations) {
+              if (approved(*operation)) {
+                operations->add_operations()->CopyFrom(*operation);
+              }
+            }
+
+            foreachvalue (
+                const Slave::ResourceProvider resourceProvider,
+                slave->resourceProviders) {
+              foreachvalue (Operation* operation, resourceProvider.operations) {
+                if (approved(*operation)) {
+                  operations->add_operations()->CopyFrom(*operation);
+                }
+              }
+            }
+          }
+
+          return OK(
+              serialize(contentType, evolve(response)),
+              stringify(contentType));
+        }));
 }
-
-
-struct TaskComparator
-{
-  static bool ascending(const Task* lhs, const Task* rhs)
-  {
-    size_t lhsSize = lhs->statuses().size();
-    size_t rhsSize = rhs->statuses().size();
-
-    if ((lhsSize == 0) && (rhsSize == 0)) {
-      return false;
-    }
-
-    if (lhsSize == 0) {
-      return true;
-    }
-
-    if (rhsSize == 0) {
-      return false;
-    }
-
-    return (lhs->statuses(0).timestamp() < rhs->statuses(0).timestamp());
-  }
-
-  static bool descending(const Task* lhs, const Task* rhs)
-  {
-    size_t lhsSize = lhs->statuses().size();
-    size_t rhsSize = rhs->statuses().size();
-
-    if ((lhsSize == 0) && (rhsSize == 0)) {
-      return false;
-    }
-
-    if (rhsSize == 0) {
-      return true;
-    }
-
-    if (lhsSize == 0) {
-      return false;
-    }
-
-    return (lhs->statuses(0).timestamp() > rhs->statuses(0).timestamp());
-  }
-};
 
 
 string Master::Http::TASKS_HELP()
@@ -3790,116 +4028,19 @@ Future<Response> Master::Http::tasks(
     return redirect(request);
   }
 
-  // Get list options (limit and offset).
-  Result<int> result = numify<int>(request.url.query.get("limit"));
-  size_t limit = result.isSome() ? result.get() : TASK_LIMIT;
-
-  result = numify<int>(request.url.query.get("offset"));
-  size_t offset = result.isSome() ? result.get() : 0;
-
-  Option<string> order = request.url.query.get("order");
-  string _order = order.isSome() && (order.get() == "asc") ? "asc" : "des";
-
-  Option<string> frameworkId = request.url.query.get("framework_id");
-  Option<string> taskId = request.url.query.get("task_id");
-
   return ObjectApprovers::create(
       master->authorizer,
       principal,
       {VIEW_FRAMEWORK, VIEW_TASK})
     .then(defer(
         master->self(),
-        [=](const Owned<ObjectApprovers>& approvers) -> Response {
-          IDAcceptor<FrameworkID> selectFrameworkId(frameworkId);
-          IDAcceptor<TaskID> selectTaskId(taskId);
-
-          // Construct framework list with both active and completed frameworks.
-          vector<const Framework*> frameworks;
-          foreachvalue (Framework* framework, master->frameworks.registered) {
-            // Skip unauthorized frameworks or frameworks without matching
-            // framework ID.
-            if (!selectFrameworkId.accept(framework->id()) ||
-                !approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
-              continue;
-            }
-
-            frameworks.push_back(framework);
-          }
-
-          foreachvalue (const Owned<Framework>& framework,
-                        master->frameworks.completed) {
-            // Skip unauthorized frameworks or frameworks without matching
-            // framework ID.
-            if (!selectFrameworkId.accept(framework->id()) ||
-                !approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
-             continue;
-            }
-
-            frameworks.push_back(framework.get());
-          }
-
-          // Construct task list with both running,
-          // completed and unreachable tasks.
-          vector<const Task*> tasks;
-          foreach (const Framework* framework, frameworks) {
-            foreachvalue (Task* task, framework->tasks) {
-              CHECK_NOTNULL(task);
-              // Skip unauthorized tasks or tasks without matching task ID.
-              if (!selectTaskId.accept(task->task_id()) ||
-                  !approvers->approved<VIEW_TASK>(*task, framework->info)) {
-                continue;
-              }
-
-              tasks.push_back(task);
-            }
-
-            foreachvalue (
-                const Owned<Task>& task,
-                framework->unreachableTasks) {
-              // Skip unauthorized tasks or tasks without matching task ID.
-              if (!selectTaskId.accept(task->task_id()) ||
-                  !approvers->approved<VIEW_TASK>(*task, framework->info)) {
-                continue;
-              }
-
-              tasks.push_back(task.get());
-            }
-
-            foreach (const Owned<Task>& task, framework->completedTasks) {
-              // Skip unauthorized tasks or tasks without matching task ID.
-              if (!selectTaskId.accept(task->task_id()) ||
-                  !approvers->approved<VIEW_TASK>(*task, framework->info)) {
-                continue;
-              }
-
-              tasks.push_back(task.get());
-            }
-          }
-
-          // Sort tasks by task status timestamp. Default order is descending.
-          // The earliest timestamp is chosen for comparison when
-          // multiple are present.
-          if (_order == "asc") {
-            sort(tasks.begin(), tasks.end(), TaskComparator::ascending);
-          } else {
-            sort(tasks.begin(), tasks.end(), TaskComparator::descending);
-          }
-
-          auto tasksWriter =
-            [&tasks, limit, offset](JSON::ObjectWriter* writer) {
-              writer->field(
-                  "tasks",
-                  [&tasks, limit, offset](JSON::ArrayWriter* writer) {
-                    // Collect 'limit' number of tasks starting from 'offset'.
-                    size_t end = std::min(offset + limit, tasks.size());
-                    for (size_t i = offset; i < end; i++) {
-                      writer->element(*tasks[i]);
-                    }
-                  });
-          };
-
-          return OK(jsonify(tasksWriter), request.url.query.get("jsonp"));
-  }));
+        [this, request, principal](const Owned<ObjectApprovers>& approvers) {
+          return deferBatchedRequest(
+              &Master::ReadOnlyHandler::tasks,
+              principal,
+              request.url.query,
+              approvers);
+        }));
 }
 
 
@@ -3917,14 +4058,288 @@ Future<Response> Master::Http::getTasks(
     .then(defer(
         master->self(),
         [=](const Owned<ObjectApprovers>& approvers) -> Response {
-          mesos::master::Response response;
-          response.set_type(mesos::master::Response::GET_TASKS);
+          // Serialize the following message:
+          //
+          //    mesos::master::Response response;
+          //    response.set_type(mesos::master::Response::GET_TASKS);
+          //    *response.mutable_get_tasks() = _getTasks(approvers);
 
-          *response.mutable_get_tasks() = _getTasks(approvers);
+          switch (contentType) {
+            case ContentType::PROTOBUF: {
+              string output;
+              google::protobuf::io::StringOutputStream stream(&output);
+              google::protobuf::io::CodedOutputStream writer(&stream);
 
-          return OK(
-              serialize(contentType, evolve(response)), stringify(contentType));
-  }));
+              WireFormatLite::WriteEnum(
+                  mesos::v1::master::Response::kTypeFieldNumber,
+                  mesos::v1::master::Response::GET_TASKS,
+                  &writer);
+
+              WireFormatLite::WriteBytes(
+                  mesos::v1::master::Response::kGetTasksFieldNumber,
+                  serializeGetTasks(approvers),
+                  &writer);
+
+              // We must manually trim the unused buffer space since
+              // we use the string before the coded output stream is
+              // destructed.
+              writer.Trim();
+
+              return OK(std::move(output), stringify(contentType));
+            }
+
+            case ContentType::JSON: {
+              string body = jsonify([&](JSON::ObjectWriter* writer) {
+                const google::protobuf::Descriptor* descriptor =
+                  v1::master::Response::descriptor();
+
+                int field;
+
+                field = v1::master::Response::kTypeFieldNumber;
+                writer->field(
+                    descriptor->FindFieldByNumber(field)->name(),
+                    v1::master::Response::Type_Name(
+                        v1::master::Response::GET_TASKS));
+
+                field = v1::master::Response::kGetTasksFieldNumber;
+                writer->field(
+                    descriptor->FindFieldByNumber(field)->name(),
+                    jsonifyGetTasks(master, approvers));
+              });
+
+              // TODO(bmahler): Pass jsonp query parameter through here.
+              return OK(std::move(body), stringify(contentType));
+            }
+
+            default:
+              return NotAcceptable("Request must accept json or protobuf");
+          }
+    }));
+}
+
+
+function<void(JSON::ObjectWriter*)> Master::Http::jsonifyGetTasks(
+    const Master* master,
+    const Owned<ObjectApprovers>& approvers)
+{
+  // Jsonify the following message:
+  //
+  //  master::Response::GetTasks getTasks;
+  //  for each pending task:
+  //    *getTasks.add_pending_tasks() =
+  //      protobuf::createTask(taskInfo, TASK_STAGING, framework->id());
+  //  for each task:
+  //    *getTasks.add_tasks() = *task;
+  //  for each unreachable task:
+  //    *getTasks.add_unreachable_tasks() = *task;
+  //  for each completed task:
+  //    *getTasks.add_completed_tasks() = *task;
+
+  // TODO(bmahler): This copies the Owned object approvers.
+  return [=](JSON::ObjectWriter* writer) {
+    // Construct framework list with both active and completed frameworks.
+    vector<const Framework*> frameworks;
+    foreachvalue (Framework* framework, master->frameworks.registered) {
+      // Skip unauthorized frameworks.
+      if (approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+        frameworks.push_back(framework);
+      }
+    }
+    foreachvalue (const Owned<Framework>& framework,
+                  master->frameworks.completed) {
+      // Skip unauthorized frameworks.
+      if (approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+        frameworks.push_back(framework.get());
+      }
+    }
+
+    const google::protobuf::Descriptor* descriptor =
+      v1::master::Response::GetTasks::descriptor();
+
+    int field;
+
+    // Pending tasks.
+    field = v1::master::Response::GetTasks::kPendingTasksFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        [&](JSON::ArrayWriter* writer) {
+          foreach (const Framework* framework, frameworks) {
+            foreachvalue (const TaskInfo& t, framework->pendingTasks) {
+              // Skip unauthorized tasks.
+              if (!approvers->approved<VIEW_TASK>(t, framework->info)) {
+                continue;
+              }
+
+              Task task =
+                  protobuf::createTask(t, TASK_STAGING, framework->id());
+
+              writer->element(asV1Protobuf(task));
+            }
+          }
+        });
+
+    // Active tasks.
+    field = v1::master::Response::GetTasks::kTasksFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        [&](JSON::ArrayWriter* writer) {
+          foreach (const Framework* framework, frameworks) {
+            foreachvalue (Task* task, framework->tasks) {
+              CHECK_NOTNULL(task);
+              // Skip unauthorized tasks.
+              if (!approvers->approved<VIEW_TASK>(*task, framework->info)) {
+                continue;
+              }
+
+              writer->element(asV1Protobuf(*task));
+            }
+          }
+        });
+
+    // Unreachable tasks.
+    field = v1::master::Response::GetTasks::kUnreachableTasksFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        [&](JSON::ArrayWriter* writer) {
+          foreach (const Framework* framework, frameworks) {
+            foreachvalue (const Owned<Task>& task,
+                          framework->unreachableTasks) {
+              // Skip unauthorized tasks.
+              if (!approvers->approved<VIEW_TASK>(*task, framework->info)) {
+                continue;
+              }
+
+              writer->element(asV1Protobuf(*task));
+            }
+          }
+        });
+
+    // Completed tasks.
+    field = v1::master::Response::GetTasks::kCompletedTasksFieldNumber;
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        [&](JSON::ArrayWriter* writer) {
+          foreach (const Framework* framework, frameworks) {
+            foreach (const Owned<Task>& task, framework->completedTasks) {
+              // Skip unauthorized tasks.
+              if (!approvers->approved<VIEW_TASK>(*task, framework->info)) {
+                continue;
+              }
+
+              writer->element(asV1Protobuf(*task));
+            }
+          }
+        });
+  };
+}
+
+
+string Master::Http::serializeGetTasks(
+    const Owned<ObjectApprovers>& approvers) const
+{
+  // Construct framework list with both active and completed frameworks.
+  vector<const Framework*> frameworks;
+  foreachvalue (Framework* framework, master->frameworks.registered) {
+    // Skip unauthorized frameworks.
+    if (approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+      frameworks.push_back(framework);
+    }
+  }
+  foreachvalue (const Owned<Framework>& framework,
+                master->frameworks.completed) {
+    // Skip unauthorized frameworks.
+    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+      frameworks.push_back(framework.get());
+    }
+  }
+
+  // Serialize the following message:
+  //
+  //  mesos::master::Response::GetTasks getTasks;
+  //  for each pending task:
+  //    *getTasks.add_pending_tasks() =
+  //      protobuf::createTask(taskInfo, TASK_STAGING, framework->id());
+  //  for each task:
+  //    *getTasks.add_tasks() = *task;
+  //  for each unreachable task:
+  //    *getTasks.add_unreachable_tasks() = *task;
+  //  for each completed task:
+  //    *getTasks.add_completed_tasks() = *task;
+
+  string output;
+  google::protobuf::io::StringOutputStream stream(&output);
+  google::protobuf::io::CodedOutputStream writer(&stream);
+
+  foreach (const Framework* framework, frameworks) {
+    // Pending tasks.
+    foreachvalue (const TaskInfo& taskInfo, framework->pendingTasks) {
+      // Skip unauthorized tasks.
+      if (!approvers->approved<VIEW_TASK>(taskInfo, framework->info)) {
+        continue;
+      }
+
+      // TODO(bmahler): Consider not constructing the temporary task
+      // object and instead serialize directly. Since we don't expect
+      // a large number of pending tasks, we currently don't bother
+      // with the more efficient approach.
+      //
+      // *getTasks.add_pending_tasks() =
+      //   protobuf::createTask(taskInfo, TASK_STAGING, framework->id());
+      WireFormatLite2::WriteMessageWithoutCachedSizes(
+          mesos::v1::master::Response::GetTasks::kPendingTasksFieldNumber,
+          protobuf::createTask(taskInfo, TASK_STAGING, framework->id()),
+          &writer);
+    }
+
+    // Active tasks.
+    foreachvalue (Task* task, framework->tasks) {
+      CHECK_NOTNULL(task);
+      // Skip unauthorized tasks.
+      if (!approvers->approved<VIEW_TASK>(*task, framework->info)) {
+        continue;
+      }
+
+      WireFormatLite2::WriteMessageWithoutCachedSizes(
+          mesos::v1::master::Response::GetTasks::kTasksFieldNumber,
+          *task,
+          &writer);
+    }
+
+    // Unreachable tasks.
+    foreachvalue (const Owned<Task>& task, framework->unreachableTasks) {
+      // Skip unauthorized tasks.
+      if (!approvers->approved<VIEW_TASK>(*task, framework->info)) {
+        continue;
+      }
+
+      WireFormatLite2::WriteMessageWithoutCachedSizes(
+          mesos::v1::master::Response::GetTasks::kUnreachableTasksFieldNumber,
+          *task,
+          &writer);
+    }
+
+    // Completed tasks.
+    foreach (const Owned<Task>& task, framework->completedTasks) {
+      // Skip unauthorized tasks.
+      if (!approvers->approved<VIEW_TASK>(*task, framework->info)) {
+        continue;
+      }
+
+      WireFormatLite2::WriteMessageWithoutCachedSizes(
+          mesos::v1::master::Response::GetTasks::kCompletedTasksFieldNumber,
+          *task,
+          &writer);
+    }
+  }
+
+  // While an explicit Trim() isn't necessary (since the coded
+  // output stream is destructed before the string is returned),
+  // it's a quite tricky bug to diagnose if Trim() is missed, so
+  // we always do it explicitly to signal the reader about this
+  // subtlety.
+  writer.Trim();
+
+  return output;
 }
 
 
@@ -4131,6 +4546,8 @@ Future<Response> Master::Http::_updateMaintenanceSchedule(
     return BadRequest(isValid.error());
   }
 
+  // TODO(alexr): Consider pulling this higher above before we even start
+  // parsing request body.
   return ObjectApprovers::create(
       master->authorizer,
       principal,
@@ -4156,6 +4573,14 @@ Future<Response> Master::Http::__updateMaintenanceSchedule(
 
   return master->registrar->apply(Owned<RegistryOperation>(
       new maintenance::UpdateSchedule(schedule)))
+    .onAny([](const Future<bool>& result) {
+      // TODO(fiu): Consider changing/refactoring the registrar itself
+      // so the individual call sites don't need to handle this separately.
+      // All registrar failures that cause it to abort should instead
+      // abort the process.
+      CHECK_READY(result)
+        << "Failed to update maintenance schedule in the registry";
+    })
     .then(defer(master->self(), [this, schedule](bool result) {
       return ___updateMaintenanceSchedule(schedule, result);
     }));
@@ -4170,11 +4595,12 @@ Future<Response> Master::Http::___updateMaintenanceSchedule(
   CHECK(applied);
 
   // Update the master's local state with the new schedule.
-  // NOTE: We only add or remove differences between the current schedule
-  // and the new schedule.  This is because the `MachineInfo` struct
-  // holds more information than a maintenance schedule.
-  // For example, the `mode` field is not part of a maintenance schedule.
-
+  //
+  // NOTE: We only add or remove differences between the current schedule and
+  // the new schedule.  This is because the `MachineInfo` struct holds more
+  // information than a maintenance schedule. For example, the `mode` field is
+  // not part of a maintenance schedule.
+  //
   // TODO(josephw): allow more than one schedule.
 
   // Put the machines in the updated schedule into a set.
@@ -4754,6 +5180,271 @@ Future<Response> Master::Http::getMaintenanceStatus(
 }
 
 
+Future<Response> Master::Http::_drainAgent(
+    const SlaveID& slaveId,
+    const Option<DurationInfo>& maxGracePeriod,
+    const bool markGone,
+    const Owned<ObjectApprovers>& approvers) const
+{
+  if (!approvers->approved<DRAIN_AGENT>()) {
+    return Forbidden();
+  }
+
+  if (markGone && !approvers->approved<MARK_AGENT_GONE>()) {
+    return Forbidden();
+  }
+
+  // Check that the agent is either recovering, registered, or unreachable.
+  if (!master->slaves.recovered.contains(slaveId) &&
+      !master->slaves.registered.contains(slaveId) &&
+      !master->slaves.unreachable.contains(slaveId)) {
+    return BadRequest("Unknown agent");
+  }
+
+  // If this agent is being marked gone, then no draining can be performed.
+  if (master->slaves.markingGone.contains(slaveId)) {
+    return Conflict("Agent is currently being marked gone");
+  }
+
+  // Save the draining info to the registry.
+  return master->registrar->apply(Owned<RegistryOperation>(
+      new DrainAgent(slaveId, maxGracePeriod, markGone)))
+    .onAny([](const Future<bool>& result) {
+      CHECK_READY(result)
+        << "Failed to update draining info in the registry";
+    })
+    .then(defer(
+        master->self(),
+        [this, slaveId, maxGracePeriod, markGone](bool result) -> Response {
+          // Update the in-memory state.
+          DrainConfig drainConfig;
+          drainConfig.set_mark_gone(markGone);
+
+          if (maxGracePeriod.isSome()) {
+            drainConfig.mutable_max_grace_period()
+              ->CopyFrom(maxGracePeriod.get());
+          }
+
+          DrainInfo drainInfo;
+          drainInfo.set_state(DRAINING);
+          drainInfo.mutable_config()->CopyFrom(drainConfig);
+
+          master->slaves.draining[slaveId] = drainInfo;
+
+          // Deactivate the agent.
+          master->slaves.deactivated.insert(slaveId);
+
+          Slave* slave = master->slaves.registered.get(slaveId);
+          if (slave != nullptr) {
+            master->deactivate(slave);
+
+            // Tell the agent to start draining.
+            DrainSlaveMessage message;
+            message.mutable_config()->CopyFrom(drainConfig);
+            master->send(slave->pid, message);
+
+            slave->estimatedDrainStartTime = Clock::now();
+
+            // Check if the agent is already drained and transition it
+            // appropriately if so.
+            master->checkAndTransitionDrainingAgent(slave);
+          }
+
+          return OK();
+        }));
+}
+
+
+Future<Response> Master::Http::drainAgent(
+    const mesos::master::Call& call,
+    const Option<Principal>& principal,
+    ContentType /*contentType*/) const
+{
+  CHECK_EQ(mesos::master::Call::DRAIN_AGENT, call.type());
+  CHECK(call.has_drain_agent());
+
+  SlaveID slaveId = call.drain_agent().slave_id();
+  Slave* slave = master->slaves.registered.get(slaveId);
+
+  if (slave != nullptr) {
+    // Check that the targeted agent is not part of a maintenance schedule.
+    // NOTE: This is a best-effort check, because it is possible to drain
+    // an agent, and then change the agent's hostname/IP into a MachineID
+    // in a maintenance schedule. Also, the MachineID of unreachable agents
+    // is unknown until they reregister.
+    //
+    // TODO(josephw): Reconsider this check once the maintenance and agent
+    // draining features are integrated.
+    //
+    // TODO(josephw): Check this condition against unreachable agents
+    // once MESOS-9884 is resolved.
+    if (!master->maintenance.schedules.empty()) {
+      foreach (
+          const mesos::maintenance::Window& window,
+          master->maintenance.schedules.front().windows()) {
+        foreach (const MachineID& machineId, window.machine_ids()) {
+          if (machineId == slave->machineId) {
+            return BadRequest(
+                "Agent " + stringify(slaveId) + " is part of a maintenance"
+                " schedule under Machine " + stringify(machineId));
+          }
+        }
+      }
+    }
+
+    // Check that the targeted agent is capable of `AGENT_DRAINING`.
+    // NOTE: This is a best-effort check, because it is possible to drain
+    // an agent, and then downgrade the agent to a version that does not
+    // support draining. Also, the capabilities of unreachable agents
+    // are unknown until they reregister.
+    //
+    // TODO(josephw): Check this condition against unreachable agents
+    // once MESOS-9884 is resolved.
+    if (!slave->capabilities.agentDraining) {
+      return BadRequest(
+          "Agent " + stringify(slaveId) + " is not capable of draining");
+    }
+  }
+
+  Option<DurationInfo> maxGracePeriod;
+  if (call.drain_agent().has_max_grace_period()) {
+    maxGracePeriod = call.drain_agent().max_grace_period();
+  }
+
+  bool markGone = call.drain_agent().mark_gone();
+
+  return ObjectApprovers::create(
+      master->authorizer,
+      principal,
+      {DRAIN_AGENT, MARK_AGENT_GONE})
+    .then(defer(
+      master->self(),
+      [this, slaveId, maxGracePeriod, markGone](
+          const Owned<ObjectApprovers>& approvers) {
+        return _drainAgent(slaveId, maxGracePeriod, markGone, approvers);
+      }));
+}
+
+
+Future<Response> Master::Http::_deactivateAgent(
+    const SlaveID& slaveId,
+    const Owned<ObjectApprovers>& approvers) const
+{
+  if (!approvers->approved<DEACTIVATE_AGENT>()) {
+    return Forbidden();
+  }
+
+  // Check that the agent is either recovering, registered, or unreachable.
+  if (!master->slaves.recovered.contains(slaveId) &&
+      !master->slaves.registered.contains(slaveId) &&
+      !master->slaves.unreachable.contains(slaveId)) {
+    return BadRequest("Unknown agent");
+  }
+
+  // Save the deactivation to the registry.
+  return master->registrar->apply(Owned<RegistryOperation>(
+      new DeactivateAgent(slaveId)))
+    .onAny([](const Future<bool>& result) {
+      CHECK_READY(result)
+        << "Failed to deactivate agent in the registry";
+    })
+    .then(defer(master->self(), [this, slaveId](bool result) -> Response {
+      // Deactivate the agent.
+      master->slaves.deactivated.insert(slaveId);
+
+      Slave* slave = master->slaves.registered.get(slaveId);
+      if (slave != nullptr) {
+        master->deactivate(slave);
+      }
+
+      return OK();
+    }));
+}
+
+
+Future<Response> Master::Http::deactivateAgent(
+    const mesos::master::Call& call,
+    const Option<Principal>& principal,
+    ContentType /*contentType*/) const
+{
+  CHECK_EQ(mesos::master::Call::DEACTIVATE_AGENT, call.type());
+  CHECK(call.has_deactivate_agent());
+
+  SlaveID slaveId = call.deactivate_agent().slave_id();
+
+  return ObjectApprovers::create(
+      master->authorizer,
+      principal,
+      {DEACTIVATE_AGENT})
+    .then(defer(
+      master->self(),
+      [this, slaveId](
+          const Owned<ObjectApprovers>& approvers) {
+        return _deactivateAgent(slaveId, approvers);
+      }));
+}
+
+
+Future<Response> Master::Http::_reactivateAgent(
+    const SlaveID& slaveId,
+    const Owned<ObjectApprovers>& approvers) const
+{
+  if (!approvers->approved<REACTIVATE_AGENT>()) {
+    return Forbidden();
+  }
+
+  // Check that the agent is deactivated.
+  if (!master->slaves.deactivated.contains(slaveId)) {
+    return BadRequest("Agent is not deactivated");
+  }
+
+  // Save the reactivation to the registry.
+  return master->registrar->apply(Owned<RegistryOperation>(
+      new ReactivateAgent(slaveId)))
+    .onAny([](const Future<bool>& result) {
+      CHECK_READY(result)
+        << "Failed to reactivate agent in the registry";
+    })
+    .then(defer(master->self(), [this, slaveId](bool result) -> Response {
+      // Reactivate the agent.
+      master->slaves.draining.erase(slaveId);
+      master->slaves.deactivated.erase(slaveId);
+
+      Slave* slave = master->slaves.registered.get(slaveId);
+      if (slave != nullptr) {
+        master->reactivate(slave);
+      }
+
+      slave->estimatedDrainStartTime = None();
+
+      return OK();
+    }));
+}
+
+
+Future<Response> Master::Http::reactivateAgent(
+    const mesos::master::Call& call,
+    const Option<Principal>& principal,
+    ContentType /*contentType*/) const
+{
+  CHECK_EQ(mesos::master::Call::REACTIVATE_AGENT, call.type());
+  CHECK(call.has_reactivate_agent());
+
+  SlaveID slaveId = call.reactivate_agent().slave_id();
+
+  return ObjectApprovers::create(
+      master->authorizer,
+      principal,
+      {REACTIVATE_AGENT})
+    .then(defer(
+      master->self(),
+      [this, slaveId](
+          const Owned<ObjectApprovers>& approvers) {
+        return _reactivateAgent(slaveId, approvers);
+      }));
+}
+
+
 string Master::Http::UNRESERVE_HELP()
 {
   return HELP(
@@ -4889,16 +5580,23 @@ Future<Response> Master::Http::_unreserve(
         return Forbidden();
       }
 
-      return _operation(slaveId, operation.unreserve().resources(), operation);
+      return _operation(slaveId, operation);
     }));
 }
 
 
 Future<Response> Master::Http::_operation(
     const SlaveID& slaveId,
-    Resources required,
     const Offer::Operation& operation) const
 {
+  Try<Resources> required = protobuf::getConsumedResources(operation);
+
+  if (required.isError()) {
+    return BadRequest(
+        "Invalid " + stringify(operation.type()) + " operation: " +
+        required.error());
+  }
+
   Slave* slave = master->slaves.registered.get(slaveId);
   if (slave == nullptr) {
     return BadRequest("No agent found with specified ID");
@@ -4919,12 +5617,12 @@ Future<Response> Master::Http::_operation(
     Resources recovered = offer->resources();
     recovered.unallocate();
 
-    if (required == required - recovered) {
+    if (required.get() == required.get() - recovered) {
       continue;
     }
 
     totalRecovered += recovered;
-    required -= recovered;
+    required.get() -= recovered;
 
     // We explicitly pass 'Filters()' which has a default 'refuse_seconds'
     // of 5 seconds rather than 'None()' here, so that we can virtually
@@ -4933,13 +5631,7 @@ Future<Response> Master::Http::_operation(
     // NOTE: However it's entirely possible that these resources are
     // offered to other frameworks in the next 'allocate' and the filter
     // cannot prevent it.
-    master->allocator->recoverResources(
-        offer->framework_id(),
-        offer->slave_id(),
-        offer->resources(),
-        Filters());
-
-    master->removeOffer(offer, true); // Rescind!
+    master->rescindOffer(offer, Filters());
 
     // If we've rescinded enough offers to cover 'operation', we're done.
     Try<Resources> updatedRecovered = totalRecovered.apply(operation);
@@ -5073,15 +5765,7 @@ Future<Response> Master::Http::_markAgentGone(const SlaveID& slaveId) const
                  << registrarResult.failure();
     }
 
-    Slave* slave = master->slaves.registered.get(slaveId);
-
-    // This can happen if the agent that is being marked as
-    // gone is not currently registered (unreachable/recovered).
-    if (slave == nullptr) {
-      return;
-    }
-
-    master->markGone(slave, goneTime);
+    master->markGone(slaveId, goneTime);
   }));
 
   return gone.then([]() -> Future<Response> {

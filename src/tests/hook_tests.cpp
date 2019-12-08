@@ -77,7 +77,6 @@ using process::Owned;
 using process::PID;
 using process::Shared;
 
-using std::list;
 using std::string;
 using std::vector;
 
@@ -117,7 +116,7 @@ protected:
     EXPECT_SOME(HookManager::initialize(HOOK_MODULE_NAME));
   }
 
-  ~HookTest()
+  ~HookTest() override
   {
     // Unload the hooks so a subsequent install may succeed.
     EXPECT_SOME(HookManager::unload(HOOK_MODULE_NAME));
@@ -149,7 +148,9 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HookTest, HookLoading)
 
 // Test that the label decorator hook hangs a new label off the
 // taskinfo message during master launch task.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(HookTest, VerifyMasterLaunchTaskHook)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(
+    HookTest,
+    VerifyMasterLaunchTaskLabelDecoratorHook)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -223,6 +224,82 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HookTest, VerifyMasterLaunchTaskHook)
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// Test that the resource decorator hook implicitly injects a custom resource
+// in taskinfo message during master launch task.
+//
+// Concretely, the agent declares 100Mbps of network bandwidth and the
+// framework does not consume any. Consequently the hook will set 10Mbps as a
+// default value for the task.
+TEST_F_TEMP_DISABLED_ON_WINDOWS(
+    HookTest,
+    VerifyMasterLaunchTaskResourceDecoratorHook)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.resources.get() += ";network_bandwidth:100";
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  // Extract all resources from the offer except network bandwidth.
+  Resources resourcesWithoutNetworkBandwidth = Resources(
+    offers.get()[0].resources()).filter(
+      [](const Resource& r) {
+        return r.name() != "network_bandwidth";
+      });
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->CopyFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->CopyFrom(resourcesWithoutNetworkBandwidth);
+  task.mutable_executor()->CopyFrom(DEFAULT_EXECUTOR_INFO);
+
+  Future<RunTaskMessage> runTaskMessage =
+    FUTURE_PROTOBUF(RunTaskMessage(), _, _);
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status))
+    .WillRepeatedly(Return());
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(runTaskMessage);
+
+  AWAIT_READY(status);
+
+  const Resources& taskResources = runTaskMessage->task().resources();
+  Option<Value::Scalar> value = taskResources
+    .get<Value::Scalar>("network_bandwidth");
+
+  ASSERT_SOME(value);
+  EXPECT_EQ(10, value->value());
 
   driver.stop();
   driver.join();
@@ -735,7 +812,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   AWAIT_READY(termination);
   EXPECT_SOME(termination.get());
 
-  Future<list<Docker::Container>> containers =
+  Future<vector<Docker::Container>> containers =
     docker->ps(true, slave::DOCKER_NAME_PREFIX);
 
   AWAIT_READY(containers);
@@ -956,7 +1033,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   AWAIT_READY(termination);
   EXPECT_SOME(termination.get());
 
-  Future<list<Docker::Container>> containers =
+  Future<vector<Docker::Container>> containers =
     docker->ps(true, slave::DOCKER_NAME_PREFIX);
 
   AWAIT_READY(containers);
@@ -1069,7 +1146,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HookTest, ROOT_DOCKER_VerifySlavePostFetchHook)
   driver.stop();
   driver.join();
 
-  Future<list<Docker::Container>> containers =
+  Future<vector<Docker::Container>> containers =
     docker->ps(true, slave::DOCKER_NAME_PREFIX);
 
   AWAIT_READY(containers);

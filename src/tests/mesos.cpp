@@ -35,6 +35,7 @@
 
 #ifdef __linux__
 #include "linux/cgroups.hpp"
+#include "linux/fs.hpp"
 #endif
 
 #ifdef ENABLE_PORT_MAPPING_ISOLATOR
@@ -56,6 +57,7 @@ using mesos::master::detector::MasterDetector;
 using std::list;
 using std::shared_ptr;
 using std::string;
+using std::vector;
 
 using testing::_;
 
@@ -161,26 +163,31 @@ slave::Flags MesosTest::CreateSlaveFlags()
   slave::Flags flags;
 
   // Create a temporary work directory (removed by Environment).
-  Try<string> directory = environment->mkdtemp();
-  CHECK_SOME(directory) << "Failed to create temporary directory";
-  flags.work_dir = directory.get();
+  Try<string> workDir = environment->mkdtemp();
+  CHECK_SOME(workDir) << "Failed to create temporary directory";
+  flags.work_dir = workDir.get();
 
   // Create a temporary runtime directory (removed by Environment).
-  directory = environment->mkdtemp();
-  CHECK_SOME(directory) << "Failed to create temporary directory";
-  flags.runtime_dir = directory.get();
+  Try<string> runtimeDir = environment->mkdtemp();
+  CHECK_SOME(runtimeDir) << "Failed to create temporary directory";
+  flags.runtime_dir = runtimeDir.get();
 
-  flags.fetcher_cache_dir = path::join(directory.get(), "fetch");
+  Try<string> agentDir = os::mkdtemp(path::join(sandbox.get(), "XXXXXX"));
+  CHECK_SOME(agentDir) << "Failed to create temporary directory";
+
+  flags.fetcher_cache_dir = path::join(agentDir.get(), "fetch");
 
   flags.launcher_dir = getLauncherDir();
 
-  flags.appc_store_dir = path::join(directory.get(), "store", "appc");
+  flags.appc_store_dir = path::join(agentDir.get(), "store", "appc");
 
-  flags.docker_store_dir = path::join(directory.get(), "store", "docker");
+  flags.docker_store_dir = path::join(agentDir.get(), "store", "docker");
+
+  flags.frameworks_home = path::join(agentDir.get(), "frameworks");
 
   {
     // Create a default credential file for master/agent authentication.
-    const string& path = path::join(directory.get(), "credential");
+    const string& path = path::join(agentDir.get(), "credential");
 
     Try<int_fd> fd = os::open(
         path,
@@ -214,7 +221,7 @@ slave::Flags MesosTest::CreateSlaveFlags()
 
   {
     // Create a secret key for executor authentication.
-    const string path = path::join(directory.get(), "jwt_secret_key");
+    const string path = path::join(agentDir.get(), "jwt_secret_key");
 
     Try<int_fd> fd = os::open(
         path,
@@ -240,7 +247,7 @@ slave::Flags MesosTest::CreateSlaveFlags()
 
   {
     // Create a default HTTP credentials file.
-    const string& path = path::join(directory.get(), "http_credentials");
+    const string& path = path::join(agentDir.get(), "http_credentials");
 
     Try<int_fd> fd = os::open(
         path,
@@ -327,29 +334,37 @@ Try<Owned<cluster::Master>> MesosTest::StartMaster(
 }
 
 
+Try<Owned<cluster::Slave>> MesosTest::StartSlave(const SlaveOptions& options)
+{
+  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
+      options.detector,
+      options.flags.isNone() ? CreateSlaveFlags() : options.flags.get(),
+      options.id,
+      options.containerizer,
+      options.gc,
+      options.taskStatusUpdateManager,
+      options.resourceEstimator,
+      options.qosController,
+      options.secretGenerator,
+      options.authorizer,
+      options.futureTracker,
+      options.mock);
+
+  if (slave.isSome() && !options.mock) {
+    slave.get()->start();
+  }
+
+  return slave;
+}
+
+
 Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     MasterDetector* detector,
     const Option<slave::Flags>& flags,
     bool mock)
 {
-  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      mock);
-
-  if (slave.isSome() && !mock) {
-    slave.get()->start();
-  }
-
-  return slave;
+  return StartSlave(SlaveOptions(detector, mock)
+    .withFlags(flags));
 }
 
 
@@ -359,24 +374,9 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     const Option<slave::Flags>& flags,
     bool mock)
 {
-  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      None(),
-      containerizer,
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      mock);
-
-  if (slave.isSome() && !mock) {
-    slave.get()->start();
-  }
-
-  return slave;
+  return StartSlave(SlaveOptions(detector, mock)
+    .withFlags(flags)
+    .withContainerizer(containerizer));
 }
 
 
@@ -386,24 +386,9 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     const Option<slave::Flags>& flags,
     bool mock)
 {
-  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      id,
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      mock);
-
-  if (slave.isSome() && !mock) {
-    slave.get()->start();
-  }
-
-  return slave;
+  return StartSlave(SlaveOptions(detector, mock)
+    .withFlags(flags)
+    .withId(id));
 }
 
 
@@ -413,17 +398,10 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     const string& id,
     const Option<slave::Flags>& flags)
 {
-  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      id,
-      containerizer);
-
-  if (slave.isSome()) {
-    slave.get()->start();
-  }
-
-  return slave;
+  return StartSlave(SlaveOptions(detector)
+    .withFlags(flags)
+    .withId(id)
+    .withContainerizer(containerizer));
 }
 
 
@@ -433,24 +411,9 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     const Option<slave::Flags>& flags,
     bool mock)
 {
-  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      None(),
-      None(),
-      gc,
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      mock);
-
-  if (slave.isSome() && !mock) {
-    slave.get()->start();
-  }
-
-  return slave;
+  return StartSlave(SlaveOptions(detector, mock)
+    .withFlags(flags)
+    .withGc(gc));
 }
 
 
@@ -459,20 +422,9 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     mesos::slave::ResourceEstimator* resourceEstimator,
     const Option<slave::Flags>& flags)
 {
-  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      None(),
-      None(),
-      None(),
-      None(),
-      resourceEstimator);
-
-  if (slave.isSome()) {
-    slave.get()->start();
-  }
-
-  return slave;
+  return StartSlave(SlaveOptions(detector)
+    .withFlags(flags)
+    .withResourceEstimator(resourceEstimator));
 }
 
 
@@ -482,71 +434,35 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     mesos::slave::ResourceEstimator* resourceEstimator,
     const Option<slave::Flags>& flags)
 {
-  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      None(),
-      containerizer,
-      None(),
-      None(),
-      resourceEstimator);
-
-  if (slave.isSome()) {
-    slave.get()->start();
-  }
-
-  return slave;
+  return StartSlave(SlaveOptions(detector)
+    .withFlags(flags)
+    .withContainerizer(containerizer)
+    .withResourceEstimator(resourceEstimator));
 }
 
 
 Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     MasterDetector* detector,
-    mesos::slave::QoSController* qoSController,
+    mesos::slave::QoSController* qosController,
     const Option<slave::Flags>& flags)
 {
-  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      qoSController);
-
-  if (slave.isSome()) {
-    slave.get()->start();
-  }
-
-  return slave;
+  return StartSlave(SlaveOptions(detector)
+    .withFlags(flags)
+    .withQosController(qosController));
 }
 
 
 Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     MasterDetector* detector,
     slave::Containerizer* containerizer,
-    mesos::slave::QoSController* qoSController,
+    mesos::slave::QoSController* qosController,
     const Option<slave::Flags>& flags,
     bool mock)
 {
-  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      None(),
-      containerizer,
-      None(),
-      None(),
-      None(),
-      qoSController,
-      None(),
-      None(),
-      mock);
-
-  if (slave.isSome() && !mock) {
-    slave.get()->start();
-  }
-
-  return slave;
+  return StartSlave(SlaveOptions(detector, mock)
+    .withFlags(flags)
+    .withContainerizer(containerizer)
+    .withQosController(qosController));
 }
 
 
@@ -556,24 +472,9 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     const Option<slave::Flags>& flags,
     bool mock)
 {
-  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      authorizer,
-      mock);
-
-  if (slave.isSome() && !mock) {
-    slave.get()->start();
-  }
-
-  return slave;
+  return StartSlave(SlaveOptions(detector, mock)
+    .withFlags(flags)
+    .withAuthorizer(authorizer));
 }
 
 
@@ -584,24 +485,10 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     const Option<slave::Flags>& flags,
     bool mock)
 {
-  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      None(),
-      containerizer,
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      authorizer,
-      mock);
-
-  if (slave.isSome() && !mock) {
-    slave.get()->start();
-  }
-
-  return slave;
+  return StartSlave(SlaveOptions(detector, mock)
+    .withFlags(flags)
+    .withContainerizer(containerizer)
+    .withAuthorizer(authorizer));
 }
 
 
@@ -613,24 +500,11 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     const Option<slave::Flags>& flags,
     bool mock)
 {
-  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      None(),
-      containerizer,
-      None(),
-      None(),
-      None(),
-      None(),
-      secretGenerator,
-      authorizer,
-      mock);
-
-  if (slave.isSome() && !mock) {
-    slave.get()->start();
-  }
-
-  return slave;
+  return StartSlave(SlaveOptions(detector, mock)
+    .withFlags(flags)
+    .withContainerizer(containerizer)
+    .withSecretGenerator(secretGenerator)
+    .withAuthorizer(authorizer));
 }
 
 
@@ -639,22 +513,9 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     mesos::SecretGenerator* secretGenerator,
     const Option<slave::Flags>& flags)
 {
-  Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      None(),
-      secretGenerator);
-
-  if (slave.isSome()) {
-    slave.get()->start();
-  }
-
-  return slave;
+  return StartSlave(SlaveOptions(detector)
+    .withFlags(flags)
+    .withSecretGenerator(secretGenerator));
 }
 
 
@@ -691,7 +552,8 @@ MockAuthorizer::MockAuthorizer()
 MockAuthorizer::~MockAuthorizer() {}
 
 
-MockGarbageCollector::MockGarbageCollector()
+MockGarbageCollector::MockGarbageCollector(const string& workDir)
+    : slave::GarbageCollector(workDir)
 {
   EXPECT_CALL(*this, unschedule(_)).WillRepeatedly(Return(true));
 }
@@ -928,6 +790,37 @@ void ContainerizerTest<slave::MesosContainerizer>::TearDown()
   }
 }
 #endif // __linux__
+
+
+string ParamDiskQuota::Printer::operator()(
+  const ::testing::TestParamInfo<ParamDiskQuota::Type>& info) const
+{
+  switch (info.param) {
+    case SANDBOX:
+      return "Sandbox";
+    case ROOTFS:
+      return "Rootfs";
+    default:
+      UNREACHABLE();
+  }
+}
+
+
+vector<ParamDiskQuota::Type> ParamDiskQuota::parameters()
+{
+  vector<Type> params{SANDBOX};
+
+  // ROOTFS tests depend on overlayfs being available, since that is
+  // the only provisioner backend that supports ephemeral volumes.
+#if __linux__
+  Try<bool> overlayfsSupported = fs::supported("overlayfs");
+  if (overlayfsSupported.isSome() && overlayfsSupported.get()) {
+    params.push_back(ROOTFS);
+  }
+#endif
+
+  return params;
+}
 
 } // namespace tests {
 } // namespace internal {

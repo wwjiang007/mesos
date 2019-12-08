@@ -34,6 +34,13 @@ if ! $(git diff-index --quiet HEAD --); then
   exit 1
 fi
 
+# NOTE: We chmod the directory here so that the docker containter can
+# copy out the test report xml files from the container file system.
+chmod 777 "${MESOS_DIR}"
+
+# Update docker image
+docker pull "mesos/mesos-build:${OS//:/-}"
+
 docker run \
   --rm \
   -v "${MESOS_DIR}":/SRC:Z \

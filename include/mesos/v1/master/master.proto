@@ -16,6 +16,9 @@
 
 syntax = "proto2";
 
+// NOTE: This should be removed upon switching to Protobuf3.
+import "google/protobuf/duration.proto";
+
 import "mesos/v1/mesos.proto";
 
 import "mesos/v1/maintenance/maintenance.proto";
@@ -77,6 +80,9 @@ message Call {
     CREATE_VOLUMES = 21;     // See 'CreateVolumes' below.
     DESTROY_VOLUMES = 22;    // See 'DestroyVolumes' below.
 
+    GROW_VOLUME = 34;        // See 'GrowVolume' below.
+    SHRINK_VOLUME = 35;      // See 'ShrinkVolume' below.
+
     // Retrieves the cluster's maintenance status.
     GET_MAINTENANCE_STATUS = 23;
     // Retrieves the cluster's maintenance schedule.
@@ -85,9 +91,19 @@ message Call {
     START_MAINTENANCE = 26;           // See 'StartMaintenance' below.
     STOP_MAINTENANCE = 27;            // See 'StopMaintenance' below.
 
+    DRAIN_AGENT = 37;      // See 'DrainAgent' below.
+    DEACTIVATE_AGENT = 38; // See 'DeactivateAgent' below.
+    REACTIVATE_AGENT = 39; // See 'ReactivateAgent' below.
+
     GET_QUOTA = 28;
-    SET_QUOTA = 29;          // See 'SetQuota' below.
-    REMOVE_QUOTA = 30;       // See 'RemoveQuota' below.
+    UPDATE_QUOTA = 36;       // See 'UpdateQuota' below.
+
+    // `SET_QUOTA` and `REMOVE_QUOTA` are deprecated in favor
+    // of `UPDATE_QUOTA`. To reset a role's quota back to the default
+    // (no guarantees and no limits), simply update the role's quota
+    // with empty guarantees and limits.
+    SET_QUOTA = 29 [deprecated = true];
+    REMOVE_QUOTA = 30 [deprecated = true];
 
     TEARDOWN = 31;       // See 'Teardown' below.
 
@@ -139,6 +155,7 @@ message Call {
   // Reserve resources dynamically on a specific agent.
   message ReserveResources {
     required AgentID agent_id = 1;
+    repeated Resource source = 3;
     repeated Resource resources = 2;
   }
 
@@ -167,6 +184,32 @@ message Call {
     repeated Resource volumes = 2;
   }
 
+  // Grow a volume by an additional disk resource.
+  // NOTE: This is currently experimental and only for persistent volumes
+  // created on ROOT/PATH disks.
+  message GrowVolume {
+    // `agent_id` must be set if `volume` is an agent-local resource, and must
+    // be unset if `volume` is an external resource.
+    optional AgentID agent_id = 1;
+
+    required Resource volume = 2;
+    required Resource addition = 3;
+  }
+
+  // Shrink a volume by the size specified in the `subtract` field.
+  // NOTE: This is currently experimental and only for persistent volumes
+  // created on ROOT/PATH disks.
+  message ShrinkVolume {
+    // `agent_id` must be set if `volume` is an agent-local resource, and must
+    // be unset if `volume` is an external resource.
+    optional AgentID agent_id = 1;
+
+    required Resource volume = 2;
+
+    // See comments in `Value.Scalar` for maximum precision supported.
+    required Value.Scalar subtract = 3;
+  }
+
   // Updates the cluster's maintenance schedule.
   message UpdateMaintenanceSchedule {
     required maintenance.Schedule schedule = 1;
@@ -184,11 +227,71 @@ message Call {
     repeated MachineID machines = 1;
   }
 
-  // Sets the quota for resources to be used by a particular role.
+  // EXPERIMENTAL.
+  //
+  // Marks an agent for automated draining of tasks.
+  // This prevents further tasks from being launched on the agent, by preventing
+  // offers from being sent for the agent (see 'DeactivateAgent'), and also
+  // begins killing tasks running on the agent.
+  message DrainAgent {
+    required AgentID agent_id = 1;
+
+    // An upper bound for tasks with a KillPolicy.
+    // If a task has a KillPolicy grace period greater than this value,
+    // this value will be used instead. This allows the operator to limit
+    // the maximum time it will take the agent to drain.
+    //
+    // NOTE: Grace periods start when the executor receives the associated kill.
+    // If, for example, the agent is unreachable when this call is made,
+    // tasks will still receive their full grace period to kill gracefully.
+    optional google.protobuf.Duration max_grace_period = 2;
+
+    // Whether or not this agent will be removed permanently from the
+    // cluster when draining is complete. This transition is automatic
+    // and does **NOT** require a separate call to `MarkAgentGone`.
+    //
+    // Compared to `MarkAgentGone`, which is used for unreachable agents,
+    // marking agents gone after draining will respect kill policies.
+    // To notify frameworks, tasks terminated during draining will return
+    // a `TASK_GONE_BY_OPERATOR` status update instead of any other terminal
+    // status. Executors will not need to account for this case, because
+    // the terminal status update will be intercepted and modified by the agent.
+    optional bool mark_gone = 3 [default = false];
+  }
+
+  // EXPERIMENTAL.
+  //
+  // Turns off offers for a specific agent.
+  // A deactivated agent will continue to run tasks and communicate statuses
+  // with the master.
+  message DeactivateAgent {
+    required AgentID agent_id = 1;
+  }
+
+  // EXPERIMENTAL.
+  //
+  // Turns on offers for a specific agent, which was previously drained or
+  // deactivated.
+  message ReactivateAgent {
+    required AgentID agent_id = 1;
+  }
+
+  // Updates quota given the provided quota configurations, these configurations
+  // are applied in an all-or-nothing manner.
+  message UpdateQuota {
+    // Determines whether to skip the capacity validation. See
+    // `quota.QuotaConfig` for more details.
+    optional bool force = 1;
+
+    repeated quota.QuotaConfig quota_configs = 2;
+  }
+
+  // Deprecated in favor of `UpdateQuota`.
   message SetQuota {
     required quota.QuotaRequest quota_request = 1;
   }
 
+  // Deprecated in favor of `UpdateQuota`.
   message RemoveQuota {
     required string role = 1;
   }
@@ -225,13 +328,20 @@ message Call {
   optional UnreserveResources unreserve_resources = 8;
   optional CreateVolumes create_volumes = 9;
   optional DestroyVolumes destroy_volumes = 10;
+  optional GrowVolume grow_volume = 18;
+  optional ShrinkVolume shrink_volume = 19;
   optional UpdateMaintenanceSchedule update_maintenance_schedule = 11;
   optional StartMaintenance start_maintenance = 12;
   optional StopMaintenance stop_maintenance = 13;
-  optional SetQuota set_quota = 14;
-  optional RemoveQuota remove_quota = 15;
+  optional DrainAgent drain_agent = 21;
+  optional DeactivateAgent deactivate_agent = 22;
+  optional ReactivateAgent reactivate_agent = 23;
+  optional UpdateQuota update_quota = 20;
   optional Teardown teardown = 16;
   optional MarkAgentGone mark_agent_gone = 17;
+
+  optional SetQuota set_quota = 14 [deprecated = true];
+  optional RemoveQuota remove_quota = 15 [deprecated = true];
 }
 
 
@@ -325,6 +435,7 @@ message Response {
     message Agent {
       required AgentInfo agent_info = 1;
       required bool active = 2;
+      optional bool deactivated = 12;
       required string version = 3;
 
       optional string pid = 4;
@@ -346,6 +457,9 @@ message Response {
       }
 
       repeated ResourceProvider resource_providers = 11;
+
+      optional DrainInfo drain_info = 13;
+      optional TimeInfo estimated_drain_start_time = 14;
     }
 
     // Registered agents.
@@ -567,7 +681,10 @@ message Event {
     // status update acknowledged by the scheduler.
     required TaskStatus status = 2;
 
-    // This is the latest state of the task according to the agent.
+    // This is the latest state of the task according to the agent,
+    // which can be more recent than `status` above but intermediate
+    // state changes may be skipped if they happen faster than the
+    // scheduler can acknowledge them.
     required TaskState state = 3;
   }
 
@@ -593,7 +710,7 @@ message Event {
 
   // Forwarded by the master when an agent becomes known to it.
   // This can happen when an agent registered for the first
-  // time, or reregistered after a master failover.
+  // time, or reregistered with the master.
   message AgentAdded {
     required Response.GetAgents.Agent agent = 1;
   }

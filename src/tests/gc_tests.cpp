@@ -25,6 +25,11 @@
 #include <mesos/resources.hpp>
 #include <mesos/scheduler.hpp>
 
+#include <mesos/v1/executor.hpp>
+#include <mesos/v1/mesos.hpp>
+#include <mesos/v1/scheduler.hpp>
+
+#include <process/collect.hpp>
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
 #include <process/gmock.hpp>
@@ -84,7 +89,9 @@ using std::string;
 using std::vector;
 
 using testing::_;
+using testing::AllOf;
 using testing::AtMost;
+using testing::DoAll;
 using testing::Return;
 using testing::SaveArg;
 
@@ -96,7 +103,7 @@ class GarbageCollectorTest : public TemporaryDirectoryTest {};
 
 TEST_F(GarbageCollectorTest, Schedule)
 {
-  GarbageCollector gc;
+  GarbageCollector gc("work_dir");
 
   // Make some temporary files to gc.
   const string& file1 = "file1";
@@ -180,7 +187,7 @@ TEST_F(GarbageCollectorTest, Schedule)
 
 TEST_F(GarbageCollectorTest, Unschedule)
 {
-  GarbageCollector gc;
+  GarbageCollector gc("work_dir");
 
   // Attempt to unschedule a file that is not scheduled.
   AWAIT_ASSERT_FALSE(gc.unschedule("bogus"));
@@ -229,7 +236,7 @@ TEST_F(GarbageCollectorTest, Unschedule)
 
 TEST_F(GarbageCollectorTest, Prune)
 {
-  GarbageCollector gc;
+  GarbageCollector gc("work_dir");
 
   // Make some temporary files to prune.
   const string& file1 = "file1";
@@ -646,6 +653,468 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedExecutor)
 }
 
 
+// This test verifies that task metadata and sandboxes are scheduled for GC
+// when a task finishes, but the executor is still running.
+TEST_F(GarbageCollectorIntegrationTest, LongLivedDefaultExecutor)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  // We need this for the agent's work directory and GC policy.
+  slave::Flags flags = CreateSlaveFlags();
+
+  // Turn on GC of nested container sandboxes by default.
+  flags.gc_non_executor_container_sandboxes = true;
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  // Enable checkpointing, otherwise there will be no metadata to GC.
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_checkpoint(true);
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
+
+  v1::Resources resources =
+    v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  // We launch two tasks for this test:
+  //   * One will be a long-lived task to keep the executor alive.
+  //   * One will be a short-lived task to exercise task metadata/sandbox GC.
+  v1::TaskInfo longLivedTaskInfo =
+    v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
+
+  v1::TaskInfo shortLivedTaskInfo =
+    v1::createTask(agentId, resources, "exit 0");
+
+  // There should be a total of 5 updates:
+  //   * TASK_STARTING/RUNNING from the long-lived task,
+  //   * TASK_STARTING/RUNNING/FINISHED from the short-lived task.
+  testing::Sequence longTask;
+  Future<v1::scheduler::Event::Update> longStartingUpdate;
+  Future<v1::scheduler::Event::Update> longRunningUpdate;
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(longLivedTaskInfo.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_STARTING))))
+    .InSequence(longTask)
+    .WillOnce(DoAll(
+        FutureArg<1>(&longStartingUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(longLivedTaskInfo.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .InSequence(longTask)
+    .WillOnce(DoAll(
+        FutureArg<1>(&longRunningUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  testing::Sequence shortTask;
+  Future<v1::scheduler::Event::Update> shortStartingUpdate;
+  Future<v1::scheduler::Event::Update> shortRunningUpdate;
+  Future<v1::scheduler::Event::Update> shortFinishedUpdate;
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(shortLivedTaskInfo.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_STARTING))))
+    .InSequence(shortTask)
+    .WillOnce(DoAll(
+        FutureArg<1>(&shortStartingUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(shortLivedTaskInfo.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .InSequence(shortTask)
+    .WillOnce(DoAll(
+        FutureArg<1>(&shortRunningUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(shortLivedTaskInfo.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_FINISHED))))
+    .InSequence(shortTask)
+    .WillOnce(DoAll(
+        FutureArg<1>(&shortFinishedUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  // There should be two directories scheduled for GC:
+  // the short-lived task's metadata and sandbox.
+  vector<Future<Nothing>> schedules = {
+    FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule),
+    FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule)
+  };
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {
+            v1::LAUNCH_GROUP(
+                executorInfo, v1::createTaskGroupInfo({longLivedTaskInfo})),
+            v1::LAUNCH_GROUP(
+                executorInfo, v1::createTaskGroupInfo({shortLivedTaskInfo}))
+          }));
+
+  AWAIT_READY(collect(schedules));
+  AWAIT_READY(longStartingUpdate);
+  AWAIT_READY(longRunningUpdate);
+  AWAIT_READY(shortStartingUpdate);
+  AWAIT_READY(shortRunningUpdate);
+  AWAIT_READY(shortFinishedUpdate);
+
+  // Check that the short-lived task's metadata and sandbox exist.
+  string shortLivedTaskPath = slave::paths::getTaskPath(
+      slave::paths::getMetaRootDir(flags.work_dir),
+      devolve(agentId),
+      devolve(frameworkId),
+      devolve(executorInfo.executor_id()),
+      devolve(
+          shortStartingUpdate->status()
+            .container_status().container_id().parent()),
+      devolve(shortLivedTaskInfo.task_id()));
+
+  ASSERT_TRUE(os::exists(shortLivedTaskPath));
+
+  string shortLivedSandboxPath = path::join(
+      slave::paths::getExecutorRunPath(
+          flags.work_dir,
+            devolve(agentId),
+            devolve(frameworkId),
+            devolve(executorInfo.executor_id()),
+            devolve(
+                shortStartingUpdate->status()
+                  .container_status().container_id().parent())),
+      "containers",
+      shortStartingUpdate->status().container_status().container_id().value());
+
+  ASSERT_TRUE(os::exists(shortLivedSandboxPath));
+
+  // Check another metadata directory that should only be GC'd after the
+  // executor exits.
+  string executorMetaPath = slave::paths::getExecutorPath(
+      slave::paths::getMetaRootDir(flags.work_dir),
+      devolve(agentId),
+      devolve(frameworkId),
+      devolve(executorInfo.executor_id()));
+
+  ASSERT_TRUE(os::exists(executorMetaPath));
+
+  // Trigger garbage collection on the short-lived task's directories
+  // and check that those are properly deleted.
+  Clock::pause();
+  Clock::advance(flags.gc_delay);
+  Clock::settle();
+  Clock::resume();
+
+  ASSERT_FALSE(os::exists(shortLivedTaskPath));
+  ASSERT_FALSE(os::exists(shortLivedSandboxPath));
+  ASSERT_TRUE(os::exists(executorMetaPath));
+
+  // Kill the remaining task and trigger garbage collection again.
+  Future<v1::scheduler::Event::Update> killedUpdate;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(DoAll(
+        FutureArg<1>(&killedUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  // Since this is the last executor belonging to the framework, we expect
+  // multiple directories to be scheduled for GC:
+  //   * Task, Executor container, Executor, and Framework metadata directories.
+  //   * Executor sandbox and run directories.
+  //   * Framework work directory.
+  schedules = {
+    FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule),
+    FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule),
+    FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule),
+    FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule),
+    FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule),
+    FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule),
+    FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule)
+  };
+
+  mesos.send(v1::createCallKill(frameworkId, longLivedTaskInfo.task_id()));
+
+  AWAIT_READY(killedUpdate);
+  EXPECT_EQ(v1::TASK_KILLED, killedUpdate->status().state());
+  EXPECT_EQ(longLivedTaskInfo.task_id(), killedUpdate->status().task_id());
+
+  AWAIT_READY(collect(schedules));
+
+  // Trigger GC and then check one of the directories above.
+  Clock::pause();
+  Clock::advance(flags.gc_delay);
+  Clock::settle();
+  Clock::resume();
+
+  ASSERT_FALSE(os::exists(executorMetaPath));
+}
+
+
+// This test verifies that task metadata and sandboxes are scheduled for GC
+// when a task finishes, but the executor is still running. This version of
+// the test restarts the agent to ensure recovered tasks are also scheduled
+// for GC.
+TEST_F(GarbageCollectorIntegrationTest, LongLivedDefaultExecutorRestart)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  // We need this for the agent's work directory and GC policy.
+  slave::Flags flags = CreateSlaveFlags();
+
+  // Turn on GC of nested container sandboxes by default.
+  flags.gc_non_executor_container_sandboxes = true;
+
+  // Start the slave with a static process ID. This allows the executor to
+  // reconnect with the slave upon a process restart.
+  const string id(process::ID::generate("agent"));
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), id, flags, false);
+
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  // Enable checkpointing, otherwise there will be no metadata to GC.
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_checkpoint(true);
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
+
+  v1::Resources resources =
+    v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  // We launch two tasks for this test:
+  //   * One will be a long-lived task to keep the executor alive.
+  //   * One will be a short-lived task to exercise task metadata/sandbox GC.
+  v1::TaskInfo longLivedTaskInfo =
+    v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
+
+  v1::TaskInfo shortLivedTaskInfo =
+    v1::createTask(agentId, resources, "exit 0");
+
+  // There should be a total of 5 updates:
+  //   * TASK_STARTING/RUNNING from the long-lived task,
+  //   * TASK_STARTING/RUNNING/FINISHED from the short-lived task.
+  testing::Sequence longTask;
+  Future<v1::scheduler::Event::Update> longStartingUpdate;
+  Future<v1::scheduler::Event::Update> longRunningUpdate;
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(longLivedTaskInfo.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_STARTING))))
+    .InSequence(longTask)
+    .WillOnce(DoAll(
+        FutureArg<1>(&longStartingUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(longLivedTaskInfo.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .InSequence(longTask)
+    .WillOnce(DoAll(
+        FutureArg<1>(&longRunningUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  testing::Sequence shortTask;
+  Future<v1::scheduler::Event::Update> shortStartingUpdate;
+  Future<v1::scheduler::Event::Update> shortRunningUpdate;
+  Future<v1::scheduler::Event::Update> shortFinishedUpdate;
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(shortLivedTaskInfo.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_STARTING))))
+    .InSequence(shortTask)
+    .WillOnce(DoAll(
+        FutureArg<1>(&shortStartingUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(shortLivedTaskInfo.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .InSequence(shortTask)
+    .WillOnce(DoAll(
+        FutureArg<1>(&shortRunningUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(shortLivedTaskInfo.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_FINISHED))))
+    .InSequence(shortTask)
+    .WillOnce(DoAll(
+        FutureArg<1>(&shortFinishedUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  // There should be two directories scheduled for GC:
+  // the short-lived task's metadata and sandbox.
+  vector<Future<Nothing>> schedules = {
+    FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule),
+    FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule)
+  };
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {
+            v1::LAUNCH_GROUP(
+                executorInfo, v1::createTaskGroupInfo({longLivedTaskInfo})),
+            v1::LAUNCH_GROUP(
+                executorInfo, v1::createTaskGroupInfo({shortLivedTaskInfo}))
+          }));
+
+  AWAIT_READY(collect(schedules));
+  AWAIT_READY(longStartingUpdate);
+  AWAIT_READY(longRunningUpdate);
+  AWAIT_READY(shortStartingUpdate);
+  AWAIT_READY(shortRunningUpdate);
+  AWAIT_READY(shortFinishedUpdate);
+
+  // Check that the short-lived task's metadata and sandbox exist.
+  string shortLivedTaskPath = slave::paths::getTaskPath(
+      slave::paths::getMetaRootDir(flags.work_dir),
+      devolve(agentId),
+      devolve(frameworkId),
+      devolve(executorInfo.executor_id()),
+      devolve(
+          shortStartingUpdate->status()
+            .container_status().container_id().parent()),
+      devolve(shortLivedTaskInfo.task_id()));
+
+  ASSERT_TRUE(os::exists(shortLivedTaskPath));
+
+  string shortLivedSandboxPath = path::join(
+      slave::paths::getExecutorRunPath(
+          flags.work_dir,
+            devolve(agentId),
+            devolve(frameworkId),
+            devolve(executorInfo.executor_id()),
+            devolve(
+                shortStartingUpdate->status()
+                  .container_status().container_id().parent())),
+      "containers",
+      shortStartingUpdate->status().container_status().container_id().value());
+
+  ASSERT_TRUE(os::exists(shortLivedSandboxPath));
+
+  // Restart the agent to wipe out any scheduled GC.
+  Future<SlaveReregisteredMessage> slaveReregisteredMessage =
+    FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
+  slave.get()->terminate();
+
+  // The agent should reregister once recovery is complete, which also means
+  // that any finished tasks metadata/sandboxes should be rescheduled for GC.
+  slave = StartSlave(detector.get(), id, flags, false);
+  ASSERT_SOME(slave);
+  AWAIT_READY(slaveReregisteredMessage);
+
+  // Trigger garbage collection on the short-lived task's directories
+  // and check that those are properly deleted.
+  Clock::pause();
+  Clock::advance(flags.gc_delay);
+  Clock::settle();
+  Clock::resume();
+
+  ASSERT_FALSE(os::exists(shortLivedTaskPath));
+  ASSERT_FALSE(os::exists(shortLivedSandboxPath));
+}
+
+
 TEST_F(GarbageCollectorIntegrationTest, DiskUsage)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
@@ -899,25 +1368,29 @@ TEST_F(GarbageCollectorIntegrationTest, Unschedule)
 
 
 #ifdef __linux__
-// In Mesos it's possible for tasks and isolators to lay down files
-// that are not deletable by GC. This test runs a task that creates a busy
-// mount point which is not directly deletable by GC. We verify that
-// GC deletes all files that it's able to delete in the face of such errors.
-TEST_F(GarbageCollectorIntegrationTest, ROOT_BusyMountPoint)
+// This test creates a persistent volume and runs a task which mounts the volume
+// inside the sandbox, to simulate a dangling mount which agent failed to
+// clean up (see MESOS-8830). We verify that GC process will unmount the
+// dangling mount point successfully and report success in metrics.
+TEST_F(GarbageCollectorIntegrationTest, ROOT_DanglingMount)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   slave::Flags flags = CreateSlaveFlags();
+  flags.resources = strings::format("disk(%s):1024", DEFAULT_TEST_ROLE).get();
+
   Owned<MasterDetector> detector = master.get()->createDetector();
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
 
   ASSERT_SOME(slave);
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, DEFAULT_TEST_ROLE);
 
   MockScheduler sched;
   MesosSchedulerDriver driver(
       &sched,
-      DEFAULT_FRAMEWORK_INFO,
+      frameworkInfo,
       master.get()->pid,
       DEFAULT_CREDENTIAL);
 
@@ -936,21 +1409,33 @@ TEST_F(GarbageCollectorIntegrationTest, ROOT_BusyMountPoint)
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->empty());
 
-  const Offer& offer = offers.get()[0];
-  const SlaveID& slaveId = offer.slave_id();
+  const Offer& offer = offers->at(0);
 
-  // The busy mount point goes before the regular file in GC's
-  // directory traversal due to their names. This makes sure that
-  // an error occurs before all deletable files are GCed.
-  string mountPoint = "test1";
-  string regularFile = "test2.txt";
+  string persistenceId = "persistence-id";
+  string containerPath = "path";
+
+  Resource volume = createPersistentVolume(
+      Megabytes(1024),
+      DEFAULT_TEST_ROLE,
+      persistenceId,
+      containerPath,
+      None(),
+      None(),
+      frameworkInfo.principal());
+
+  string mountPoint = "dangling";
+
+  string hostPath = slave::paths::getPersistentVolumePath(
+      flags.work_dir, DEFAULT_TEST_ROLE, persistenceId);
+
+  string fileInVolume = "foo.txt";
 
   TaskInfo task = createTask(
-      slaveId,
-      Resources::parse("cpus:1;mem:128;disk:1").get(),
-      "touch "+ regularFile + "; "
+      offer.slave_id(),
+      Resources(volume),
+      "touch "+ path::join(containerPath, fileInVolume) + "; "
       "mkdir " + mountPoint + "; "
-      "mount --bind " + mountPoint + " " + mountPoint,
+      "mount --bind " + hostPath + " " + mountPoint,
       None(),
       "test-task123",
       "test-task123");
@@ -966,7 +1451,15 @@ TEST_F(GarbageCollectorIntegrationTest, ROOT_BusyMountPoint)
   Future<Nothing> schedule = FUTURE_DISPATCH(
       _, &GarbageCollectorProcess::schedule);
 
-  driver.launchTasks(offer.id(), {task});
+  Future<Nothing> ack1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> ack2 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  driver.acceptOffers(
+      {offer.id()},
+      {CREATE(volume), LAUNCH({task})});
 
   AWAIT_READY(status0);
   EXPECT_EQ(task.task_id(), status0->task_id());
@@ -980,23 +1473,21 @@ TEST_F(GarbageCollectorIntegrationTest, ROOT_BusyMountPoint)
   executorId.set_value("test-task123");
   Result<string> _sandbox = os::realpath(slave::paths::getExecutorLatestRunPath(
       flags.work_dir,
-      slaveId,
+      offer.slave_id(),
       frameworkId.get(),
       executorId));
   ASSERT_SOME(_sandbox);
   string sandbox = _sandbox.get();
   EXPECT_TRUE(os::exists(sandbox));
 
-  // Wait for the task to create these paths.
+  // Wait for the task to create the dangling mount point.
   Timeout timeout = Timeout::in(process::TEST_AWAIT_TIMEOUT);
   while (!os::exists(path::join(sandbox, mountPoint)) ||
-         !os::exists(path::join(sandbox, regularFile)) ||
          !timeout.expired()) {
     os::sleep(Milliseconds(10));
   }
 
   ASSERT_TRUE(os::exists(path::join(sandbox, mountPoint)));
-  ASSERT_TRUE(os::exists(path::join(sandbox, regularFile)));
 
   AWAIT_READY(status2);
   ASSERT_EQ(task.task_id(), status2->task_id());
@@ -1004,15 +1495,16 @@ TEST_F(GarbageCollectorIntegrationTest, ROOT_BusyMountPoint)
 
   AWAIT_READY(schedule);
 
+  ASSERT_TRUE(os::exists(path::join(sandbox, mountPoint)));
+  ASSERT_TRUE(os::exists(path::join(hostPath, fileInVolume)));
+
+  AWAIT_READY(schedule);
+
   Clock::pause();
   Clock::advance(flags.gc_delay);
   Clock::settle();
 
-  EXPECT_TRUE(os::exists(sandbox));
-  EXPECT_TRUE(os::exists(path::join(sandbox, mountPoint)));
-  EXPECT_FALSE(os::exists(path::join(sandbox, regularFile)));
-
-  // Verify that GC metrics show that a path removal failed.
+  // Verify that GC metrics showes no failure.
   JSON::Object metrics = Metrics();
 
   ASSERT_EQ(1u, metrics.values.count("gc/path_removals_pending"));
@@ -1022,21 +1514,130 @@ TEST_F(GarbageCollectorIntegrationTest, ROOT_BusyMountPoint)
   EXPECT_SOME_EQ(
       0u,
       metrics.at<JSON::Number>("gc/path_removals_pending"));
+
   EXPECT_SOME_EQ(
       0u,
-      metrics.at<JSON::Number>("gc/path_removals_succeeded"));
+      metrics.at<JSON::Number>("gc/path_removals_failed"));
 
-  // The sandbox path removal failure will cascade to cause failures to
-  // remove the executor and framework directories. For testing purposes
-  // it is sufficient to verify that some failure was detected.
-  ASSERT_SOME(metrics.at<JSON::Number>("gc/path_removals_failed"));
+  ASSERT_SOME(metrics.at<JSON::Number>("gc/path_removals_succeeded"));
   EXPECT_GT(
-      metrics.at<JSON::Number>("gc/path_removals_failed")->as<unsigned>(),
+      metrics.at<JSON::Number>("gc/path_removals_succeeded")->as<unsigned>(),
       0u);
+
+  ASSERT_FALSE(os::exists(path::join(sandbox, mountPoint)));
+  ASSERT_TRUE(os::exists(path::join(hostPath, fileInVolume)));
 
   Clock::resume();
   driver.stop();
   driver.join();
+}
+
+
+// This is a regression test for MESOS-9966. It enables the agent
+// flag `--gc_non_executor_container_sandboxes` and launches a
+// nested container with checkpointing disabled, and then verifies
+// that agent can recover successfully.
+//
+// TODO(qianzhang): For now, this test is Linux specific because
+// the POSIX launcher is not able to destroy orphan containers
+// after recovery, see MESOS-8771 for details.
+TEST_F(GarbageCollectorIntegrationTest, ROOT_OrphanContainer)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  // Turn on GC of nested container sandboxes by default.
+  slave::Flags flags = CreateSlaveFlags();
+  flags.gc_non_executor_container_sandboxes = true;
+  flags.launcher = "linux";
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags, false);
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  // Disable checkpointing so the container launched by the framework will be
+  // orphan after agent restarts.
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_checkpoint(false);
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
+
+  v1::Resources resources =
+    v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  v1::TaskInfo taskInfo =
+    v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
+
+  Future<v1::scheduler::Event::Update> startingUpdate;
+  Future<v1::scheduler::Event::Update> runningUpdate;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(DoAll(
+        FutureArg<1>(&startingUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(FutureArg<1>(&runningUpdate))
+    .WillRepeatedly(Return());
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({taskInfo}))}));
+
+  AWAIT_READY(startingUpdate);
+
+  ASSERT_EQ(v1::TASK_STARTING, startingUpdate->status().state());
+  EXPECT_EQ(taskInfo.task_id(), startingUpdate->status().task_id());
+  EXPECT_TRUE(startingUpdate->status().has_timestamp());
+
+  AWAIT_READY(runningUpdate);
+
+  // Restart the agent.
+  Future<SlaveReregisteredMessage> slaveReregisteredMessage =
+    FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
+
+  slave.get()->terminate();
+
+  slave = StartSlave(detector.get(), flags, false);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveReregisteredMessage);
 }
 #endif // __linux__
 

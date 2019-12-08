@@ -24,8 +24,8 @@ SRCDIR=/tmp/SRC
 # Prepare sources
 git clone --depth 1 file:///SRC "${SRCDIR}"
 
-# We require this in order to populate the `.clang-tidy` file at the top-level.
-(cd "${SRCDIR}" && ./bootstrap)
+# Populate the `.clang-tidy` at the top-level.
+cp "${SRCDIR}"/support/clang-tidy "${SRCDIR}"/.clang-tidy
 
 # Configure sources
 cmake -DCMAKE_BUILD_TYPE=Release \
@@ -37,8 +37,9 @@ cmake -DCMAKE_BUILD_TYPE=Release \
 # TODO(mpark): Use an external dependencies target once MESOS-6924 is resolved.
 cmake --build 3rdparty --target boost-1.65.0 -- -j $(nproc)
 cmake --build 3rdparty --target elfio-3.2 -- -j $(nproc)
-cmake --build 3rdparty --target glog-0.3.3 -- -j $(nproc)
+cmake --build 3rdparty --target glog-0.4.0 -- -j $(nproc)
 cmake --build 3rdparty --target googletest-1.8.0 -- -j $(nproc)
+cmake --build 3rdparty --target grpc-1.10.0 -- -j $(nproc)
 cmake --build 3rdparty --target http_parser-2.6.2 -- -j $(nproc)
 
 # TODO(mpark): The `|| true` is a hack to try both `libev` and `libevent` and
@@ -58,10 +59,12 @@ cmake --build 3rdparty --target zookeeper-3.4.8 -- -j $(nproc)
 cmake --build . --target mesos-protobufs -- -j $(nproc)
 
 # For protobuf definitions in stout (`protobuf-test.pb.h`) or
-# libprocess (`benchmarks.pb.h`) no explict targets exists; we instead
-# build the executable targets to produce them as a side-effect.  This
-# is pretty hacky for what we want to do, but it's okay for now.
+# libprocess (`grpc_tests.pb.h`, `grpc_tests.grpc.pb.h` and `benchmarks.pb.h`)
+# no explict targets exists; we instead build the executable targets to produce
+# them as a side-effect. This is pretty hacky for what we want to do, but it's
+# okay for now.
 cmake --build 3rdparty/stout/tests --target stout-tests -- -j $(nproc)
+cmake --build 3rdparty/libprocess/src/tests --target libprocess-tests -- -j $(nproc)
 cmake --build 3rdparty/libprocess/src/tests --target benchmarks -- -j $(nproc)
 
 # TODO(bbannier): Use a less restrictive `grep` pattern and `header-filter`

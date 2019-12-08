@@ -29,6 +29,7 @@
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/message.h>
+#include <google/protobuf/reflection.h>
 #include <google/protobuf/repeated_field.h>
 
 #include <google/protobuf/io/zero_copy_stream_impl.h>
@@ -46,11 +47,16 @@
 #include <stout/try.hpp>
 
 #include <stout/os/close.hpp>
+#include <stout/os/fsync.hpp>
 #include <stout/os/int_fd.hpp>
 #include <stout/os/lseek.hpp>
 #include <stout/os/open.hpp>
 #include <stout/os/read.hpp>
 #include <stout/os/write.hpp>
+
+#ifdef __WINDOWS__
+#include <stout/os/dup.hpp>
+#endif // __WINDOWS__
 
 namespace protobuf {
 
@@ -80,12 +86,31 @@ inline Try<Nothing> write(int_fd fd, const google::protobuf::Message& message)
   }
 
 #ifdef __WINDOWS__
-  if (!message.SerializeToFileDescriptor(fd.crt())) {
-#else
-  if (!message.SerializeToFileDescriptor(fd)) {
-#endif
+  // NOTE: On Windows, we need to explicitly allocate a CRT file
+  // descriptor because the Protobuf library requires it. Because
+  // users of `protobuf::write` are likely to call `os::close` on the
+  // `fd` we were given, we need to duplicate it before allocating the
+  // CRT fd. This is because once the CRT fd is allocated, it must be
+  // closed with `_close` instead of `os::close`. Since we need to
+  // call `_close` here, we duplicate the fd to prevent the users call
+  // of `os::close` from closing twice.
+  Try<int_fd> dup = os::dup(fd);
+  if (dup.isError()) {
+    return Error("Failed to duplicate handle: " + dup.error());
+  }
+
+  int crt = dup->crt();
+
+  if (!message.SerializeToFileDescriptor(crt)) {
+    ::_close(crt);
     return Error("Failed to write/serialize message");
   }
+  ::_close(crt);
+#else
+  if (!message.SerializeToFileDescriptor(fd)) {
+    return Error("Failed to write/serialize message");
+  }
+#endif
 
   return Nothing();
 }
@@ -109,8 +134,10 @@ Try<Nothing> write(
 }
 
 
+// A wrapper function for the above `write()` with opening and closing the file.
+// If `sync` is set to true, an `fsync()` will be called before `close()`.
 template <typename T>
-Try<Nothing> write(const std::string& path, const T& t)
+Try<Nothing> write(const std::string& path, const T& t, bool sync = false)
 {
   Try<int_fd> fd = os::open(
       path,
@@ -121,20 +148,33 @@ Try<Nothing> write(const std::string& path, const T& t)
     return Error("Failed to open file '" + path + "': " + fd.error());
   }
 
-  Try<Nothing> result = write(fd.get(), t);
+  Try<Nothing> write = ::protobuf::write(fd.get(), t);
 
-  // NOTE: We ignore the return value of close(). This is because
-  // users calling this function are interested in the return value of
-  // write(). Also an unsuccessful close() doesn't affect the write.
-  os::close(fd.get());
+  if (sync && write.isSome()) {
+    // We call `fsync()` before closing the file instead of opening it with the
+    // `O_SYNC` flag for better performance. See:
+    // http://lkml.iu.edu/hypermail/linux/kernel/0105.3/0353.html
+    write = os::fsync(fd.get());
+  }
 
-  return result;
+  Try<Nothing> close = os::close(fd.get());
+
+  // We propagate `close` failures if `write` on the file was successful.
+  if (write.isSome() && close.isError()) {
+    return Error(
+        "Failed to close '" + stringify(fd.get()) + "':" + close.error());
+  }
+
+  return write;
 }
 
 
+// A wrapper function to append a protobuf message with opening and closing the
+// file. If `sync` is set to true, an `fsync()` will be called before `close()`.
 inline Try<Nothing> append(
     const std::string& path,
-    const google::protobuf::Message& message)
+    const google::protobuf::Message& message,
+    bool sync = false)
 {
   Try<int_fd> fd = os::open(
       path,
@@ -145,14 +185,23 @@ inline Try<Nothing> append(
     return Error("Failed to open file '" + path + "': " + fd.error());
   }
 
-  Try<Nothing> result = write(fd.get(), message);
+  Try<Nothing> write = protobuf::write(fd.get(), message);
 
-  // NOTE: We ignore the return value of close(). This is because
-  // users calling this function are interested in the return value of
-  // write(). Also an unsuccessful close() doesn't affect the write.
-  os::close(fd.get());
+  if (sync && write.isSome()) {
+    // We call `fsync()` before closing the file instead of opening it with the
+    // `O_SYNC` flag for better performance.
+    write = os::fsync(fd.get());
+  }
 
-  return result;
+  Try<Nothing> close = os::close(fd.get());
+
+  // We propagate `close` failures if `write` on the file was successful.
+  if (write.isSome() && close.isError()) {
+    return Error(
+        "Failed to close '" + stringify(fd.get()) + "':" + close.error());
+  }
+
+  return write;
 }
 
 
@@ -761,6 +810,9 @@ struct Protobuf : Representation<google::protobuf::Message>
 // `json` function for protobuf messages. Refer to `jsonify.hpp` for details.
 // TODO(mpark): This currently uses the default value for optional fields
 // that are not deprecated, but we may want to revisit this decision.
+//
+// TODO(mzhu): Use protobuf built-in JSON mapping utilities in favor of
+// the reflection APIs. See MESOS-9896.
 inline void json(ObjectWriter* writer, const Protobuf& protobuf)
 {
   using google::protobuf::FieldDescriptor;
@@ -779,7 +831,7 @@ inline void json(ObjectWriter* writer, const Protobuf& protobuf)
   fields.reserve(fieldCount);
   for (int i = 0; i < fieldCount; ++i) {
     const FieldDescriptor* field = descriptor->field(i);
-    if (field->is_repeated()) {
+    if (field->is_repeated()) { // Repeated or Map.
       if (reflection->FieldSize(message, field) > 0) {
         // Has repeated field with members, output as JSON.
         fields.push_back(field);
@@ -793,7 +845,7 @@ inline void json(ObjectWriter* writer, const Protobuf& protobuf)
   }
 
   foreach (const FieldDescriptor* field, fields) {
-    if (field->is_repeated()) {
+    if (field->is_repeated() && !field->is_map()) {
       writer->field(
           field->name(),
           [&field, &reflection, &message](JSON::ArrayWriter* writer) {
@@ -848,46 +900,142 @@ inline void json(ObjectWriter* writer, const Protobuf& protobuf)
               }
             }
           });
-    } else {
-      switch (field->cpp_type()) {
-        case FieldDescriptor::CPPTYPE_BOOL:
-          writer->field(field->name(), reflection->GetBool(message, field));
-          break;
-        case FieldDescriptor::CPPTYPE_INT32:
-          writer->field(field->name(), reflection->GetInt32(message, field));
-          break;
-        case FieldDescriptor::CPPTYPE_INT64:
-          writer->field(field->name(), reflection->GetInt64(message, field));
-          break;
-        case FieldDescriptor::CPPTYPE_UINT32:
-          writer->field(field->name(), reflection->GetUInt32(message, field));
-          break;
-        case FieldDescriptor::CPPTYPE_UINT64:
-          writer->field(field->name(), reflection->GetUInt64(message, field));
-          break;
-        case FieldDescriptor::CPPTYPE_FLOAT:
-          writer->field(field->name(), reflection->GetFloat(message, field));
-          break;
-        case FieldDescriptor::CPPTYPE_DOUBLE:
-          writer->field(field->name(), reflection->GetDouble(message, field));
-          break;
-        case FieldDescriptor::CPPTYPE_MESSAGE:
-          writer->field(
-              field->name(), Protobuf(reflection->GetMessage(message, field)));
-          break;
-        case FieldDescriptor::CPPTYPE_ENUM:
-          writer->field(
-              field->name(), reflection->GetEnum(message, field)->name());
-          break;
-        case FieldDescriptor::CPPTYPE_STRING:
-          const std::string& s = reflection->GetStringReference(
-              message, field, nullptr);
-          if (field->type() == FieldDescriptor::TYPE_BYTES) {
-            writer->field(field->name(), base64::encode(s));
-          } else {
-            writer->field(field->name(), s);
-          }
-          break;
+    } else { // field->is_map() || !field->is_repeated()
+      auto writeField = [&writer](
+                            const std::string& fieldName,
+                            const google::protobuf::Reflection* reflection,
+                            const google::protobuf::Message& message,
+                            const FieldDescriptor* field) {
+        switch (field->cpp_type()) {
+          case FieldDescriptor::CPPTYPE_BOOL:
+            writer->field(fieldName, reflection->GetBool(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_INT32:
+            writer->field(fieldName, reflection->GetInt32(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_INT64:
+            writer->field(fieldName, reflection->GetInt64(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_UINT32:
+            writer->field(fieldName, reflection->GetUInt32(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_UINT64:
+            writer->field(fieldName, reflection->GetUInt64(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_FLOAT:
+            writer->field(fieldName, reflection->GetFloat(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_DOUBLE:
+            writer->field(fieldName, reflection->GetDouble(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_MESSAGE:
+            writer->field(
+                fieldName, Protobuf(reflection->GetMessage(message, field)));
+            break;
+          case FieldDescriptor::CPPTYPE_ENUM:
+            writer->field(
+                fieldName, reflection->GetEnum(message, field)->name());
+            break;
+          case FieldDescriptor::CPPTYPE_STRING:
+            const std::string& s =
+              reflection->GetStringReference(message, field, nullptr);
+            if (field->type() == FieldDescriptor::TYPE_BYTES) {
+              writer->field(fieldName, base64::encode(s));
+            } else {
+              writer->field(fieldName, s);
+            }
+            break;
+        }
+      };
+
+      if (!field->is_repeated()) { // Singular field.
+        writeField(field->name(), reflection, message, field);
+      } else { // Map field.
+        CHECK(field->is_map());
+        writer->field(
+            field->name(),
+            [&field, &reflection, &message, &writeField](
+                JSON::ObjectWriter* writer) {
+              foreach (
+                  const auto& mapEntry,
+                  reflection->GetRepeatedFieldRef<google::protobuf::Message>(
+                      message, field)) {
+                const google::protobuf::Descriptor* mapEntryDescriptor =
+                  mapEntry.GetDescriptor();
+                const google::protobuf::Reflection* mapEntryReflection =
+                  mapEntry.GetReflection();
+
+                // Map entry must contain exactly two fields: `key` and `value`.
+                CHECK_EQ(mapEntryDescriptor->field_count(), 2);
+
+                const FieldDescriptor* keyField = mapEntryDescriptor->field(0);
+                const FieldDescriptor* valueField =
+                  mapEntryDescriptor->field(1);
+
+                switch (keyField->cpp_type()) {
+                  case FieldDescriptor::CPPTYPE_BOOL:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetBool(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_INT32:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetInt32(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_INT64:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetInt64(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_UINT32:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetUInt32(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_UINT64:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetUInt64(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_STRING:
+                    if (keyField->type() == FieldDescriptor::TYPE_BYTES) {
+                      LOG(FATAL)
+                        << "Unexpected key field type in protobuf Map: "
+                        << keyField->type_name();
+                    }
+
+                    writeField(
+                        mapEntryReflection->GetStringReference(
+                            mapEntry, keyField, nullptr),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_FLOAT:
+                  case FieldDescriptor::CPPTYPE_DOUBLE:
+                  case FieldDescriptor::CPPTYPE_MESSAGE:
+                  case FieldDescriptor::CPPTYPE_ENUM:
+                    LOG(FATAL) << "Unexpected key field type in protobuf Map: "
+                               << keyField->cpp_type_name();
+                }
+              }
+            });
       }
     }
   }

@@ -9,7 +9,7 @@ By default, all the messages that flow through the Mesos cluster are unencrypted
 
 SSL/TLS support was added to libprocess in Mesos 0.23.0, which encypts the low-level communication that Mesos uses for network communication between Mesos components.  Additionally, HTTPS support was added to the Mesos WebUI.
 
-# Configuration
+# Build Configuration
 There is currently only one implementation of the [libprocess socket interface](https://github.com/apache/mesos/blob/master/3rdparty/libprocess/include/process/socket.hpp) that supports SSL. This implementation uses [libevent](https://github.com/libevent/libevent). Specifically it relies on the `libevent-openssl` library that wraps `openssl`.
 
 Before building Mesos 0.23.0 from source, assuming you have installed the required [Dependencies](#Dependencies), you can modify your configure line to enable SSL as follows:
@@ -18,7 +18,50 @@ Before building Mesos 0.23.0 from source, assuming you have installed the requir
 ../configure --enable-libevent --enable-ssl
 ~~~
 
-# Running
+
+# Runtime Configuration
+
+TLS support in Mesos can be configured with different levels of security. This section aims to help
+Mesos operators to better understand the trade-offs involved in them.
+
+On a high level, one can imagine to choose between three available layers of security, each
+providing additional security guarantees but also increasing the deployment complexity.
+
+1) `LIBPROCESS_SSL_ENABLED=true`. This provides external clients (e.g. curl) with the ability to
+   connect to Mesos HTTP endpoints securely via TLS, verifying that the server certificate is valid
+   and trusted.
+
+2) `LIBPROCESS_SSL_VERIFY_SERVER_CERT=true`. In addition to the above, this ensures that Mesos components
+   themselves are verifying the presence of valid and trusted server certificates when making
+   outgoing connections. This prevents man-in-the-middle attacks on communications between Mesos
+   components, and on communications between a Mesos component and an external server.
+
+   **WARNING:** This setting only makes sense if `LIBPROCESS_SSL_ENABLE_DOWNGRADE` is set
+   to `false`, otherwise a malicious actor can simply bypass certificate verification by
+   downgrading to a non-TLS connection.
+
+3) `LIBPROCESS_SSL_REQUIRE_CLIENT_CERT=true`. In addition to the above, this enforces the use of TLS
+   client certificates on all connections to any Mesos component. This ensures that only trusted
+   clients can connect to any Mesos component, preventing reception of forged or malformed messages.
+
+   This implies that all schedulers or other clients (including the web browsers used by human
+   operators) that are supposed to connect to any endpoint of a Mesos component must be provided
+   with valid client certificates.
+
+   **WARNING:** As above, this setting only makes sense if `LIBPROCESS_SSL_ENABLE_DOWNGRADE` is
+   set to `false`.
+
+
+For secure usage, it is recommended to set `LIBPROCESS_SSL_ENABLED=true`,
+`LIBPROCESS_SSL_VERIFY_SERVER_CERT=true`, `LIBPROCESS_SSL_HOSTNAME_VALIDATION_SCHEME=openssl`
+and `LIBPROCESS_SSL_ENABLE_DOWNGRADE=false`. This provides a good trade-off
+between security and usability.
+
+It is not recommended in general to expose Mesos components to the public internet, but in cases
+where they are the use of `LIBPROCESS_SSL_REQUIRE_CLIENT_CERT` is strongly suggested.
+
+
+# Environment Variables
 Once you have successfully built and installed your new binaries, here are the environment variables that are applicable to the `Master`, `Agent`, `Framework Scheduler/Executor`, or any `libprocess process`:
 
 **NOTE:** Prior to 1.0, the SSL related environment variables used to be prefixed by `SSL_`. However, we found that they may collide with other programs and lead to unexpected results (e.g., openssl, see [MESOS-5863](https://issues.apache.org/jira/browse/MESOS-5863) for details). To be backward compatible, we accept environment variables prefixed by both `SSL_` or `LIBPROCESS_SSL_`. New users should use the `LIBPROCESS_SSL_` version.
@@ -27,7 +70,14 @@ Once you have successfully built and installed your new binaries, here are the e
 Turn on or off SSL. When it is turned off it is the equivalent of default Mesos with libevent as the backing for events. All sockets default to the non-SSL implementation. When it is turned on, the default configuration for sockets is SSL. This means outgoing connections will use SSL, and incoming connections will be expected to speak SSL as well. None of the below flags are relevant if SSL is not enabled.  If SSL is enabled, `LIBPROCESS_SSL_CERT_FILE` and `LIBPROCESS_SSL_KEY_FILE` must be supplied.
 
 #### LIBPROCESS_SSL_SUPPORT_DOWNGRADE=(false|0,true|1) [default=false|0]
-Control whether or not non-SSL connections can be established. If this is enabled __on the accepting side__, then the accepting side will downgrade to a non-SSL socket if the connecting side is attempting to communicate via non-SSL. (e.g. HTTP). See [Upgrading Your Cluster](#Upgrading) for more details.
+Control whether or not non-SSL connections can be established. If this is enabled
+__on the accepting side__, then the accepting side will downgrade to a non-SSL socket if the
+connecting side is attempting to communicate via non-SSL. (e.g. HTTP).
+
+If this is enabled __on the connecting side__, then the connecting side will retry on a non-SSL
+socket if establishing the SSL connection failed.
+
+See [Upgrading Your Cluster](#Upgrading) for more details.
 
 #### LIBPROCESS_SSL_KEY_FILE=(path to key)
 The location of the private key used by OpenSSL.
@@ -41,21 +91,53 @@ openssl genrsa -des3 -f4 -passout pass:some_password -out key.pem 4096
 The location of the certificate that will be presented.
 
 ~~~
-// For example, to generate a certificate with OpenSSL:
-openssl req -new -x509 -passin pass:some_password -days 365 -key key.pem -out cert.pem
+// For example, to generate a root certificate with OpenSSL:
+// (assuming the signing key already exists in `key.pem`)
+openssl req -new -x509 -passin pass:some_password -days 365 -keyout key.pem -out cert.pem
 ~~~
 
 #### LIBPROCESS_SSL_VERIFY_CERT=(false|0,true|1) [default=false|0]
-Control whether certificates are verified when presented. If this is false, even when a certificate is presented, it will not be verified. When `LIBPROCESS_SSL_REQUIRE_CERT` is true, `LIBPROCESS_SSL_VERIFY_CERT` is overridden and all certificates will be verified _and_ required.
+This is a legacy alias for the `LIBPROCESS_SSL_VERIFY_SERVER_CERT` setting.
+
+#### LIBPROCESS_SSL_VERIFY_SERVER_CERT=(false|0,true|1) [default=false|0]
+This setting only affects the behaviour of libprocess in TLS client mode.
+
+If this is true, a remote server is required to present a server certificate,
+and the presented server certificates will be verified. That means
+it will be checked that the certificate is cryptographically valid,
+was generated by a trusted CA, and contains the correct hostname.
+
+If this is false, a remote server is still required to present a server certificate (unless
+an anonymous cipher is used), but the presented server certificates will not be verified.
+
+**NOTE:** When `LIBPROCESS_SSL_REQUIRE_CERT` is true, `LIBPROCESS_SSL_VERIFY_CERT` is automatically
+set to true for backwards compatibility reasons.
 
 #### LIBPROCESS_SSL_REQUIRE_CERT=(false|0,true|1) [default=false|0]
-Enforce that certificates must be presented by connecting clients. This means all connections (including tools hitting endpoints) must present valid certificates in order to establish a connection.
+This is a legacy alias for the `LIBPROCESS_SSL_REQUIRE_CLIENT_CERT` setting.
+
+#### LIBPROCESS_SSL_REQUIRE_CLIENT_CERT=(false|0,true|1) [default=false|0]
+This setting only affects the behaviour of libprocess in TLS server mode.
+
+If this is true, enforce that certificates must be presented by connecting clients. This means all
+connections (including external tooling trying to access HTTP endpoints, like web browsers etc.)
+must present valid certificates in order to establish a connection.
+
+**NOTE:** The specifics of what it means for the certificate to "contain the correct hostname"
+depend on the selected value of `LIBPROCESS_SSL_HOSTNAME_VALIDATION_SCHEME`.
+
+**NOTE:** If this is set to false, client certificates are not verified even if they are presented
+and `LIBPROCESS_SSL_VERIFY_CERT` is set to true.
 
 #### LIBPROCESS_SSL_VERIFY_DEPTH=(N) [default=4]
 The maximum depth used to verify certificates. The default is 4. See the OpenSSL documentation or contact your system administrator to learn why you may want to change this.
 
 #### LIBPROCESS_SSL_VERIFY_IPADD=(false|0,true|1) [default=false|0]
-Enable IP address verification in the certificate subject alternative name extension. When set to `true` the peer certificate verification will additionally use the IP address of a peer connection. When a hostname of the peer as well as its IP address are available, the validation will succeed when either the hostname or the IP match.
+Enable IP address verification in the certificate subject alternative name extension. When set
+to `true` the peer certificate verification will be able to use the IP address of a peer connection.
+
+The specifics on when a certificate containing an IP address will we accepted depend on the
+selected value of the `LIBPROCESS_SSL_HOSTNAME_VALIDATION_SCHEME`.
 
 #### LIBPROCESS_SSL_CA_DIR=(path to CA directory)
 The directory used to find the certificate authority / authorities. You can specify `LIBPROCESS_SSL_CA_DIR` or `LIBPROCESS_SSL_CA_FILE` depending on how you want to restrict your certificate authorization.
@@ -70,13 +152,58 @@ A list of `:`-separated ciphers. Use these if you want to restrict or open up th
 #### LIBPROCESS_SSL_ENABLE_TLS_V1_0=(false|0,true|1) [default=false|0]
 #### LIBPROCESS_SSL_ENABLE_TLS_V1_1=(false|0,true|1) [default=false|0]
 #### LIBPROCESS_SSL_ENABLE_TLS_V1_2=(false|0,true|1) [default=true|1]
+#### LIBPROCESS_SSL_ENABLE_TLS_V1_3=(false|0,true|1) [default=false|0]
 The above switches enable / disable the specified protocols. By default only TLS V1.2 is enabled. SSL V2 is always disabled; there is no switch to enable it. The mentality here is to restrict security by default, and force users to open it up explicitly. Many older version of the protocols have known vulnerabilities, so only enable these if you fully understand the risks.
+TLS V1.3 is not supported yet and should not be enabled. [MESOS-9730](https://issues.apache.org/jira/browse/MESOS-9730).
 _SSLv2 is disabled completely because modern versions of OpenSSL disable it using multiple compile time configuration options._
 #<a name="Dependencies"></a>Dependencies
 
 #### LIBPROCESS_SSL_ECDH_CURVE=(auto|list of curves separated by ':') [default=auto]
 List of elliptic curves which should be used for ECDHE-based cipher suites, in preferred order. Available values depend on the OpenSSL version used. Default value `auto` allows OpenSSL to pick the curve automatically.
 OpenSSL versions prior to `1.0.2` allow for the use of only one curve; in those cases, `auto` defaults to `prime256v1`.
+
+#### LIBPROCESS_SSL_HOSTNAME_VALIDATION_SCHEME=(legacy|openssl) [default=legacy]
+This flag is used to select the scheme by which the hostname validation check works.
+
+Since hostname validation is part of certificate verification, this flag has no
+effect unless one of `LIBPROCESS_SSL_VERIFY_SERVER_CERT` or `LIBPROCESS_SSL_REQUIRE_CLIENT_CERT`
+is set to true.
+
+Currently, it is possible to choose between two schemes:
+
+  - `openssl`:
+
+    In client mode: Perform the hostname validation checks during the TLS handshake.
+    If the client connects via hostname, accept the certificate if it contains
+    the hostname as common name (CN) or as a subject alternative name (SAN).
+    If the client connects via IP address and `LIBPROCESS_SSL_VERIFY_IPADD` is true,
+    accept the certificate if it contains the IP as a subject alternative name.
+
+    **NOTE:** If the client connects via IP address and `LIBPROCESS_SSL_VERIFY_IPADD` is false,
+    the connection attempt cannot succeed.
+
+    In server mode: Do not perform any hostname validation checks.
+
+    This setting requires OpenSSL >= 1.0.2 to be used.
+
+  - `legacy`:
+
+    Use a custom hostname validation algorithm that is run after the connection is established,
+    and immediately close the connection if it fails.
+
+    In both client and server mode:
+    Do a reverse DNS lookup on the peer IP. If `LIBPROCESS_SSL_VERIFY_IPADD` is set to `false`,
+    accept the certificate if it contains the first result of that lookup as either the common name
+    or as a subject alternative name. If `LIBPROCESS_SSL_VERIFY_IPADD` is set to `true`,
+    additionally accept the certificate if it contains the peer IP as a subject alternative name.
+
+
+It is suggested that operators choose the 'openssl' setting unless they have
+applications relying on the legacy behaviour of the 'libprocess' scheme. It is
+using standardized APIs (`X509_VERIFY_PARAM_check_{host,ip}`) provided by OpenSSL to
+make hostname validation more uniform across applications. It is also more secure,
+since attackers that are able to forge a DNS or rDNS result can launch a successful
+man-in-the-middle attack on the 'legacy' scheme.
 
 ### libevent
 We require the OpenSSL support from libevent. The suggested version of libevent is [`2.0.22-stable`](https://github.com/libevent/libevent/releases/tag/release-2.0.22-stable). As new releases come out we will try to maintain compatibility.

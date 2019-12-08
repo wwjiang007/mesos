@@ -25,6 +25,13 @@
 #include <stout/option.hpp>
 
 namespace mesos {
+
+namespace executor {
+
+class Call;
+
+} // namespace executor {
+
 namespace internal {
 namespace common {
 namespace validation {
@@ -53,6 +60,18 @@ Option<Error> validateContainerInfo(const ContainerInfo& containerInfo);
 
 Option<Error> validateGpus(
     const google::protobuf::RepeatedPtrField<Resource>& resources);
+
+Option<Error> validateHealthCheck(const HealthCheck& healthCheck);
+
+Option<Error> validateCheckInfo(const CheckInfo& checkInfo);
+
+Option<Error> validateCheckStatusInfo(const CheckStatusInfo& checkStatusInfo);
+
+Option<Error> validateExecutorCall(const mesos::executor::Call& call);
+
+Option<Error> validateOfferFilters(const OfferFilters& offerFilters);
+
+Option<Error> validateInputScalarValue(double value);
 
 } // namespace validation {
 } // namespace common {

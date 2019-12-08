@@ -6,6 +6,7 @@ libprocess provides general primitives and abstractions for asynchronous program
 
 ## Table of Contents
 
+* [Presentations](#presentations)
 * [Overview](#overview)
 * [Futures and Promises](#futures-and-promises)
 * [HTTP](#http)
@@ -15,6 +16,13 @@ libprocess provides general primitives and abstractions for asynchronous program
 * [Optimized Run Queue and Event Queue](#optimized-run-queue-event-queue)
 
 ---
+
+## <a name="presentations"></a> Presentations
+
+The following talks are recommended to get an overview of libprocess:
+
+* [libprocess, a concurrent and asynchronous programming library (San Francisco C++ Meetup)](https://www.youtube.com/watch?v=KjqaZYP0T2U)
+
 
 ## <a name="overview"></a> Overview
 
@@ -85,17 +93,17 @@ You can also add a callback to be invoked when (or if) a transition occurs (or h
 
 The following table is meant to capture these transitions:
 
-| Transition | `Promise::*()` | `Future::is*()` | `Future::on*()` |
-| ------ | -------------- | --------------- | --------------- |
-| `READY` | `Promise::set(T)` | `Future::isReady()` | `Future::onReady(F&&)` |
-| `FAILED` | `Promise::fail(const std::string&)` | `Future::isFailed()` | `Future::onFailed(F&&)` |
-| `DISCARDED` | `Promise::discard()` | `Future::isDiscarded()` | `Future::onDiscarded(F&&)` |
+| Transition  | `Promise::*()`                      | `Future::is*()`         | `Future::on*()`            |
+| ----------- | ----------------------------------- | ----------------------- | -------------------------- |
+| `READY`     | `Promise::set(T)`                   | `Future::isReady()`     | `Future::onReady(F&&)`     |
+| `FAILED`    | `Promise::fail(const std::string&)` | `Future::isFailed()`    | `Future::onFailed(F&&)`    |
+| `DISCARDED` | `Promise::discard()`                | `Future::isDiscarded()` | `Future::onDiscarded(F&&)` |
 
 > <br> Code Style: prefer [composition](#futures-and-promises-composition) using `Future::then()` and `Future::recover()` over `Future::onReady()`, `Future::onFailed()`, `Future::onDiscarded()`, and `Future::onAny()`. A good rule of thumb is if you find yourself creating your own instance of a `Promise` to compose an asynchronous operation you should use [composition](#futures-and-promises-composition) instead! <br><br>
 
 We use the macros `CHECK_PENDING()`, `CHECK_READY()`, `CHECK_FAILED()`, `CHECK_DISCARDED()` throughout our examples. See [`CHECK()` Overloads](#futures-and-promises-check-overloads) for more details about these macros.
 
-### <a name="futures-and-promises-discarding-a-future"></a> Disarding a Future (aka Cancellation)
+### <a name="futures-and-promises-discarding-a-future"></a> Discarding a Future (aka Cancellation)
 
 You can "cancel" the result of some asynchronous operation by discarding a future. Unlike doing a discard on a promise, _discarding a future is a request that may or may not be be satisfiable_. You discard a future using `Future::discard()`. You can determine if a future has a discard request by using `Future::hasDiscard()` or set up a callback using `Future::onDiscard()`. Here's an example:
 
@@ -236,12 +244,12 @@ Future<Person> mother(const std::string& name)
 
 Each of `Future::then()`, `Future::repair()`, and `Future::recover()` takes a callback that will be invoked after certain transitions, captured by this table:
 
-| Transition | `Future::*()` |
-| ------ | -------------- |
-| `READY` | `Future::then(F&&)` |
-| `FAILED` | `Future::repair(F&&)` and `Future::recover(F&&)` |
-| `DISCARDED` | `Future::recover(F&&)` |
-| Abandoned (`PENDING` and `Future::isAbandoned()`) | `Future::recover(F&&)` |
+| Transition                                        | `Future::*()`                                    |
+| ------------------------------------------------- | ------------------------------------------------ |
+| `READY`                                           | `Future::then(F&&)`                              |
+| `FAILED`                                          | `Future::repair(F&&)` and `Future::recover(F&&)` |
+| `DISCARDED`                                       | `Future::recover(F&&)`                           |
+| Abandoned (`PENDING` and `Future::isAbandoned()`) | `Future::recover(F&&)`                           |
 
 `Future::then()` allows you to _transform_ the type of the `Future` into a new type but both `Future::repair()` and `Future::recover()` must return the same type as `Future` because they may not get executed! Here's an example using `Future::recover()` to handle a failure:
 
@@ -384,7 +392,7 @@ using namespace process::http;
 class HttpProcess : public Process<HttpProcess>
 {
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     route("/testing", None(), [](const Request& request) {
       return testing(request.query);

@@ -82,6 +82,10 @@
 #include "internal/devolve.hpp"
 #include "internal/evolve.hpp"
 
+#ifdef ENABLE_LAUNCHER_SEALING
+#include "linux/memfd.hpp"
+#endif // ENABLE_LAUNCHER_SEALING
+
 #include "logging/logging.hpp"
 
 #include "messages/messages.hpp"
@@ -111,6 +115,8 @@ using mesos::Environment;
 using mesos::executor::Call;
 using mesos::executor::Event;
 
+using mesos::slave::ContainerLaunchInfo;
+
 using mesos::v1::executor::Mesos;
 using mesos::v1::executor::MesosBase;
 using mesos::v1::executor::V0ToV1Adapter;
@@ -131,6 +137,9 @@ public:
       const Option<Environment>& _taskEnvironment,
       const Option<CapabilityInfo>& _effectiveCapabilities,
       const Option<CapabilityInfo>& _boundingCapabilities,
+      const Option<string>& _ttySlavePath,
+      const Option<ContainerLaunchInfo>& _taskLaunchInfo,
+      const Option<vector<gid_t>> _taskSupplementaryGroups,
       const FrameworkID& _frameworkId,
       const ExecutorID& _executorId,
       const Duration& _shutdownGracePeriod)
@@ -140,6 +149,7 @@ public:
       launched(false),
       killed(false),
       killedByHealthCheck(false),
+      killedByMaxCompletionTimer(false),
       terminated(false),
       pid(None()),
       shutdownGracePeriod(_shutdownGracePeriod),
@@ -154,11 +164,14 @@ public:
       taskEnvironment(_taskEnvironment),
       effectiveCapabilities(_effectiveCapabilities),
       boundingCapabilities(_boundingCapabilities),
+      ttySlavePath(_ttySlavePath),
+      taskLaunchInfo(_taskLaunchInfo),
+      taskSupplementaryGroups(_taskSupplementaryGroups),
       frameworkId(_frameworkId),
       executorId(_executorId),
       lastTaskStatus(None()) {}
 
-  virtual ~CommandExecutor() = default;
+  ~CommandExecutor() override = default;
 
   void connected()
   {
@@ -251,6 +264,10 @@ public:
         break;
       }
 
+      case Event::HEARTBEAT: {
+        break;
+      }
+
       case Event::UNKNOWN: {
         LOG(WARNING) << "Received an UNKNOWN event and ignored";
         break;
@@ -259,7 +276,7 @@ public:
   }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     Option<string> value = os::getenv("MESOS_HTTP_COMMAND_EXECUTOR");
 
@@ -396,7 +413,7 @@ protected:
     delay(Seconds(1), self(), &Self::doReliableRegistration);
   }
 
-  static pid_t launchTaskSubprocess(
+  static Subprocess launchTaskSubprocess(
       const CommandInfo& command,
       const string& launcherDir,
       const Environment& environment,
@@ -405,12 +422,15 @@ protected:
       const Option<string>& sandboxDirectory,
       const Option<string>& workingDirectory,
       const Option<CapabilityInfo>& effectiveCapabilities,
-      const Option<CapabilityInfo>& boundingCapabilities)
+      const Option<CapabilityInfo>& boundingCapabilities,
+      const Option<string>& ttySlavePath,
+      const Option<ContainerLaunchInfo>& taskLaunchInfo,
+      const Option<vector<gid_t>>& taskSupplementaryGroups)
   {
     // Prepare the flags to pass to the launch process.
     slave::MesosContainerizerLaunch::Flags launchFlags;
 
-    ::mesos::slave::ContainerLaunchInfo launchInfo;
+    ContainerLaunchInfo launchInfo;
     launchInfo.mutable_command()->CopyFrom(command);
 
 #ifndef __WINDOWS__
@@ -472,16 +492,40 @@ protected:
           boundingCapabilities.get());
     }
 
+    if (taskLaunchInfo.isSome()) {
+      launchInfo.mutable_mounts()->CopyFrom(taskLaunchInfo->mounts());
+      launchInfo.mutable_file_operations()->CopyFrom(
+          taskLaunchInfo->file_operations());
+
+      launchInfo.mutable_pre_exec_commands()->CopyFrom(
+          taskLaunchInfo->pre_exec_commands());
+
+      launchInfo.mutable_clone_namespaces()->CopyFrom(
+          taskLaunchInfo->clone_namespaces());
+    }
+
+    if (taskSupplementaryGroups.isSome()) {
+      foreach (gid_t gid, taskSupplementaryGroups.get()) {
+        launchInfo.add_supplementary_groups(gid);
+      }
+    }
+
     launchFlags.launch_info = JSON::protobuf(launchInfo);
 
-    // TODO(tillt): Consider using a flag allowing / disallowing the
-    // log output of possibly sensitive data. See MESOS-7292.
-    string commandString = strings::format(
-        "%s %s <POSSIBLY-SENSITIVE-DATA>",
-        path::join(launcherDir, MESOS_CONTAINERIZER),
-        MesosContainerizerLaunch::NAME).get();
+    // Determine the mesos containerizer binary depends on whether we
+    // need to clone and seal it on linux.
+    string initPath = path::join(launcherDir, MESOS_CONTAINERIZER);
+#ifdef ENABLE_LAUNCHER_SEALING
+    // Clone the launcher binary in memory for security concerns.
+    Try<int_fd> memFd = memfd::cloneSealedFile(initPath);
+    if (memFd.isError()) {
+      ABORT(
+          "Failed to clone a sealed file '" + initPath + "' in memory: " +
+          memFd.error());
+    }
 
-    LOG(INFO) << "Running '" << commandString << "'";
+    initPath = "/proc/self/fd/" + stringify(memFd.get());
+#endif // ENABLE_LAUNCHER_SEALING
 
     // Fork the child using launcher.
     vector<string> argv(2);
@@ -498,8 +542,13 @@ protected:
         [](pid_t pid) { return os::set_job_kill_on_close_limit(pid); }));
 #endif // __WINDOWS__
 
+    vector<process::Subprocess::ChildHook> childHooks;
+    if (ttySlavePath.isNone()) {
+      childHooks.emplace_back(Subprocess::ChildHook::SETSID());
+    }
+
     Try<Subprocess> s = subprocess(
-        path::join(launcherDir, MESOS_CONTAINERIZER),
+        initPath,
         argv,
         Subprocess::FD(STDIN_FILENO),
         Subprocess::FD(STDOUT_FILENO),
@@ -508,13 +557,13 @@ protected:
         None(),
         None(),
         parentHooks,
-        {Subprocess::ChildHook::SETSID()});
+        childHooks);
 
     if (s.isError()) {
-      ABORT("Failed to launch '" + commandString + "': " + s.error());
+      ABORT("Failed to launch task subprocess: " + s.error());
     }
 
-    return s->pid();
+    return *s;
   }
 
   void launch(const TaskInfo& task)
@@ -641,14 +690,38 @@ protected:
       }
     }
 
+    // Set the `MESOS_ALLOCATION_ROLE` environment variable for the task.
+    // Please note that tasks are not allowed to mix resources allocated
+    // to different roles, see MESOS-6636.
+    Environment::Variable variable;
+    variable.set_name("MESOS_ALLOCATION_ROLE");
+    variable.set_type(Environment::Variable::VALUE);
+    variable.set_value(task.resources().begin()->allocation_info().role());
+    environment["MESOS_ALLOCATION_ROLE"] = variable;
+
     Environment launchEnvironment;
     foreachvalue (const Environment::Variable& variable, environment) {
       launchEnvironment.add_variables()->CopyFrom(variable);
     }
 
+    // Setup timer for max_completion_time.
+    if (task.max_completion_time().nanoseconds() > 0) {
+      Duration duration = Nanoseconds(task.max_completion_time().nanoseconds());
+
+      LOG(INFO) << "Task " << taskId.get() << " has a max completion time of "
+                << duration;
+
+      taskCompletionTimer = delay(
+          duration,
+          self(),
+          &Self::taskCompletionTimeout,
+          task.task_id(),
+          duration);
+    }
+
     LOG(INFO) << "Starting task " << taskId.get();
 
-    pid = launchTaskSubprocess(
+    Subprocess subprocess = launchTaskSubprocess(
         command,
         launcherDir,
         launchEnvironment,
@@ -657,7 +730,12 @@ protected:
         sandboxDirectory,
         workingDirectory,
         effectiveCapabilities,
-        boundingCapabilities);
+        boundingCapabilities,
+        ttySlavePath,
+        taskLaunchInfo,
+        taskSupplementaryGroups);
+
+    pid = subprocess.pid();
 
     LOG(INFO) << "Forked command at " << pid.get();
 
@@ -723,7 +801,7 @@ protected:
     }
 
     // Monitor this process.
-    process::reap(pid.get())
+    subprocess.status()
       .onAny(defer(self(), &Self::reaped, pid.get(), lambda::_1));
 
     TaskStatus status = createTaskStatus(taskId.get(), TASK_RUNNING);
@@ -734,6 +812,12 @@ protected:
 
   void kill(const TaskID& _taskId, const Option<KillPolicy>& override = None())
   {
+    // Cancel the taskCompletionTimer if it is set and ongoing.
+    if (taskCompletionTimer.isSome()) {
+      Clock::cancel(taskCompletionTimer.get());
+      taskCompletionTimer = None();
+    }
+
     // Default grace period is set to 3s for backwards compatibility.
     //
     // TODO(alexr): Replace it with a more meaningful default, e.g.
@@ -846,10 +930,13 @@ private:
       CHECK_SOME(taskId);
       CHECK(taskId.get() == _taskId);
 
-      if (protobuf::frameworkHasCapability(
+      if (!killedByMaxCompletionTimer &&
+          protobuf::frameworkHasCapability(
               frameworkInfo.get(),
               FrameworkInfo::Capability::TASK_KILLING_STATE)) {
-        TaskStatus status = createTaskStatus(taskId.get(), TASK_KILLING);
+        TaskStatus status =
+          createTaskStatus(taskId.get(), TASK_KILLING);
+
         forward(status);
       }
 
@@ -915,6 +1002,13 @@ private:
       Clock::cancel(killGracePeriodTimer.get());
     }
 
+    if (taskCompletionTimer.isSome()) {
+      Clock::cancel(taskCompletionTimer.get());
+      taskCompletionTimer = None();
+    }
+
+    Option<TaskStatus::Reason> reason = None();
+
     if (!status_.isReady()) {
       taskState = TASK_FAILED;
       message =
@@ -928,7 +1022,10 @@ private:
       CHECK(WIFEXITED(status) || WIFSIGNALED(status))
         << "Unexpected wait status " << status;
 
-      if (killed) {
+      if (killedByMaxCompletionTimer) {
+        taskState = TASK_FAILED;
+        reason = TaskStatus::REASON_MAX_COMPLETION_TIME_REACHED;
+      } else if (killed) {
         // Send TASK_KILLED if the task was killed as a result of
         // kill() or shutdown().
         taskState = TASK_KILLED;
@@ -948,7 +1045,7 @@ private:
     TaskStatus status = createTaskStatus(
         taskId.get(),
         taskState,
-        None(),
+        reason,
         message);
 
     // Indicate that a kill occurred due to a failing health check.
@@ -1006,6 +1103,23 @@ private:
                 << stringify(trees.get());
     }
   }
+
+
+  void taskCompletionTimeout(const TaskID& taskId, const Duration& duration)
+  {
+    CHECK(!terminated);
+    CHECK(!killed);
+
+    LOG(INFO) << "Killing task " << taskId
+              << " which exceeded its maximum completion time of " << duration;
+
+    taskCompletionTimer = None();
+    killedByMaxCompletionTimer = true;
+
+    // Use a zero gracePeriod to kill the task.
+    kill(taskId, Duration::zero());
+  }
+
 
   // Use this helper to create a status update from scratch, i.e., without
   // previously attached extra information like `data` or `check_status`.
@@ -1130,11 +1244,13 @@ private:
   bool launched;
   bool killed;
   bool killedByHealthCheck;
+  bool killedByMaxCompletionTimer;
+
   bool terminated;
 
   Option<Time> killGracePeriodStart;
   Option<Timer> killGracePeriodTimer;
-
+  Option<Timer> taskCompletionTimer;
   Option<pid_t> pid;
   Duration shutdownGracePeriod;
   Option<KillPolicy> killPolicy;
@@ -1149,6 +1265,9 @@ private:
   Option<Environment> taskEnvironment;
   Option<CapabilityInfo> effectiveCapabilities;
   Option<CapabilityInfo> boundingCapabilities;
+  Option<string> ttySlavePath;
+  Option<ContainerLaunchInfo> taskLaunchInfo;
+  Option<vector<gid_t>> taskSupplementaryGroups;
   const FrameworkID frameworkId;
   const ExecutorID executorId;
   Owned<MesosBase> mesos;
@@ -1208,6 +1327,18 @@ public:
         "bounding_capabilities",
         "The bounding set of capabilities the command can use.");
 
+    add(&Flags::task_launch_info,
+        "task_launch_info",
+        "The launch info to run the task.");
+
+    add(&Flags::tty_slave_path,
+        "tty_slave_path",
+        "A path to the slave end of the attached TTY if there is one.");
+
+    add(&Flags::task_supplementary_groups,
+        "task_supplementary_groups",
+        "Comma-separated list of supplementary groups to run the task with.");
+
     add(&Flags::launcher_dir,
         "launcher_dir",
         "Directory path of Mesos binaries.",
@@ -1225,6 +1356,9 @@ public:
   Option<Environment> task_environment;
   Option<mesos::CapabilityInfo> effective_capabilities;
   Option<mesos::CapabilityInfo> bounding_capabilities;
+  Option<string> tty_slave_path;
+  Option<JSON::Object> task_launch_info;
+  Option<vector<gid_t>> task_supplementary_groups;
   string launcher_dir;
 };
 
@@ -1289,6 +1423,19 @@ int main(int argc, char** argv)
     shutdownGracePeriod = parse.get();
   }
 
+  Option<ContainerLaunchInfo> task_launch_info;
+  if (flags.task_launch_info.isSome()) {
+    Try<ContainerLaunchInfo> parse =
+      protobuf::parse<ContainerLaunchInfo>(flags.task_launch_info.get());
+
+    if (parse.isError()) {
+      EXIT(EXIT_FAILURE)
+        << "Failed to parse task launch info: " << parse.error();
+    }
+
+    task_launch_info = parse.get();
+  }
+
   process::initialize();
 
   Owned<mesos::internal::CommandExecutor> executor(
@@ -1302,6 +1449,9 @@ int main(int argc, char** argv)
           flags.task_environment,
           flags.effective_capabilities,
           flags.bounding_capabilities,
+          flags.tty_slave_path,
+          task_launch_info,
+          flags.task_supplementary_groups,
           frameworkId,
           executorId,
           shutdownGracePeriod));

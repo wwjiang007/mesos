@@ -4,7 +4,7 @@ This directory contains bundled packages within the Mesos repository.
 
 ## Bundled Packages
 
-  - boost
+  - [boost](boost.md)
   - [concurrentqueue](concurrentqueue.md)
   - csi
   - elfio
@@ -19,6 +19,7 @@ This directory contains bundled packages within the Mesos repository.
   - picojson
   - pip
   - [protobuf](protobuf.md)
+  - [rapidjson](rapidjson.md)
   - setuptools
   - wheel
   - zookeeper

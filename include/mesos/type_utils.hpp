@@ -23,7 +23,10 @@
 
 #include <boost/functional/hash.hpp>
 
+#include <google/protobuf/map.h>
 #include <google/protobuf/repeated_field.h>
+
+#include <google/protobuf/util/message_differencer.h>
 
 #include <mesos/mesos.hpp>
 
@@ -59,6 +62,8 @@ bool operator==(
 bool operator==(const DiscoveryInfo& left, const DiscoveryInfo& right);
 bool operator==(const Environment& left, const Environment& right);
 bool operator==(const ExecutorInfo& left, const ExecutorInfo& right);
+bool operator==(const HealthCheck& left, const HealthCheck& right);
+bool operator==(const KillPolicy& left, const KillPolicy& right);
 bool operator==(const Label& left, const Label& right);
 bool operator==(const Labels& left, const Labels& right);
 bool operator==(const MasterInfo& left, const MasterInfo& right);
@@ -220,6 +225,18 @@ inline bool operator==(const DomainInfo& left, const DomainInfo& right)
 }
 
 
+inline bool operator==(const DrainInfo& left, const DrainInfo& right)
+{
+  return google::protobuf::util::MessageDifferencer::Equals(left, right);
+}
+
+
+inline bool operator==(const DrainConfig& left, const DrainConfig& right)
+{
+  return google::protobuf::util::MessageDifferencer::Equals(left, right);
+}
+
+
 /**
  * For machines to match, both the `hostname` and `ip` must be equivalent.
  * Hostname is not case sensitive, so it is lowercased before comparison.
@@ -321,6 +338,12 @@ inline bool operator<(const ContainerID& left, const ContainerID& right)
 }
 
 
+inline bool operator<(const DurationInfo& left, const DurationInfo& right)
+{
+  return left.nanoseconds() < right.nanoseconds();
+}
+
+
 inline bool operator<(const ExecutorID& left, const ExecutorID& right)
 {
   return left.value() < right.value();
@@ -380,6 +403,12 @@ std::ostream& operator<<(
 std::ostream& operator<<(std::ostream& stream, const DomainInfo& domainInfo);
 
 
+std::ostream& operator<<(std::ostream& stream, const DrainConfig& drainConfig);
+
+
+std::ostream& operator<<(std::ostream& stream, const DrainState& state);
+
+
 std::ostream& operator<<(std::ostream& stream, const Environment& environment);
 
 
@@ -402,6 +431,9 @@ std::ostream& operator<<(std::ostream& stream, const OperationID& operationId);
 
 
 std::ostream& operator<<(std::ostream& stream, const OperationState& state);
+
+
+std::ostream& operator<<(std::ostream& stream, const Operation& operation);
 
 
 std::ostream& operator<<(std::ostream& stream, const RateLimits& limits);
@@ -475,23 +507,6 @@ std::ostream& operator<<(
 template <typename T>
 inline std::ostream& operator<<(
     std::ostream& stream,
-    const google::protobuf::RepeatedPtrField<T>& messages)
-{
-  stream << "[ ";
-  for (auto it = messages.begin(); it != messages.end(); ++it) {
-    if (it != messages.begin()) {
-      stream << ", ";
-    }
-    stream << *it;
-  }
-  stream << " ]";
-  return stream;
-}
-
-
-template <typename T>
-inline std::ostream& operator<<(
-    std::ostream& stream,
     const std::vector<T>& messages)
 {
   stream << "[ ";
@@ -507,14 +522,87 @@ inline std::ostream& operator<<(
 
 } // namespace mesos {
 
+
+/**
+ * Type utilities for the protobuf library that are not specific to particular
+ * protobuf classes. They are defined in the `google::protobuf` namespace for
+ * argument-dependent lookup.
+ */
+namespace google {
+namespace protobuf {
+
+template <typename Key, typename Value>
+inline bool operator==(
+    const Map<Key, Value>& left, const Map<Key, Value>& right)
+{
+  if (left.size() != right.size()) {
+    return false;
+  }
+
+  for (auto it = left.begin(); it != left.end(); ++it) {
+    auto found = right.find(it->first);
+    if (found == right.end() || found->second != it->second) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
+template <typename Key, typename Value>
+inline bool operator!=(
+    const Map<Key, Value>& left, const Map<Key, Value>& right)
+{
+  return !(left == right);
+}
+
+
+template <typename Key, typename Value>
+inline std::ostream& operator<<(
+  std::ostream& stream, const Map<Key, Value>& map)
+{
+  stream << "{ ";
+  for (auto it = map.cbegin(); it != map.end(); ++it) {
+    if (it != map.cbegin()) {
+      stream << ", ";
+    }
+    stream << it->first << ": " << it->second;
+  }
+  stream << " }";
+
+  return stream;
+}
+
+
+template <typename T>
+inline std::ostream& operator<<(
+    std::ostream& stream,
+    const RepeatedPtrField<T>& messages)
+{
+  stream << "[ ";
+  for (auto it = messages.begin(); it != messages.end(); ++it) {
+    if (it != messages.begin()) {
+      stream << ", ";
+    }
+    stream << *it;
+  }
+  stream << " ]";
+  return stream;
+}
+
+} // namespace protobuf {
+} // namespace google {
+
+
 namespace std {
 
 template <>
-struct hash<mesos::CommandInfo_URI>
+struct hash<mesos::CommandInfo::URI>
 {
   typedef size_t result_type;
 
-  typedef mesos::CommandInfo_URI argument_type;
+  typedef mesos::CommandInfo::URI argument_type;
 
   result_type operator()(const argument_type& uri) const
   {
@@ -529,6 +617,7 @@ struct hash<mesos::CommandInfo_URI>
     }
 
     boost::hash_combine(seed, uri.value());
+    boost::hash_combine(seed, uri.output_file());
     return seed;
   }
 };
@@ -590,6 +679,38 @@ struct hash<mesos::FrameworkID>
 
 
 template <>
+struct hash<mesos::Image::Type>
+{
+  typedef size_t result_type;
+
+  typedef mesos::Image::Type argument_type;
+
+  result_type operator()(const argument_type& imageType) const
+  {
+    // Use the underlying type of the enum as hash value.
+    return static_cast<size_t>(imageType);
+  }
+};
+
+
+template <>
+struct hash<mesos::MachineID>
+{
+  typedef size_t result_type;
+
+  typedef mesos::MachineID argument_type;
+
+  result_type operator()(const argument_type& machineId) const
+  {
+    size_t seed = 0;
+    boost::hash_combine(seed, strings::lower(machineId.hostname()));
+    boost::hash_combine(seed, machineId.ip());
+    return seed;
+  }
+};
+
+
+template <>
 struct hash<mesos::OfferID>
 {
   typedef size_t result_type;
@@ -600,6 +721,38 @@ struct hash<mesos::OfferID>
   {
     size_t seed = 0;
     boost::hash_combine(seed, offerId.value());
+    return seed;
+  }
+};
+
+
+template <>
+struct hash<mesos::OperationID>
+{
+  typedef size_t result_type;
+
+  typedef mesos::OperationID argument_type;
+
+  result_type operator()(const argument_type& operationId) const
+  {
+    size_t seed = 0;
+    boost::hash_combine(seed, operationId.value());
+    return seed;
+  }
+};
+
+
+template <>
+struct hash<mesos::ResourceProviderID>
+{
+  typedef size_t result_type;
+
+  typedef mesos::ResourceProviderID argument_type;
+
+  result_type operator()(const argument_type& resourceProviderId) const
+  {
+    size_t seed = 0;
+    boost::hash_combine(seed, resourceProviderId.value());
     return seed;
   }
 };
@@ -683,16 +836,17 @@ struct hash<mesos::TaskStatus_Reason>
 
 
 template <>
-struct hash<mesos::Image::Type>
+struct hash<mesos::UUID>
 {
   typedef size_t result_type;
 
-  typedef mesos::Image::Type argument_type;
+  typedef mesos::UUID argument_type;
 
-  result_type operator()(const argument_type& imageType) const
+  result_type operator()(const argument_type& uuid) const
   {
-    // Use the underlying type of the enum as hash value.
-    return static_cast<size_t>(imageType);
+    size_t seed = 0;
+    boost::hash_combine(seed, uuid.value());
+    return seed;
   }
 };
 
@@ -716,65 +870,18 @@ struct hash<std::pair<mesos::FrameworkID, mesos::ExecutorID>>
 
 
 template <>
-struct hash<mesos::MachineID>
+struct hash<std::pair<mesos::FrameworkID, mesos::OperationID>>
 {
   typedef size_t result_type;
 
-  typedef mesos::MachineID argument_type;
+  typedef std::pair<
+      mesos::FrameworkID, mesos::OperationID> argument_type;
 
-  result_type operator()(const argument_type& machineId) const
+  result_type operator()(const argument_type& pair) const
   {
     size_t seed = 0;
-    boost::hash_combine(seed, strings::lower(machineId.hostname()));
-    boost::hash_combine(seed, machineId.ip());
-    return seed;
-  }
-};
-
-
-template <>
-struct hash<mesos::OperationID>
-{
-  typedef size_t result_type;
-
-  typedef mesos::OperationID argument_type;
-
-  result_type operator()(const argument_type& operationId) const
-  {
-    size_t seed = 0;
-    boost::hash_combine(seed, operationId.value());
-    return seed;
-  }
-};
-
-
-template <>
-struct hash<mesos::ResourceProviderID>
-{
-  typedef size_t result_type;
-
-  typedef mesos::ResourceProviderID argument_type;
-
-  result_type operator()(const argument_type& resourceProviderId) const
-  {
-    size_t seed = 0;
-    boost::hash_combine(seed, resourceProviderId.value());
-    return seed;
-  }
-};
-
-
-template <>
-struct hash<mesos::UUID>
-{
-  typedef size_t result_type;
-
-  typedef mesos::UUID argument_type;
-
-  result_type operator()(const argument_type& uuid) const
-  {
-    size_t seed = 0;
-    boost::hash_combine(seed, uuid.value());
+    boost::hash_combine(seed, std::hash<mesos::FrameworkID>()(pair.first));
+    boost::hash_combine(seed, std::hash<mesos::OperationID>()(pair.second));
     return seed;
   }
 };

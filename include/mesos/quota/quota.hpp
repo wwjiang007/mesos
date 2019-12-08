@@ -17,15 +17,28 @@
 #ifndef __MESOS_QUOTA_PROTO_HPP__
 #define __MESOS_QUOTA_PROTO_HPP__
 
+#include <mesos/resource_quantities.hpp>
+
 // ONLY USEFUL AFTER RUNNING PROTOC.
 #include <mesos/quota/quota.pb.h>
 
-// A C++ wrapper for `QuotaInfo` used to communicate between the
-// Allocator and Master.
+namespace mesos {
+
 struct Quota
 {
-  // Holds the quota protobuf, as constructed from an operator's request.
-  mesos::quota::QuotaInfo info;
+  ResourceQuantities guarantees;
+  ResourceLimits limits;
+
+  Quota() {};
+
+  Quota(const mesos::quota::QuotaConfig& config);
+  Quota(const mesos::quota::QuotaInfo& info);
+  Quota(const mesos::quota::QuotaRequest& request);
+
+  bool operator==(const Quota& quota) const;
+  bool operator!=(const Quota& quota) const;
 };
+
+} // namespace mesos {
 
 #endif // __MESOS_QUOTA_PROTO_HPP__

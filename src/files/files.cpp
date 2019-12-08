@@ -121,7 +121,7 @@ public:
       const Option<Principal>& principal);
 
 protected:
-  virtual void initialize();
+  void initialize() override;
 
 private:
   // Resolves the virtual path to an actual path.
@@ -222,25 +222,6 @@ FilesProcess::FilesProcess(
 
 void FilesProcess::initialize()
 {
-    // TODO(ijimenez): Remove these endpoints at the end of the
-    // deprecation cycle on 0.26.
-    route("/browse.json",
-          authenticationRealm,
-          FilesProcess::BROWSE_HELP,
-          &FilesProcess::loggedBrowse);
-    route("/read.json",
-          authenticationRealm,
-          FilesProcess::READ_HELP,
-          &FilesProcess::loggedRead);
-    route("/download.json",
-          authenticationRealm,
-          FilesProcess::DOWNLOAD_HELP,
-          &FilesProcess::loggedDownload);
-    route("/debug.json",
-          authenticationRealm,
-          FilesProcess::DEBUG_HELP,
-          &FilesProcess::loggedDebug);
-
     route("/browse",
           authenticationRealm,
           FilesProcess::BROWSE_HELP,
@@ -530,8 +511,8 @@ Future<http::Response> FilesProcess::__read(
 
   off_t offset = -1;
 
-  if (request.url.query.get("offset").isSome()) {
-    Try<off_t> result = numify<off_t>(request.url.query.get("offset").get());
+  if (request.url.query.contains("offset")) {
+    Try<off_t> result = numify<off_t>(request.url.query.at("offset"));
 
     if (result.isError()) {
       return BadRequest("Failed to parse offset: " + result.error() + ".\n");
@@ -547,9 +528,9 @@ Future<http::Response> FilesProcess::__read(
 
   Option<size_t> length;
 
-  if (request.url.query.get("length").isSome()) {
+  if (request.url.query.contains("length")) {
     Try<ssize_t> result = numify<ssize_t>(
-        request.url.query.get("length").get());
+        request.url.query.at("length"));
 
     if (result.isError()) {
       return BadRequest("Failed to parse length: " + result.error() + ".\n");
@@ -711,10 +692,10 @@ Future<Try<tuple<size_t, string>, FilesError>> FilesProcess::_read(
     return FilesError(FilesError::Type::UNKNOWN, error);
   }
 
-  Try<Nothing> nonblock = os::nonblock(fd.get());
-  if (nonblock.isError()) {
+  Try<Nothing> async = io::prepare_async(fd.get());
+  if (async.isError()) {
     string error =
-        "Failed to set file descriptor nonblocking: " + nonblock.error();
+        "Failed to make file descriptor asynchronous: " + async.error();
     LOG(WARNING) << error;
     os::close(fd.get());
     return FilesError(FilesError::Type::UNKNOWN, error);

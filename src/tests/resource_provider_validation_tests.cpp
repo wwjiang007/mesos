@@ -43,7 +43,7 @@ TEST(ResourceProviderCallValidationTest, Subscribe)
   call.set_type(Call::SUBSCRIBE);
 
   // Expecting `Call::Subscribe`.
-  Option<Error> error = call::validate(call);
+  Option<Error> error = call::validate(call, None());
   EXPECT_SOME(error);
 
   Call::Subscribe* subscribe = call.mutable_subscribe();
@@ -51,7 +51,7 @@ TEST(ResourceProviderCallValidationTest, Subscribe)
   info->set_type("org.apache.mesos.rp.test");
   info->set_name("test");
 
-  error = call::validate(call);
+  error = call::validate(call, None());
   EXPECT_NONE(error);
 }
 
@@ -62,14 +62,14 @@ TEST(ResourceProviderCallValidationTest, UpdateOperationStatus)
   call.set_type(Call::UPDATE_OPERATION_STATUS);
 
   // Expecting a resource provider ID and `Call::UpdateOperationStatus`.
-  Option<Error> error = call::validate(call);
+  Option<Error> error = call::validate(call, None());
   EXPECT_SOME(error);
 
   ResourceProviderID* id = call.mutable_resource_provider_id();
   id->set_value(id::UUID::random().toString());
 
   // Still expecting `Call::UpdateOperationStatus`.
-  error = call::validate(call);
+  error = call::validate(call, None());
   EXPECT_SOME(error);
 
   Call::UpdateOperationStatus* update =
@@ -82,7 +82,24 @@ TEST(ResourceProviderCallValidationTest, UpdateOperationStatus)
   status->mutable_operation_id()->set_value(id::UUID::random().toString());
   status->set_state(OPERATION_FINISHED);
 
-  error = call::validate(call);
+  error = call::validate(call, None());
+  EXPECT_NONE(error);
+
+  // If given some `ResourceProviderInfo` the call is rejected
+  // since above status had no resource provider ID set.
+  ResourceProviderInfo resourceProviderInfo;
+  resourceProviderInfo.set_type("org.apache.mesos.rp.test");
+  resourceProviderInfo.set_name("test");
+  resourceProviderInfo.mutable_id()->set_value("test_id");
+
+  error = call::validate(call, resourceProviderInfo);
+  EXPECT_SOME(error);
+
+  // If the provider of the operation state is consistent
+  // with the given provider info the call validates.
+  status->mutable_resource_provider_id()->CopyFrom(resourceProviderInfo.id());
+
+  error = call::validate(call, resourceProviderInfo);
   EXPECT_NONE(error);
 }
 
@@ -93,21 +110,49 @@ TEST(ResourceProviderCallValidationTest, UpdateState)
   call.set_type(Call::UPDATE_STATE);
 
   // Expecting a resource provider ID and `Call::UpdateState`.
-  Option<Error> error = call::validate(call);
+  Option<Error> error = call::validate(call, None());
   EXPECT_SOME(error);
 
   ResourceProviderID* id = call.mutable_resource_provider_id();
   id->set_value(id::UUID::random().toString());
 
   // Still expecting `Call::UpdateState`.
-  error = call::validate(call);
+  error = call::validate(call, None());
   EXPECT_SOME(error);
 
   Call::UpdateState* updateState = call.mutable_update_state();
   updateState->mutable_resource_version_uuid()->CopyFrom(
       protobuf::createUUID());
 
-  error = call::validate(call);
+  error = call::validate(call, None());
+  EXPECT_NONE(error);
+
+  // If given some `ResourceProviderInfo` the call still validates.
+  ResourceProviderInfo resourceProviderInfo;
+  resourceProviderInfo.set_type("org.apache.mesos.rp.test");
+  resourceProviderInfo.set_name("test");
+  resourceProviderInfo.mutable_id()->set_value("test_id");
+
+  error = call::validate(call, resourceProviderInfo);
+  EXPECT_NONE(error);
+
+  // Adding resource without `provider_id` if given a provider is not rejected.
+  Resource* resource = updateState->add_resources();
+  resource->CopyFrom(*Resources::parse("disk", "1024", "*"));
+
+  error = call::validate(call, resourceProviderInfo);
+  EXPECT_SOME(error);
+
+  // A resource with a `provider_id` not matching the provider is rejected.
+  resource->mutable_provider_id()->set_value("another_id");
+
+  error = call::validate(call, resourceProviderInfo);
+  EXPECT_SOME(error);
+
+  // The call is accepted if the resource's `provider_id` matches the provider.
+  resource->mutable_provider_id()->CopyFrom(resourceProviderInfo.id());
+
+  error = call::validate(call, resourceProviderInfo);
   EXPECT_NONE(error);
 }
 

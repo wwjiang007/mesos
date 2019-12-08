@@ -41,9 +41,11 @@ if (NOT WIN32)
   add_executable(disk-full-framework           disk_full_framework.cpp)
   add_executable(docker-no-executor-framework  docker_no_executor_framework.cpp)
   add_executable(dynamic-reservation-framework dynamic_reservation_framework.cpp)
+  add_executable(inverse-offer-framework       inverse_offer_framework.cpp)
   add_executable(load-generator-framework      load_generator_framework.cpp)
   add_executable(long-lived-executor           long_lived_executor.cpp)
   add_executable(long-lived-framework          long_lived_framework.cpp)
+  add_executable(operation-feedback-framework  operation_feedback_framework.cpp)
   add_executable(no-executor-framework         no_executor_framework.cpp)
   add_executable(persistent-volume-framework   persistent_volume_framework.cpp)
   add_executable(test-executor                 test_executor.cpp)
@@ -51,6 +53,11 @@ if (NOT WIN32)
   add_executable(test-http-executor            test_http_executor.cpp)
   add_executable(test-http-framework           test_http_framework.cpp)
   add_executable(test-csi-user-framework       test_csi_user_framework.cpp)
+
+  # TODO(chhsiao): The test CSI plugin is Linux only for now.
+  if (LINUX)
+    add_executable(test-csi-plugin test_csi_plugin.cpp)
+  endif ()
 
   # NOTE: Do not replace this with `link_libraries()`. While it may result in
   # less code, it is deprecated and relies on side effects instead of
@@ -74,9 +81,11 @@ if (NOT WIN32)
   target_link_libraries(disk-full-framework           PRIVATE mesos)
   target_link_libraries(docker-no-executor-framework  PRIVATE mesos)
   target_link_libraries(dynamic-reservation-framework PRIVATE mesos)
+  target_link_libraries(inverse-offer-framework       PRIVATE mesos)
   target_link_libraries(load-generator-framework      PRIVATE mesos)
   target_link_libraries(long-lived-executor           PRIVATE mesos)
   target_link_libraries(long-lived-framework          PRIVATE mesos)
+  target_link_libraries(operation-feedback-framework  PRIVATE mesos)
   target_link_libraries(no-executor-framework         PRIVATE mesos)
   target_link_libraries(persistent-volume-framework   PRIVATE mesos)
   target_link_libraries(test-executor                 PRIVATE mesos)
@@ -84,4 +93,11 @@ if (NOT WIN32)
   target_link_libraries(test-http-executor            PRIVATE mesos)
   target_link_libraries(test-http-framework           PRIVATE mesos)
   target_link_libraries(test-csi-user-framework       PRIVATE mesos)
+
+  # TODO(chhsiao): The test CSI plugin is Linux only for now.
+  if (LINUX)
+    # NOTE: We explicitly add `grpc` here since the test CSI plugin uses the
+    # server-side gRPC library, which might not be linked in mesos.
+    target_link_libraries(test-csi-plugin PRIVATE mesos grpc)
+  endif ()
 endif ()

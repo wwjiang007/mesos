@@ -60,6 +60,8 @@ public:
   std::string docker_registry;
   std::string docker_store_dir;
   std::string docker_volume_checkpoint_dir;
+  bool docker_volume_chown;
+  bool docker_ignore_runtime;
 
   std::string default_role;
   Option<std::string> attributes;
@@ -69,16 +71,19 @@ public:
   std::string work_dir;
   std::string runtime_dir;
   std::string launcher_dir;
-  std::string hadoop_home; // TODO(benh): Make an Option.
+  Option<std::string> hadoop_home;
   size_t max_completed_executors_per_framework;
 
 #ifndef __WINDOWS__
   bool switch_user;
+  Option<std::string> volume_gid_range;
 #endif // __WINDOWS__
   Duration http_heartbeat_interval;
   std::string frameworks_home;  // TODO(benh): Make an Option.
   Duration registration_backoff_factor;
   Duration authentication_backoff_factor;
+  Duration authentication_timeout_min;
+  Duration authentication_timeout_max;
   Option<JSON::Object> executor_environment_variables;
   Duration executor_registration_timeout;
   Duration executor_reregistration_timeout;
@@ -89,6 +94,7 @@ public:
 #endif // USE_SSL_SOCKET
   Duration gc_delay;
   double gc_disk_headroom;
+  bool gc_non_executor_container_sandboxes;
   Duration disk_watch_interval;
 
   Option<std::string> container_logger;
@@ -99,6 +105,7 @@ public:
   bool strict;
   Duration register_retry_interval_min;
 #ifdef __linux__
+  Duration cgroups_destroy_timeout;
   std::string cgroups_hierarchy;
   std::string cgroups_root;
   bool cgroups_enable_cfs;
@@ -108,6 +115,7 @@ public:
   Option<std::string> cgroups_net_cls_secondary_handles;
   Option<DeviceWhitelist> allowed_devices;
   Option<std::string> agent_subsystems;
+  Option<std::string> host_path_volume_force_creation;
   Option<std::vector<unsigned int>> nvidia_gpu_devices;
   Option<std::string> perf_events;
   Duration perf_interval;
@@ -117,6 +125,8 @@ public:
   std::string systemd_runtime_directory;
   Option<CapabilityInfo> effective_capabilities;
   Option<CapabilityInfo> bounding_capabilities;
+  Option<Bytes> default_container_shm_size;
+  bool disallow_sharing_agent_ipc_namespace;
   bool disallow_sharing_agent_pid_namespace;
 #endif
   Option<Firewall> firewall_rules;
@@ -152,10 +162,14 @@ public:
 #ifdef ENABLE_NETWORK_PORTS_ISOLATOR
   Duration container_ports_watch_interval;
   bool check_agent_port_range_only;
+  bool enforce_container_ports;
+  Option<std::string> container_ports_isolated_range;
 #endif // ENABLE_NETWORK_PORTS_ISOLATOR
 
   Option<std::string> network_cni_plugins_dir;
   Option<std::string> network_cni_config_dir;
+  bool network_cni_root_dir_persist;
+  bool network_cni_metrics;
   Duration container_disk_watch_interval;
   bool enforce_container_disk_quota;
   Option<Modules> modules;
@@ -178,6 +192,11 @@ public:
   Option<std::string> master_detector;
 #if ENABLE_XFS_DISK_ISOLATOR
   std::string xfs_project_range;
+  bool xfs_kill_containers;
+#endif
+#if ENABLE_SECCOMP_ISOLATOR
+  Option<std::string> seccomp_config_dir;
+  Option<std::string> seccomp_profile_name;
 #endif
   bool http_command_executor;
   Option<SlaveCapabilities> agent_features;

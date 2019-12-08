@@ -74,7 +74,7 @@ class ProcessBase : public EventConsumer
 public:
   explicit ProcessBase(const std::string& id = "");
 
-  virtual ~ProcessBase();
+  ~ProcessBase() override;
 
   const UPID& self() const { return pid; }
 
@@ -418,7 +418,11 @@ private:
   std::atomic<bool> termination = ATOMIC_VAR_INIT(false);
 
   // Enqueue the specified message, request, or function call.
-  void enqueue(Event* event);
+  // Returns false if not enqueued (i.e. the process is terminating).
+  // In this case the caller retains ownership of the event.
+  // Should not be called directly, callers should go through
+  // `ProcessManager::deliver(...)`.
+  bool enqueue(Event* event);
 
   // Delegates for messages.
   std::map<std::string, UPID> delegates;
@@ -500,7 +504,7 @@ private:
 template <typename T>
 class Process : public virtual ProcessBase {
 public:
-  virtual ~Process() {}
+  ~Process() override {}
 
   /**
    * Returns the `PID` of the process.

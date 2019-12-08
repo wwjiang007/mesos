@@ -18,7 +18,7 @@
 Mesos CLI unit tests module.
 """
 
-# pylint: disable=W0401
+# pylint: disable=cyclic-import,wildcard-import
 from .base import *
 
 from .agent import *

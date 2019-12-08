@@ -366,7 +366,7 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_Log_00024Writer_append
          ? position.failure().c_str()
          : "Discarded future"));
     return nullptr;
-  } else if (position.get().isNone()) {
+  } else if (position->isNone()) {
     // Lost exclusive write promise.
     env->ReleaseByteArrayElements(jdata, temp, 0);
     clazz = env->FindClass("org/apache/mesos/Log$WriterFailedException");
@@ -378,7 +378,7 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_Log_00024Writer_append
 
   env->ReleaseByteArrayElements(jdata, temp, 0);
 
-  jobject jposition = convert<Log::Position>(env, position.get().get());
+  jobject jposition = convert<Log::Position>(env, position->get());
 
   return jposition;
 }
@@ -430,7 +430,7 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_Log_00024Writer_truncate
          ? position.failure().c_str()
          : "Discarded future"));
     return nullptr;
-  } else if (position.get().isNone()) {
+  } else if (position->isNone()) {
     // Lost exclusive write promise.
     clazz = env->FindClass("org/apache/mesos/Log$WriterFailedException");
     env->ThrowNew(
@@ -439,7 +439,7 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_Log_00024Writer_truncate
     return nullptr;
   }
 
-  jobject jposition = convert<Log::Position>(env, position.get().get());
+  jobject jposition = convert<Log::Position>(env, position->get());
 
   return jposition;
 }
@@ -497,7 +497,7 @@ JNIEXPORT void JNICALL Java_org_apache_mesos_Log_00024Writer_initialize
       // Cancel the pending start. It is likely that we'll retry right
       // away but that is safe.
       position.discard();
-    } else if (position.isReady() && position.get().isSome()) {
+    } else if (position.isReady() && position->isSome()) {
       // Started!
       break;
     }
@@ -532,7 +532,7 @@ JNIEXPORT void JNICALL Java_org_apache_mesos_Log_00024Writer_finalize
  * Method:    initialize
  * Signature: (ILjava/lang/String;Ljava/util/Set;)V
  */
-JNIEXPORT void JNICALL Java_org_apache_mesos_Log_initialize__ILjava_lang_String_2Ljava_util_Set_2
+JNIEXPORT void JNICALL Java_org_apache_mesos_Log_initialize__ILjava_lang_String_2Ljava_util_Set_2 // NOLINT(whitespace/line_length)
   (JNIEnv* env,
    jobject thiz,
    jint jquorum,
@@ -584,7 +584,7 @@ JNIEXPORT void JNICALL Java_org_apache_mesos_Log_initialize__ILjava_lang_String_
  * Method:    initialize
  * Signature: (ILjava/lang/String;Ljava/lang/String;JLjava/util/concurrent/TimeUnit;Ljava/lang/String;)V
  */
-JNIEXPORT void JNICALL Java_org_apache_mesos_Log_initialize__ILjava_lang_String_2Ljava_lang_String_2JLjava_util_concurrent_TimeUnit_2Ljava_lang_String_2
+JNIEXPORT void JNICALL Java_org_apache_mesos_Log_initialize__ILjava_lang_String_2Ljava_lang_String_2JLjava_util_concurrent_TimeUnit_2Ljava_lang_String_2 // NOLINT(whitespace/line_length)
   (JNIEnv* env,
    jobject thiz,
    jint jquorum,
@@ -611,7 +611,7 @@ JNIEXPORT void JNICALL Java_org_apache_mesos_Log_initialize__ILjava_lang_String_
 
   std::string znode = construct<std::string>(env, jznode);
 
-   // Create the C++ Log and initialize the __log variable.
+  // Create the C++ Log and initialize the __log variable.
   Log* log = new Log(quorum, path, servers, seconds, znode);
 
   clazz = env->GetObjectClass(thiz);
@@ -626,7 +626,7 @@ JNIEXPORT void JNICALL Java_org_apache_mesos_Log_initialize__ILjava_lang_String_
  * Method:    initialize
  * Signature: (ILjava/lang/String;Ljava/lang/String;JLjava/util/concurrent/TimeUnit;Ljava/lang/String;Ljava/lang/String;[B)V
  */
-JNIEXPORT void JNICALL Java_org_apache_mesos_Log_initialize__ILjava_lang_String_2Ljava_lang_String_2JLjava_util_concurrent_TimeUnit_2Ljava_lang_String_2Ljava_lang_String_2_3B
+JNIEXPORT void JNICALL Java_org_apache_mesos_Log_initialize__ILjava_lang_String_2Ljava_lang_String_2JLjava_util_concurrent_TimeUnit_2Ljava_lang_String_2Ljava_lang_String_2_3B  // NOLINT(whitespace/line_length)
   (JNIEnv* env,
    jobject thiz,
    jint jquorum,

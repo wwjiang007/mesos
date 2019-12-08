@@ -27,10 +27,13 @@
 
 #include <stout/internal/windows/longpath.hpp>
 
-
 namespace os {
 
-inline Try<Nothing> mkdir(const std::string& directory, bool recursive = true)
+// NOTE: `sync` has no effect on Windows.
+inline Try<Nothing> mkdir(
+    const std::string& directory,
+    bool recursive = true,
+    bool sync = false)
 {
   if (!recursive) {
     // NOTE: We check for existence because parts of certain directories
@@ -40,7 +43,7 @@ inline Try<Nothing> mkdir(const std::string& directory, bool recursive = true)
       return Nothing();
     }
 
-    std::wstring longpath = ::internal::windows::longpath(directory);
+    const std::wstring longpath = ::internal::windows::longpath(directory);
     if (::CreateDirectoryW(longpath.data(), nullptr) == 0) {
       return WindowsError("Failed to create directory: " + directory);
     }
@@ -48,7 +51,7 @@ inline Try<Nothing> mkdir(const std::string& directory, bool recursive = true)
     // Remove the long path prefix, if it already exists, otherwise the
     // tokenizer includes the long path prefix (`\\?\`) as the first part
     // of the path.
-    std::vector<std::string> tokens = strings::tokenize(
+    const std::vector<std::string> tokens = strings::tokenize(
         strings::remove(directory, os::LONGPATH_PREFIX, strings::Mode::PREFIX),
         stringify(os::PATH_SEPARATOR));
 
@@ -56,7 +59,7 @@ inline Try<Nothing> mkdir(const std::string& directory, bool recursive = true)
 
     foreach (const std::string& token, tokens) {
       path += token + os::PATH_SEPARATOR;
-      Try<Nothing> result = mkdir(path, false);
+      const Try<Nothing> result = mkdir(path, false);
       if (result.isError()) {
         return result;
       }

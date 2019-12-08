@@ -45,7 +45,7 @@ namespace {
 Option<Error> validate(const mesos::v1::resource_provider::Call& call)
 {
   return mesos::internal::resource_provider::validation::call::validate(
-      mesos::internal::devolve(call));
+      mesos::internal::devolve(call), None());
 }
 
 } // namespace {
@@ -60,11 +60,12 @@ Driver::Driver(
     const function<void(void)>& connected,
     const function<void(void)>& disconnected,
     const function<void(const queue<Event>&)>& received,
-    const Option<Credential>& credential)
+    const Option<string>& token)
   : process(new DriverProcess(
         "resource-provider-driver",
         std::move(detector),
         contentType,
+        token,
         validate,
         connected,
         disconnected,

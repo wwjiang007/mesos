@@ -54,12 +54,16 @@ namespace internal {
 CommandInfo devolve(const v1::CommandInfo& command);
 ContainerID devolve(const v1::ContainerID& containerId);
 Credential devolve(const v1::Credential& credential);
+DrainConfig devolve(const v1::DrainConfig& drainConfig);
+DrainInfo devolve(const v1::DrainInfo& drainInfo);
+DurationInfo devolve(const google::protobuf::Duration& duration);
 ExecutorID devolve(const v1::ExecutorID& executorId);
 FrameworkID devolve(const v1::FrameworkID& frameworkId);
 FrameworkInfo devolve(const v1::FrameworkInfo& frameworkInfo);
 HealthCheck devolve(const v1::HealthCheck& check);
 InverseOffer devolve(const v1::InverseOffer& inverseOffer);
 Offer devolve(const v1::Offer& offer);
+Offer::Operation devolve(const v1::Offer::Operation& operation);
 OperationStatus devolve(const v1::OperationStatus& status);
 Resource devolve(const v1::Resource& resource);
 ResourceProviderID devolve(const v1::ResourceProviderID& resourceProviderId);
@@ -75,13 +79,14 @@ mesos::resource_provider::Call devolve(const v1::resource_provider::Call& call);
 mesos::resource_provider::Event devolve(
     const v1::resource_provider::Event& event);
 
-scheduler::Call devolve(const v1::scheduler::Call& call);
-scheduler::Event devolve(const v1::scheduler::Event& event);
+mesos::scheduler::Call devolve(const v1::scheduler::Call& call);
+mesos::scheduler::Event devolve(const v1::scheduler::Event& event);
 
 executor::Call devolve(const v1::executor::Call& call);
 executor::Event devolve(const v1::executor::Event& event);
 
 mesos::agent::Call devolve(const v1::agent::Call& call);
+mesos::agent::Response devolve(const v1::agent::Response& response);
 
 mesos::master::Call devolve(const v1::master::Call& call);
 

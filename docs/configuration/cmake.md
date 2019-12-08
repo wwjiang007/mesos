@@ -108,6 +108,24 @@ See more information in the [CMake documentation](../cmake.md).
   </tr>
   <tr>
     <td>
+      -DUNBUNDLED_LIBEVENT=(TRUE|FALSE)
+    </td>
+    <td>
+      Build libprocess with an installed libevent version instead of the bundled.
+      [default=TRUE for macOS, FALSE otherwise]
+    </td>
+  </tr>
+  <tr>
+    <td>
+      -DLIBEVENT_ROOT_DIR=[path]
+    </td>
+    <td>
+      Specify the path to libevent, e.g. "C:\libevent-Win64".
+      [default=unspecified]
+    </td>
+  </tr>
+  <tr>
+    <td>
       -DENABLE_SSL=(TRUE|FALSE)
     </td>
     <td>
@@ -144,7 +162,17 @@ See more information in the [CMake documentation](../cmake.md).
       -DENABLE_NEW_CLI=(TRUE|FALSE)
     </td>
     <td>
-      Build the new CLI instead of the old one. [default=FALSE]
+      Enable the new Python CLI by building a binary using PyInstaller. This option
+      requires Python 3 which can be set using the CMake option. [default=FALSE]
+    </td>
+  </tr>
+  <tr>
+    <td>
+      -DPYTHON_3=[path]
+    </td>
+    <td>
+      Specify the path to Python 3, e.g. "python36".
+      [default=unspecified]
     </td>
   </tr>
   <tr>

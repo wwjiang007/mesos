@@ -38,6 +38,7 @@
 #include <stout/uuid.hpp>
 
 #include "master/master.hpp"
+#include "master/quota.hpp"
 #include "master/validation.hpp"
 
 #include "master/detector/standalone.hpp"
@@ -54,6 +55,7 @@
 
 using namespace mesos::internal::master::validation;
 
+using google::protobuf::Map;
 using google::protobuf::RepeatedPtrField;
 
 using mesos::internal::master::Master;
@@ -69,6 +71,7 @@ using process::Message;
 using process::Owned;
 using process::PID;
 
+using std::pair;
 using std::string;
 using std::vector;
 
@@ -80,6 +83,195 @@ using testing::Return;
 namespace mesos {
 namespace internal {
 namespace tests {
+
+
+TEST(MasterCallValidationTest, UpdateQuota)
+{
+  Option<Error> error;
+
+  // Test validation at the call level.
+  mesos::master::Call updateQuota;
+  updateQuota.set_type(mesos::master::Call::UPDATE_QUOTA);
+
+  // Missing `update_quota` field.
+  error = master::validation::master::call::validate(updateQuota);
+  EXPECT_SOME(error);
+
+  updateQuota.mutable_update_quota();
+
+  error = master::validation::master::call::validate(updateQuota);
+  EXPECT_NONE(error);
+
+  // Test validation at the config level.
+  mesos::quota::QuotaConfig config;
+
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(
+      strings::contains(error->message, "'QuotaConfig.role' must be set"))
+    << error->message;
+
+  config.set_role("");
+
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(error->message, "Invalid 'QuotaConfig.role'"))
+    << error->message;
+
+  // Once a role is set, it is valid to have no guarantee and no limit.
+  config.set_role("role");
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_NONE(error);
+
+  // Setting quota on "*" role is allowed.
+  config.set_role("*");
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_NONE(error);
+
+  auto resourceMap = [](const vector<pair<string, double>>& vector)
+    -> Map<string, Value::Scalar> {
+    Map<string, Value::Scalar> result;
+
+    foreachpair (const string& name, double value, vector) {
+      Value::Scalar scalar;
+      scalar.set_value(value);
+      result[name] = scalar;
+    }
+
+    return result;
+  };
+
+  // The quota endpoint only allows memory / disk up to
+  // 1 exabyte (in megabytes) or 1 trillion cores/ports/other.
+  double largestMegabytes = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+  double largestCpuPortsOrOther = 1000.0 * 1000.0 * 1000.0 * 1000.0;
+
+  *config.mutable_guarantees() = resourceMap({
+    {"disk", largestMegabytes},
+    {"mem", largestMegabytes},
+    {"cpus", largestCpuPortsOrOther},
+    {"ports", largestCpuPortsOrOther},
+    {"foobars", largestCpuPortsOrOther}
+  });
+  *config.mutable_limits() = resourceMap({
+    {"disk", largestMegabytes},
+    {"mem", largestMegabytes},
+    {"cpus", largestCpuPortsOrOther},
+    {"ports", largestCpuPortsOrOther},
+    {"foobars", largestCpuPortsOrOther},
+  });
+
+  error = mesos::internal::master::quota::validate(config);
+  EXPECT_NONE(error)
+    << error->message;
+
+  config.clear_guarantees();
+  *config.mutable_limits() = resourceMap({{"disk", largestMegabytes + 1.0}});
+
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "values greater than 1 exabyte (1099511627776) are not supported"))
+    << error->message;
+
+  config.clear_guarantees();
+  *config.mutable_limits() = resourceMap({{"mem", largestMegabytes + 1.0}});
+
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "values greater than 1 exabyte (1099511627776) are not supported"))
+    << error->message;
+
+  config.clear_limits();
+  *config.mutable_guarantees() = resourceMap({
+    {"cpus", largestCpuPortsOrOther + 1.0}});
+
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "values greater than 1 trillion (1000000000000) are not supported"))
+    << error->message;
+
+  config.clear_limits();
+  *config.mutable_guarantees() = resourceMap({
+    {"ports", largestCpuPortsOrOther + 1.0}});
+
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "values greater than 1 trillion (1000000000000) are not supported"))
+    << error->message;
+
+  config.clear_limits();
+  *config.mutable_guarantees() = resourceMap({
+    {"foobars", largestCpuPortsOrOther + 1.0}});
+
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "values greater than 1 trillion (1000000000000) are not supported"))
+    << error->message;
+
+  // Now test the guarantees <= limits validation.
+
+  // Guarantees > limits.
+  Map<string, Value::Scalar> superset =
+    resourceMap({{"cpus", 20}, {"mem", 40}});
+  Map<string, Value::Scalar> subset = resourceMap({{"cpus", 10}, {"mem", 20}});
+
+  *config.mutable_guarantees() = superset;
+  *config.mutable_limits() = subset;
+
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "'QuotaConfig.guarantees' { cpus: 20, mem: 40 } is not"
+      " contained within the 'QuotaConfig.limits' { cpus: 10, mem: 20 }"))
+    << error->message;
+
+  // Guarantees = limits.
+  *config.mutable_guarantees() = subset;
+  *config.mutable_limits() = subset;
+
+  error = mesos::internal::master::quota::validate(config);
+  EXPECT_NONE(error);
+
+  // Guarantees < limits.
+  *config.mutable_guarantees() = subset;
+  *config.mutable_limits() = superset;
+
+  error = mesos::internal::master::quota::validate(config);
+  EXPECT_NONE(error);
+
+  // Now we ensure that the guarantees <= limits check is a
+  // per-resource check. This is important because it's ok to:
+  //
+  //   (1) Set a limit for a resource when there is no guarantee
+  //       for the resource.
+  //
+  //   (2) Set a guarantee for a resource when there is no limit
+  //       for the resource.
+  //
+  // We test both cases at once by having both guarantee and
+  // limit contain a resource not specified in the other.
+  Map<string, Value::Scalar> cpuMemWithDisk =
+    resourceMap({{"cpus", 10}, {"mem", 20}, {"disk", 10}});
+  Map<string, Value::Scalar> cpuMemWithGpu =
+    resourceMap({{"cpus", 10}, {"mem", 20}, {"gpu", 1}});
+
+  *config.mutable_guarantees() = cpuMemWithDisk;
+  *config.mutable_limits() = cpuMemWithGpu;
+
+  error = mesos::internal::master::quota::validate(config);
+  EXPECT_NONE(error);
+}
 
 
 class ResourceValidationTest : public ::testing::Test
@@ -320,6 +512,88 @@ TEST_F(ResourceValidationTest, SingleResourceProvider)
         error->message,
         "Some resources have a resource provider and some do not"));
   }
+}
+
+
+// Unit test for the `resource::detectOverlappingSetAndRangeResources()` helper
+// function. This function should return `true` when it receives two or more
+// `Resources` objects which contain overlapping sets or ranges.
+TEST_F(ResourceValidationTest, OverlappingSetsAndRanges)
+{
+  // An empty vector, which cannot overlap.
+  EXPECT_FALSE(resource::detectOverlappingSetAndRangeResources({}));
+
+  // One group of resources containing a set, which cannot overlap.
+  EXPECT_FALSE(
+      resource::detectOverlappingSetAndRangeResources(
+          {CHECK_NOTERROR(Resources::parse("zones:{a,b,c}"))}));
+
+  // Two groups of resources with non-overlapping ranges.
+  EXPECT_FALSE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("ports:[5555-5556]")),
+          CHECK_NOTERROR(Resources::parse("ports:[5557-5558]"))
+      }));
+
+  // Two groups of resources with identical ranges.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("ports:[5555-5556]")),
+          CHECK_NOTERROR(Resources::parse("ports:[5555-5556]"))
+      }));
+
+  // Two groups of resources with overlapping ranges.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("ports:[5555-5557]")),
+          CHECK_NOTERROR(Resources::parse("ports:[5556-5558]"))
+      }));
+
+  // Three groups of resources, two of which have overlapping ranges.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("ports:[5555-5557]")),
+          CHECK_NOTERROR(Resources::parse("ports:[5558-5559]")),
+          CHECK_NOTERROR(Resources::parse("ports:[5559-5560]"))
+      }));
+
+  // Two groups of resources with overlapping ranges
+  // and other scalar resources.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("cpus:0.1;mem:32;ports:[5555-5557]")),
+          CHECK_NOTERROR(
+              Resources::parse("cpus:1.0;mem:2048;disk:4096;ports:[5556-5558]"))
+      }));
+
+  // Two groups of resources with non-overlapping sets.
+  EXPECT_FALSE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("zones:{a,b}")),
+          CHECK_NOTERROR(Resources::parse("zones:{c,d}"))
+      }));
+
+  // Two groups of resources with identical sets.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("zones:{a,b}")),
+          CHECK_NOTERROR(Resources::parse("zones:{a,b}"))
+      }));
+
+  // Two groups of resources with overlapping sets.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("zones:{a,b,c}")),
+          CHECK_NOTERROR(Resources::parse("zones:{c,d,e}"))
+      }));
+
+  // Three groups of resources, two of which have overlapping sets.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("zones:{a,b,c}")),
+          CHECK_NOTERROR(Resources::parse("zones:{d,e,f}")),
+          CHECK_NOTERROR(Resources::parse("zones:{g,h,a}"))
+      }));
 }
 
 
@@ -1460,167 +1734,478 @@ TEST_F(DestroyOperationValidationTest, MultipleResourceProviders)
 }
 
 
-TEST(OperationValidationTest, CreateVolume)
+class GrowVolumeOperationValidationTest : public MesosTest {
+protected:
+  Offer::Operation::GrowVolume createGrowVolume()
+  {
+    Resource volume = createPersistentVolume(
+        Megabytes(128),
+        "role1",
+        "id1",
+        "path1");
+
+    Resource addition = Resources::parse("disk", "128", "role1").get();
+
+    Offer::Operation::GrowVolume growVolume;
+    growVolume.mutable_volume()->CopyFrom(volume);
+    growVolume.mutable_addition()->CopyFrom(addition);
+
+    return growVolume;
+  }
+};
+
+
+// This test verifies that validation succeeds on a valid operation.
+TEST_F(GrowVolumeOperationValidationTest, Valid)
 {
-  Resource disk1 = createDiskResource(
-      "10", "*", None(), None(), createDiskSourceRaw());
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
 
-  Resource disk2 = createDiskResource(
-      "20", "*", None(), None(), createDiskSourceMount());
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
 
-  Resource disk3 = createDiskResource(
-      "30", "*", None(), None(), createDiskSourceRaw());
-
-  disk1.mutable_provider_id()->set_value("provider1");
-  disk2.mutable_provider_id()->set_value("provider2");
-
-  Offer::Operation::CreateVolume createVolume;
-  createVolume.mutable_source()->CopyFrom(disk1);
-  createVolume.set_target_type(Resource::DiskInfo::Source::MOUNT);
-
-  Option<Error> error = operation::validate(createVolume);
+  Option<Error> error = operation::validate(growVolume, capabilities);
   EXPECT_NONE(error);
-
-  createVolume.mutable_source()->CopyFrom(disk2);
-  createVolume.set_target_type(Resource::DiskInfo::Source::MOUNT);
-
-  error = operation::validate(createVolume);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "'source' is not a RAW disk resource"));
-
-  createVolume.mutable_source()->CopyFrom(disk3);
-  createVolume.set_target_type(Resource::DiskInfo::Source::PATH);
-
-  error = operation::validate(createVolume);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "Does not have a resource provider"));
-
-  createVolume.mutable_source()->CopyFrom(disk1);
-  createVolume.set_target_type(Resource::DiskInfo::Source::BLOCK);
-
-  error = operation::validate(createVolume);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "'target_type' is neither MOUNT or PATH"));
 }
 
 
-TEST(OperationValidationTest, DestroyVolume)
+// This test verifies that validation fails if `GrowVolume.volume` is not a
+// persistent volume.
+TEST_F(GrowVolumeOperationValidationTest, NonPersistentVolume)
 {
-  Resource disk1 = createDiskResource(
-      "10", "*", None(), None(), createDiskSourceMount());
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
 
-  Resource disk2 = createDiskResource(
-      "20", "*", None(), None(), createDiskSourcePath());
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
+  growVolume.mutable_volume()->mutable_disk()->clear_persistence();
 
-  Resource disk3 = createDiskResource(
-      "30", "*", None(), None(), createDiskSourceRaw());
-
-  disk1.mutable_provider_id()->set_value("provider1");
-  disk3.mutable_provider_id()->set_value("provider3");
-
-  Offer::Operation::DestroyVolume destroyVolume;
-  destroyVolume.mutable_volume()->CopyFrom(disk1);
-
-  Option<Error> error = operation::validate(destroyVolume);
-  EXPECT_NONE(error);
-
-  destroyVolume.mutable_volume()->CopyFrom(disk2);
-
-  error = operation::validate(destroyVolume);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "Does not have a resource provider"));
-
-  destroyVolume.mutable_volume()->CopyFrom(disk3);
-
-  error = operation::validate(destroyVolume);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "'volume' is neither a MOUTN or PATH disk resource"));
+  Option<Error> error = operation::validate(growVolume, capabilities);
+  EXPECT_SOME(error);
 }
 
 
-TEST(OperationValidationTest, CreateBlock)
+// This test verifies that validation fails if `GrowVolume.addition` has a zero
+// value.
+TEST_F(GrowVolumeOperationValidationTest, ZeroAddition)
 {
-  Resource disk1 = createDiskResource(
-      "10", "*", None(), None(), createDiskSourceRaw());
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
 
-  Resource disk2 = createDiskResource(
-      "20", "*", None(), None(), createDiskSourceMount());
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
+  growVolume.mutable_addition()->mutable_scalar()->set_value(0);
 
-  Resource disk3 = createDiskResource(
-      "30", "*", None(), None(), createDiskSourceRaw());
-
-  disk1.mutable_provider_id()->set_value("provider1");
-  disk2.mutable_provider_id()->set_value("provider2");
-
-  Offer::Operation::CreateBlock createBlock;
-  createBlock.mutable_source()->CopyFrom(disk1);
-
-  Option<Error> error = operation::validate(createBlock);
-  EXPECT_NONE(error);
-
-  createBlock.mutable_source()->CopyFrom(disk2);
-
-  error = operation::validate(createBlock);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "'source' is not a RAW disk resource"));
-
-  createBlock.mutable_source()->CopyFrom(disk3);
-
-  error = operation::validate(createBlock);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "Does not have a resource provider"));
+  Option<Error> error = operation::validate(growVolume, capabilities);
+  EXPECT_SOME(error);
 }
 
 
-TEST(OperationValidationTest, DestroyBlock)
+// This test verifies that validation fails if `GrowVolume.volume` and
+// `GrowVolume.addition' are incompatible.
+TEST_F(GrowVolumeOperationValidationTest, IncompatibleDisk)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  // Make the volume on a PATH disk so it cannot be grown with a ROOT disk.
+  Resource pathVolume = createPersistentVolume(
+       Megabytes(128),
+        "role1",
+        "id1",
+        "path1",
+        None(),
+        createDiskSourcePath("root"));
+
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
+  growVolume.mutable_volume()->CopyFrom(pathVolume);
+
+  Option<Error> error = operation::validate(growVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `GrowVolume.volume` is a shared
+// persistent volume.
+TEST_F(GrowVolumeOperationValidationTest, Shared)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
+  growVolume.mutable_volume()->mutable_shared();
+
+  Option<Error> error = operation::validate(growVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `GrowVolume.volume` has resource
+// provider id.
+TEST_F(GrowVolumeOperationValidationTest, ResourceProvider)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
+  growVolume.mutable_volume()->mutable_provider_id()->set_value("provider");
+
+  Option<Error> error = operation::validate(growVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `GrowVolume.volume` and
+// `GrowVolume.addition` are on MOUNT disks, which are not addable.
+TEST_F(GrowVolumeOperationValidationTest, Mount)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Resource mountVolume = createPersistentVolume(
+       Megabytes(128),
+        "role1",
+        "id1",
+        "path1",
+        None(),
+        createDiskSourceMount());
+
+  Resource mountDisk = createDiskResource(
+      "128", "role1", None(), None(), createDiskSourceMount());
+
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
+  growVolume.mutable_volume()->CopyFrom(mountVolume);
+  growVolume.mutable_addition()->CopyFrom(mountDisk);
+
+  Option<Error> error = operation::validate(growVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation  fails if agent has no RESIZE_VOLUME
+// capability.
+TEST_F(GrowVolumeOperationValidationTest, MissingCapability)
+{
+  protobuf::slave::Capabilities capabilities;
+
+  Option<Error> error = operation::validate(createGrowVolume(), capabilities);
+  EXPECT_SOME(error);
+}
+
+
+class ShrinkVolumeOperationValidationTest : public MesosTest {
+protected:
+  Offer::Operation::ShrinkVolume createShrinkVolume()
+  {
+    Resource volume = createPersistentVolume(
+        Megabytes(128),
+        "role1",
+        "id1",
+        "path1");
+
+    Offer::Operation::ShrinkVolume shrinkVolume;
+    shrinkVolume.mutable_volume()->CopyFrom(volume);
+    shrinkVolume.mutable_subtract()->set_value(64);
+
+    return shrinkVolume;
+  }
+};
+
+
+// This test verifies that validation succeeds on a valid `ShrinkVolume`
+// operation.
+TEST_F(ShrinkVolumeOperationValidationTest, Valid)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_NONE(error);
+}
+
+
+// This test verifies that validation fails if `ShrinkVolume.volume` is not a
+// persistent volume.
+TEST_F(ShrinkVolumeOperationValidationTest, NonPersistentVolume)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+  shrinkVolume.mutable_volume()->mutable_disk()->clear_persistence();
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `ShrinkVolume.subtract` has a
+// zero value.
+TEST_F(ShrinkVolumeOperationValidationTest, ZeroSubtract)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+  shrinkVolume.mutable_subtract()->set_value(0);
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `ShrinkVolume.subtract` has a
+// value equal to the size of `ShrinkVolume.volume`
+TEST_F(ShrinkVolumeOperationValidationTest, EmptyAfterShrink)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+  shrinkVolume.mutable_subtract()->CopyFrom(shrinkVolume.volume().scalar());
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `ShrinkVolume.volume` is a
+// MOUNT disk.
+TEST_F(ShrinkVolumeOperationValidationTest, Mount)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Resource mountVolume = createPersistentVolume(
+       Megabytes(128),
+        "role1",
+        "id1",
+        "path1",
+        None(),
+        createDiskSourceMount());
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+  shrinkVolume.mutable_volume()->CopyFrom(mountVolume);
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `ShrinkVolume.volume` is a
+// shared volume.
+TEST_F(ShrinkVolumeOperationValidationTest, Shared)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+  shrinkVolume.mutable_volume()->mutable_shared();
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `ShrinkVolume.volume` has
+// resource provider id.
+TEST_F(ShrinkVolumeOperationValidationTest, ResourceProvider)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+  shrinkVolume.mutable_volume()->mutable_provider_id()->set_value("provider");
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if agent has no RESIZE_VOLUME
+// capability.
+TEST_F(ShrinkVolumeOperationValidationTest, MissingCapability)
+{
+  protobuf::slave::Capabilities capabilities;
+
+  Option<Error> error = operation::validate(createShrinkVolume(), capabilities);
+  EXPECT_SOME(error);
+}
+
+
+TEST(OperationValidationTest, CreateDisk)
 {
   Resource disk1 = createDiskResource(
-      "10", "*", None(), None(), createDiskSourceBlock());
+      "10", "*", None(), None(), createDiskSourceRaw(None(), "profile"));
 
   Resource disk2 = createDiskResource(
-      "20", "*", None(), None(), createDiskSourceBlock());
+      "20", "*", None(), None(), createDiskSourceRaw());
 
   Resource disk3 = createDiskResource(
       "30", "*", None(), None(), createDiskSourceMount());
 
+  Resource disk4 = createDiskResource(
+      "40", "*", None(), None(), createDiskSourceRaw(None(), "profile"));
+
   disk1.mutable_provider_id()->set_value("provider1");
+  disk2.mutable_provider_id()->set_value("provider2");
   disk3.mutable_provider_id()->set_value("provider3");
 
-  Offer::Operation::DestroyBlock destroyBlock;
-  destroyBlock.mutable_block()->CopyFrom(disk1);
+  Offer::Operation::CreateDisk createDisk;
+  createDisk.mutable_source()->CopyFrom(disk1);
+  createDisk.set_target_type(Resource::DiskInfo::Source::MOUNT);
+  createDisk.clear_target_profile();
 
-  Option<Error> error = operation::validate(destroyBlock);
+  Option<Error> error = operation::validate(createDisk);
   EXPECT_NONE(error);
 
-  destroyBlock.mutable_block()->CopyFrom(disk2);
+  createDisk.mutable_source()->CopyFrom(disk1);
+  createDisk.set_target_type(Resource::DiskInfo::Source::BLOCK);
+  createDisk.clear_target_profile();
 
-  error = operation::validate(destroyBlock);
+  error = operation::validate(createDisk);
+  EXPECT_NONE(error);
+
+  createDisk.mutable_source()->CopyFrom(disk2);
+  createDisk.set_target_type(Resource::DiskInfo::Source::MOUNT);
+  createDisk.set_target_profile("profile");
+
+  error = operation::validate(createDisk);
+  EXPECT_NONE(error);
+
+  createDisk.mutable_source()->CopyFrom(disk1);
+  createDisk.set_target_type(Resource::DiskInfo::Source::PATH);
+  createDisk.clear_target_profile();
+
+  error = operation::validate(createDisk);
   ASSERT_SOME(error);
   EXPECT_TRUE(strings::contains(
       error->message,
-      "Does not have a resource provider"));
+      "'target_type' is neither MOUNT or BLOCK"));
 
-  destroyBlock.mutable_block()->CopyFrom(disk3);
+  createDisk.mutable_source()->CopyFrom(disk1);
+  createDisk.set_target_type(Resource::DiskInfo::Source::MOUNT);
+  createDisk.set_target_profile("profile");
 
-  error = operation::validate(destroyBlock);
+  error = operation::validate(createDisk);
   ASSERT_SOME(error);
   EXPECT_TRUE(strings::contains(
       error->message,
-      "'block' is not a BLOCK disk resource"));
+      "'target_profile' must not be set when 'source' has a profile"));
+
+  createDisk.mutable_source()->CopyFrom(disk2);
+  createDisk.set_target_type(Resource::DiskInfo::Source::MOUNT);
+  createDisk.clear_target_profile();
+
+  error = operation::validate(createDisk);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "'target_profile' must be set when 'source' has no profile"));
+
+  createDisk.mutable_source()->CopyFrom(disk3);
+  createDisk.set_target_type(Resource::DiskInfo::Source::MOUNT);
+  createDisk.clear_target_profile();
+
+  error = operation::validate(createDisk);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "'source' is not a RAW disk resource"));
+
+  createDisk.mutable_source()->CopyFrom(disk4);
+  createDisk.set_target_type(Resource::DiskInfo::Source::MOUNT);
+  createDisk.clear_target_profile();
+
+  error = operation::validate(createDisk);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "'source' is not managed by a resource provider"));
+}
+
+
+TEST(OperationValidationTest, DestroyDisk)
+{
+  Resource disk1 = createDiskResource(
+      "10", "*", None(), None(), createDiskSourceMount(None(), "volume1"));
+
+  Resource disk2 = createDiskResource(
+      "20", "*", None(), None(), createDiskSourceBlock("volume2"));
+
+  Resource disk3 = createDiskResource(
+      "40", "*", None(), None(), createDiskSourceRaw("volume3"));
+
+  Resource disk4 = createDiskResource(
+      "40", "*", None(), None(), createDiskSourcePath("volume4"));
+
+  Resource disk5 = createDiskResource(
+      "50", "*", None(), None(), createDiskSourceMount(None(), "volume5"));
+
+  Resource disk6 = createDiskResource(
+      "60", "*", None(), None(), createDiskSourceRaw(None(), "profile"));
+
+  Resource disk7 = createPersistentVolume(
+      Megabytes(70),
+      "role",
+      "id",
+      "path",
+      None(),
+      createDiskSourceMount(None(), "volume7"));
+
+  disk1.mutable_provider_id()->set_value("provider1");
+  disk2.mutable_provider_id()->set_value("provider2");
+  disk3.mutable_provider_id()->set_value("provider3");
+  disk4.mutable_provider_id()->set_value("provider4");
+  disk6.mutable_provider_id()->set_value("provider6");
+  disk7.mutable_provider_id()->set_value("provider7");
+
+  Offer::Operation::DestroyDisk destroyDisk;
+  destroyDisk.mutable_source()->CopyFrom(disk1);
+
+  Option<Error> error = operation::validate(destroyDisk);
+  EXPECT_NONE(error);
+
+  destroyDisk.mutable_source()->CopyFrom(disk2);
+
+  error = operation::validate(destroyDisk);
+  EXPECT_NONE(error);
+
+  destroyDisk.mutable_source()->CopyFrom(disk3);
+
+  error = operation::validate(destroyDisk);
+  EXPECT_NONE(error);
+
+  destroyDisk.mutable_source()->CopyFrom(disk4);
+
+  error = operation::validate(destroyDisk);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "'source' is neither a MOUNT, BLOCK or RAW disk resource"));
+
+  destroyDisk.mutable_source()->CopyFrom(disk5);
+
+  error = operation::validate(destroyDisk);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "'source' is not managed by a resource provider"));
+
+  destroyDisk.mutable_source()->CopyFrom(disk6);
+
+  error = operation::validate(destroyDisk);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "'source' is not backed by a CSI volume"));
+
+  destroyDisk.mutable_source()->CopyFrom(disk7);
+
+  error = operation::validate(destroyDisk);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "Please destroy the persistent volume first"));
 }
 
 
@@ -2820,6 +3405,59 @@ TEST_F(TaskValidationTest, TaskMissingDockerInfo)
       "Task's `ContainerInfo` is invalid: "
       "DockerInfo 'docker' is not set for DOCKER typed ContainerInfo",
       status->message());
+
+  driver.stop();
+  driver.join();
+}
+
+// This test verifies that a task that has `ContainerInfo` set as MESOS
+// but has a `DockerInfo` is rejected during `TaskInfo` validation.
+// TODO(josephw): Enable this regression test when we officially deprecate
+// this invalid protobuf. See MESOS-6874 and MESOS-9740.
+TEST_F(TaskValidationTest, DISABLED_TaskMesosTypeWithDockerInfo)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  // Create an invalid task that has `ContainerInfo` set
+  // as MESOS and has a `DockerInfo` set.
+  TaskInfo task = createTask(offers.get()[0], "exit 0");
+  task.mutable_container()->set_type(ContainerInfo::MESOS);
+  task.mutable_container()->mutable_docker()->set_image("alpine");
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_ERROR, status->state());
+  EXPECT_EQ(
+    "Task's `ContainerInfo` is invalid: "
+    "Protobuf union `mesos.ContainerInfo` with `Type == MESOS` "
+    "should not have the field `docker` set.",
+    status->message());
 
   driver.stop();
   driver.join();
@@ -4044,7 +4682,7 @@ TEST_F(FrameworkInfoValidationTest, ValidateRoles)
   {
     FrameworkInfo frameworkInfo;
 
-    EXPECT_NONE(::framework::internal::validateRoles(frameworkInfo));
+    EXPECT_NONE(::framework::validate(frameworkInfo));
   }
 
   // Not MULTI_ROLE, no 'role' (default to "*"), has 'roles' (error!).
@@ -4053,7 +4691,7 @@ TEST_F(FrameworkInfoValidationTest, ValidateRoles)
     frameworkInfo.add_roles("bar");
     frameworkInfo.add_roles("qux");
 
-    EXPECT_SOME(::framework::internal::validateRoles(frameworkInfo));
+    EXPECT_SOME(::framework::validate(frameworkInfo));
   }
 
   // Not MULTI_ROLE, has 'role', no 'roles'.
@@ -4061,7 +4699,7 @@ TEST_F(FrameworkInfoValidationTest, ValidateRoles)
     FrameworkInfo frameworkInfo;
     frameworkInfo.set_role("foo");
 
-    EXPECT_NONE(::framework::internal::validateRoles(frameworkInfo));
+    EXPECT_NONE(::framework::validate(frameworkInfo));
   }
 
   // Not MULTI_ROLE, has 'role', has 'roles' (error!).
@@ -4071,7 +4709,7 @@ TEST_F(FrameworkInfoValidationTest, ValidateRoles)
     frameworkInfo.add_roles("qux");
     frameworkInfo.set_role("foo");
 
-    EXPECT_SOME(::framework::internal::validateRoles(frameworkInfo));
+    EXPECT_SOME(::framework::validate(frameworkInfo));
   }
 
   // Is MULTI_ROLE, no 'role', no 'roles'.
@@ -4080,7 +4718,7 @@ TEST_F(FrameworkInfoValidationTest, ValidateRoles)
     frameworkInfo.add_capabilities()->set_type(
         FrameworkInfo::Capability::MULTI_ROLE);
 
-    EXPECT_NONE(::framework::internal::validateRoles(frameworkInfo));
+    EXPECT_NONE(::framework::validate(frameworkInfo));
   }
 
   // Is MULTI_ROLE, no 'role', has 'roles'.
@@ -4091,7 +4729,7 @@ TEST_F(FrameworkInfoValidationTest, ValidateRoles)
     frameworkInfo.add_roles("bar");
     frameworkInfo.add_roles("qux");
 
-    EXPECT_NONE(::framework::internal::validateRoles(frameworkInfo));
+    EXPECT_NONE(::framework::validate(frameworkInfo));
   }
 
   // Is MULTI_ROLE, has 'role' (error!), no 'roles'.
@@ -4101,7 +4739,7 @@ TEST_F(FrameworkInfoValidationTest, ValidateRoles)
     frameworkInfo.add_capabilities()->set_type(
         FrameworkInfo::Capability::MULTI_ROLE);
 
-    EXPECT_SOME(::framework::internal::validateRoles(frameworkInfo));
+    EXPECT_SOME(::framework::validate(frameworkInfo));
   }
 
   // Is MULTI_ROLE, has 'role' (error!), has 'roles'.
@@ -4113,7 +4751,7 @@ TEST_F(FrameworkInfoValidationTest, ValidateRoles)
     frameworkInfo.add_roles("bar");
     frameworkInfo.add_roles("qux");
 
-    EXPECT_SOME(::framework::internal::validateRoles(frameworkInfo));
+    EXPECT_SOME(::framework::validate(frameworkInfo));
   }
 
   // Duplicate items in 'roles'.
@@ -4125,7 +4763,7 @@ TEST_F(FrameworkInfoValidationTest, ValidateRoles)
     frameworkInfo.add_roles("qux");
     frameworkInfo.add_roles("bar");
 
-    EXPECT_SOME(::framework::internal::validateRoles(frameworkInfo));
+    EXPECT_SOME(::framework::validate(frameworkInfo));
   }
 
   // Check invalid character in 'roles'.
@@ -4136,7 +4774,99 @@ TEST_F(FrameworkInfoValidationTest, ValidateRoles)
     frameworkInfo.add_capabilities()->set_type(
         FrameworkInfo::Capability::MULTI_ROLE);
 
-    EXPECT_SOME(::framework::internal::validateRoles(frameworkInfo));
+    EXPECT_SOME(::framework::validate(frameworkInfo));
+  }
+}
+
+
+// This tests the validation of the `FrameworkID`.
+TEST_F(FrameworkInfoValidationTest, ValidateFrameworkID)
+{
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+
+  // Unset framework IDs are used in an initial subscription and are valid.
+  frameworkInfo.clear_id();
+  EXPECT_NONE(::framework::validate(frameworkInfo));
+
+  // We allow set but empty framework IDs, see MESOS-9481.
+  frameworkInfo.mutable_id()->set_value("");
+  EXPECT_NONE(::framework::validate(frameworkInfo));
+
+  // Typical IDs the master would assign are valid.
+  frameworkInfo.mutable_id()->set_value(id::UUID::random().toString());
+  frameworkInfo.mutable_id()->set_value(
+      strings::format("%s-4711", id::UUID::random().toString()).get());
+  EXPECT_NONE(::framework::validate(frameworkInfo));
+
+  // Framework IDs containing typical path separators are invalid.
+  frameworkInfo.mutable_id()->set_value("foo/bar");
+  EXPECT_SOME(::framework::validate(frameworkInfo));
+
+  frameworkInfo.mutable_id()->set_value("foo/..");
+  EXPECT_SOME(::framework::validate(frameworkInfo));
+}
+
+
+// This test validates that framework cannot configure negative
+// resources in their minimal allocatable resources offer filters.
+TEST_F(FrameworkInfoValidationTest, ValidateOfferFilters)
+{
+  Value::Scalar scalar;
+  scalar.set_value(-2);
+
+  OfferFilters offerFilters;
+  offerFilters.mutable_min_allocatable_resources()
+    ->add_quantities()
+    ->mutable_quantities()
+    ->insert({"cpus", scalar});
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+
+  ASSERT_FALSE(frameworkInfo.roles().empty());
+
+  frameworkInfo.mutable_offer_filters()->insert(
+      {frameworkInfo.roles(0), offerFilters});
+
+  EXPECT_SOME_EQ(
+      Error("Invalid resource quantity for 'cpus': "
+        "Negative values not supported"),
+      framework::validate(frameworkInfo));
+}
+
+
+// This tests validation of FrameworkInfo updates.
+TEST_F(FrameworkInfoValidationTest, ValidateUpdate)
+{
+  {
+    FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+    frameworkInfo.add_roles("bar");
+
+    EXPECT_NONE(framework::validateUpdate(
+        DEFAULT_FRAMEWORK_INFO, frameworkInfo));
+  }
+
+  {
+    FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+    *frameworkInfo.mutable_principal() += "_foo";
+
+    EXPECT_SOME(framework::validateUpdate(
+        DEFAULT_FRAMEWORK_INFO, frameworkInfo));
+  }
+
+  {
+    FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+    *frameworkInfo.mutable_user() += "_foo";
+
+    EXPECT_SOME(framework::validateUpdate(
+        DEFAULT_FRAMEWORK_INFO, frameworkInfo));
+  }
+
+  {
+    FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+    frameworkInfo.set_checkpoint(!frameworkInfo.checkpoint());
+
+    EXPECT_SOME(framework::validateUpdate(
+        DEFAULT_FRAMEWORK_INFO, frameworkInfo));
   }
 }
 

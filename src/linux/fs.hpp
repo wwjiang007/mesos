@@ -281,7 +281,7 @@ struct MountInfoTable {
   // no mount table entry that matches the exact target path, return
   // the mount table entry that is the immediate parent of the given
   // target path (similar to `findmnt --target [TARGET]`).
-  static Try<Entry> findByTarget(const std::string& target);
+  Try<Entry> findByTarget(const std::string& target);
 
   std::vector<Entry> entries;
 };
@@ -348,6 +348,10 @@ struct MountTable {
 // @param   flags     Mount flags.
 // @param   data      Extra data interpreted by different file systems.
 // @return  Whether the mount operation succeeds.
+//
+// Note that if this is a read-only bind mount (both the MS_BIND
+// and MS_READONLY flags are set), the target will automatically
+// be remounted in read-only mode.
 Try<Nothing> mount(const Option<std::string>& source,
                    const std::string& target,
                    const Option<std::string>& type,
@@ -383,10 +387,14 @@ Try<Nothing> pivot_root(const std::string& newRoot, const std::string& putOld);
 
 namespace chroot {
 
-// Enter a 'chroot' environment. The caller should be in a new mount
-// namespace. Basic configuration of special filesystems and device
-// nodes is performed. Any mounts to the current root will be
-// unmounted.
+// Clone a device node to a target directory. Intermediate directory paths
+// are created in the target.
+Try<Nothing> copyDeviceNode(
+    const std::string& device, const std::string& target);
+
+//  Enter a 'chroot' environment. The caller should be in a new mount
+//  unmounted. The root path must have already been provisioned by
+//  calling `prepare`()`.
 Try<Nothing> enter(const std::string& root);
 
 } // namespace chroot {

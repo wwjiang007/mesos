@@ -21,6 +21,8 @@
 
 #include "slave/containerizer/mesos/isolator.hpp"
 
+#include "slave/containerizer/mesos/isolators/volume/utils.hpp"
+
 namespace mesos {
 namespace internal {
 namespace slave {
@@ -30,19 +32,23 @@ class VolumeHostPathIsolatorProcess : public MesosIsolatorProcess
 public:
   static Try<mesos::slave::Isolator*> create(const Flags& flags);
 
-  virtual ~VolumeHostPathIsolatorProcess();
+  ~VolumeHostPathIsolatorProcess() override;
 
-  virtual bool supportsNesting();
-  virtual bool supportsStandalone();
+  bool supportsNesting() override;
+  bool supportsStandalone() override;
 
-  virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
-      const mesos::slave::ContainerConfig& containerConfig);
+      const mesos::slave::ContainerConfig& containerConfig) override;
 
 private:
   VolumeHostPathIsolatorProcess(const Flags& flags);
+  VolumeHostPathIsolatorProcess(
+      const Flags& flags,
+      const volume::PathValidator& pathValidator);
 
   const Flags flags;
+  const Option<volume::PathValidator> pathValidator;
 };
 
 } // namespace slave {

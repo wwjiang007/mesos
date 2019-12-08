@@ -40,6 +40,7 @@
 #include <process/socket.hpp>
 
 #include <process/ssl/gtest.hpp>
+#include <process/ssl/tls_config.hpp>
 
 #include <stout/base64.hpp>
 #include <stout/gtest.hpp>
@@ -94,6 +95,7 @@ using testing::DoAll;
 using testing::EndsWith;
 using testing::Invoke;
 using testing::Return;
+using testing::StartsWith;
 using testing::WithParamInterface;
 
 namespace process {
@@ -105,6 +107,16 @@ void reinitialize(
     const Option<string>& readonlyAuthenticationRealm,
     const Option<string>& readwriteAuthenticationRealm);
 
+namespace http {
+namespace internal {
+
+// TODO(bmahler): The client's encoding logic is currently not exposed
+// in headers, so we declare it here to test it. This should be
+// exposed in headers as a library.
+Pipe::Reader encode(const Request& request);
+
+} // namespace internal {
+} // namespace http {
 } // namespace process {
 
 class HttpProcess : public Process<HttpProcess>
@@ -127,7 +139,7 @@ public:
       Future<http::Response>(const http::Request&, const Option<Principal>&));
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     route("/body", None(), &HttpProcess::body);
     route("/pipe", None(), &HttpProcess::pipe);
@@ -173,7 +185,7 @@ class HTTPTest : public SSLTemporaryDirectoryTest,
 // These are only needed if libprocess is compiled with SSL support.
 #ifdef USE_SSL_SOCKET
 protected:
-  virtual void SetUp()
+  void SetUp() override
   {
     // We must run the parent's `SetUp` first so that we `chdir` into the test
     // directory before SSL helpers like `key_path()` are called.
@@ -231,6 +243,12 @@ INSTANTIATE_TEST_CASE_P(
 
 // TODO(vinod): Use AWAIT_EXPECT_RESPONSE_STATUS_EQ in the tests.
 
+TEST_P(HTTPTest, Statuses)
+{
+  EXPECT_TRUE(process::http::isValidStatus(200));
+  EXPECT_TRUE(process::http::isValidStatus(404));
+  EXPECT_FALSE(process::http::isValidStatus(1337));
+}
 
 TEST_P(HTTPTest, Endpoints)
 {
@@ -243,7 +261,20 @@ TEST_P(HTTPTest, Endpoints)
 
     inet::Socket socket = create.get();
 
-    AWAIT_READY(socket.connect(http.process->self().address));
+    Future<Nothing> connected = [&]() {
+      switch(socket.kind()) {
+        case network::internal::SocketImpl::Kind::POLL:
+          return socket.connect(http.process->self().address);
+#ifdef USE_SSL_SOCKET
+        case network::internal::SocketImpl::Kind::SSL:
+          return socket.connect(
+              http.process->self().address,
+              network::openssl::create_tls_client_config(None()));
+#endif
+      }
+      UNREACHABLE();
+    }();
+    AWAIT_READY(connected);
 
     std::ostringstream out;
     out << "GET /" << http.process->self().id << "/body"
@@ -319,10 +350,7 @@ TEST_P(HTTPTest, Endpoints)
 }
 
 
-// TODO(hausdorff): Routing logic is broken on Windows. Fix and enable test. In
-// this case, the '/help/(14)/body' route is missing, but the /help/(14) route
-// exists. See MESOS-5904.
-TEST_P_TEMP_DISABLED_ON_WINDOWS(HTTPTest, EndpointsHelp)
+TEST_P(HTTPTest, EndpointsHelp)
 {
   Http http;
   PID<HttpProcess> pid = http.process->self();
@@ -391,10 +419,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(HTTPTest, EndpointsHelp)
 }
 
 
-// TODO(hausdorff): Routing logic is broken on Windows. Fix and enable test. In
-// this case, the '/help/(14)/body' route is missing, but the /help/(14) route
-// exists. See MESOS-5904.
-TEST_P_TEMP_DISABLED_ON_WINDOWS(HTTPTest, EndpointsHelpRemoval)
+TEST_P(HTTPTest, EndpointsHelpRemoval)
 {
   // Start up a new HttpProcess;
   Owned<Http> http(new Http());
@@ -627,6 +652,29 @@ TEST_P(HTTPTest, EncodeAdditionalChars)
 }
 
 
+TEST_P(HTTPTest, QueryEncoding)
+{
+  // This query tests a literal ASCII encoding. The special characters
+  // `:`, `\`, and `%` should each be encoded over the wire, and when
+  // decoded should literally be `C:\foo\bar%3Abaz`.
+  hashmap<string, string> query = {{"path", "C:\\foo\\bar%3Abaz"}};
+  http::URL url = http::URL("http", "mesos.apache.org", 80, "/", query);
+  EXPECT_EQ(
+      stringify(url),
+      "http://mesos.apache.org:80/?path=C%3A%5Cfoo%5Cbar%253Abaz");
+
+  http::Request request;
+  request.method = "GET";
+  request.url = url;
+
+  // This should remain fully encoded.
+  http::Pipe::Reader reader = http::internal::encode(request);
+  Future<string> read = reader.readAll();
+  AWAIT_READY(read);
+  EXPECT_THAT(read.get(), StartsWith("GET /?path=C%3A%5Cfoo%5Cbar%253Abaz"));
+}
+
+
 TEST_P(HTTPTest, PathParse)
 {
   const string pattern = "/books/{isbn}/chapters/{chapter}";
@@ -726,10 +774,7 @@ TEST_P(HTTPTest, Get)
 }
 
 
-// TODO(hausdorff): Routing logic is broken on Windows. Fix and enable test. In
-// this case, the route '/a/b/c' exists and returns 200 ok, but '/a/b' does
-// not. See MESOS-5904.
-TEST_P_TEMP_DISABLED_ON_WINDOWS(HTTPTest, NestedGet)
+TEST_P(HTTPTest, NestedGet)
 {
   Http http;
 
@@ -1569,11 +1614,9 @@ TEST_P(HTTPTest, CaseInsensitiveHeaders)
 
 TEST_P(HTTPTest, WWWAuthenticateHeader)
 {
-  http::Headers headers;
-  headers["Www-Authenticate"] = "Basic realm=\"basic-realm\"";
-
   Result<http::header::WWWAuthenticate> header =
-    headers.get<http::header::WWWAuthenticate>();
+    http::Headers({{"Www-Authenticate", "Basic realm=\"basic-realm\""}})
+      .get<http::header::WWWAuthenticate>();
 
   ASSERT_SOME(header);
 
@@ -1581,17 +1624,14 @@ TEST_P(HTTPTest, WWWAuthenticateHeader)
   EXPECT_EQ(1u, header->authParam().size());
   EXPECT_EQ("basic-realm", header->authParam()["realm"]);
 
-  headers.clear();
-  header = headers.get<http::header::WWWAuthenticate>();
+  EXPECT_NONE(http::Headers().get<http::header::WWWAuthenticate>());
 
-  EXPECT_NONE(header);
-
-  headers["Www-Authenticate"] =
-    "Bearer realm=\"https://auth.docker.io/token\","
-    "service=\"registry.docker.io\","
-    "scope=\"repository:gilbertsong/inky:pull\"";
-
-  header = headers.get<http::header::WWWAuthenticate>();
+  header = http::Headers(
+      {{"Www-Authenticate",
+        "Bearer realm=\"https://auth.docker.io/token\", "
+        "service=\"registry.docker.io\","
+        "scope=\"repository:gilbertsong/inky:pull\""}})
+    .get<http::header::WWWAuthenticate>();
 
   ASSERT_SOME(header);
 
@@ -1601,35 +1641,70 @@ TEST_P(HTTPTest, WWWAuthenticateHeader)
   EXPECT_EQ("registry.docker.io", header->authParam()["service"]);
   EXPECT_EQ("repository:gilbertsong/inky:pull", header->authParam()["scope"]);
 
-  headers["Www-Authenticate"] = "";
-  header = headers.get<http::header::WWWAuthenticate>();
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            ""}})
+        .get<http::header::WWWAuthenticate>());
 
-  EXPECT_ERROR(header);
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            " "}})
+        .get<http::header::WWWAuthenticate>());
 
-  headers["Www-Authenticate"] = " ";
-  header = headers.get<http::header::WWWAuthenticate>();
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            "Digest"}})
+        .get<http::header::WWWAuthenticate>());
 
-  EXPECT_ERROR(header);
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            "Digest ="}})
+        .get<http::header::WWWAuthenticate>());
 
-  headers["Www-Authenticate"] = "Digest";
-  header = headers.get<http::header::WWWAuthenticate>();
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            "Digest ,,"}})
+        .get<http::header::WWWAuthenticate>());
 
-  EXPECT_ERROR(header);
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            "Digest uri=\"/dir/index.html\",qop=auth"}})
+        .get<http::header::WWWAuthenticate>());
 
-  headers["Www-Authenticate"] = "Digest =";
-  header = headers.get<http::header::WWWAuthenticate>();
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            "Bearer =\"https://https://example.com\""}})
+        .get<http::header::WWWAuthenticate>());
 
-  EXPECT_ERROR(header);
+  // authParam keys cannot be quoted strings.
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            "Bearer \"realm\"=\"https://example.com\""}})
+        .get<http::header::WWWAuthenticate>());
 
-  headers["Www-Authenticate"] = "Digest ,,";
-  header = headers.get<http::header::WWWAuthenticate>();
+  // We do not incorrectly split if authParam values contain `=`
+  // delimiters inside quotes. This is a regression test for MESOS-9968.
+  header = http::Headers(
+               {{"Www-Authenticate",
+                 "Bearer realm="
+                 "\"https://nvcr.io/proxy_auth?scope="
+                 "repository:nvidia/tensorflow:pull,push\""}})
+             .get<http::header::WWWAuthenticate>();
 
-  EXPECT_ERROR(header);
-
-  headers["Www-Authenticate"] = "Digest uri=\"/dir/index.html\",qop=auth";
-  header = headers.get<http::header::WWWAuthenticate>();
-
-  EXPECT_ERROR(header);
+  ASSERT_SOME(header);
+  EXPECT_EQ("Bearer", header->authScheme());
+  ASSERT_EQ(hashset<string>{"realm"}, header->authParam().keys());
+  EXPECT_EQ(
+      "https://nvcr.io/proxy_auth?scope=repository:nvidia/tensorflow:pull,push",
+      header->authParam()["realm"]);
 }
 
 
@@ -1780,7 +1855,7 @@ public:
       authenticate,
       Future<AuthenticationResult>(const http::Request&));
 
-  virtual string scheme() const { return "Basic"; }
+  string scheme() const override { return "Basic"; }
 };
 
 
@@ -1796,7 +1871,7 @@ protected:
     return authentication::setAuthenticator(realm, authenticator);
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     foreach (const string& realm, realms) {
       // We need to wait in order to ensure that the operation
@@ -2083,9 +2158,7 @@ TEST_F(HttpAuthenticationTest, JWT)
 
     Try<JWT, JWTError> jwt = JWT::create(payload, "a different secret");
 
-    // TODO(nfnt): Change this to `EXPECT_SOME(jwt)`
-    // once MESOS-7220 is resolved.
-    EXPECT_TRUE(jwt.isSome());
+    EXPECT_SOME(jwt);
 
     http::Headers headers;
     headers["Authorization"] = "Bearer " + stringify(jwt.get());
@@ -2111,9 +2184,7 @@ TEST_F(HttpAuthenticationTest, JWT)
 
     Try<JWT, JWTError> jwt = JWT::create(payload, "secret");
 
-    // TODO(nfnt): Change this to `EXPECT_SOME(jwt)`
-    // once MESOS-7220 is resolved.
-    EXPECT_TRUE(jwt.isSome());
+    EXPECT_SOME(jwt);
 
     http::Headers headers;
     headers["Authorization"] = "Bearer " + stringify(jwt.get());
@@ -2191,7 +2262,7 @@ TEST_F(HttpServeTest, Pipelining)
     .WillOnce(DoAll(FutureArg<0>(&request3), Return(promise3.future())))
     .WillRepeatedly(Return(http::OK()));
 
-  http::URL url("http", address.hostname().get(), address.port, "/");
+  http::URL url("http", address.lookup_hostname().get(), address.port, "/");
 
   http::Request request;
   request.method = "GET";
@@ -2286,7 +2357,7 @@ TEST_F(HttpServeTest, Discard)
   EXPECT_CALL(handler, handle(_))
     .WillOnce(DoAll(FutureArg<0>(&request1), Return(promise1.future())));
 
-  http::URL url("http", address.hostname().get(), address.port, "/");
+  http::URL url("http", address.lookup_hostname().get(), address.port, "/");
 
   http::Request request;
   request.method = "GET";
@@ -2423,7 +2494,7 @@ TEST(HttpServerTest, Pipeline)
     .WillOnce(DoAll(FutureArg<0>(&request3), Return(promise3.future())))
     .WillRepeatedly(Return(http::OK()));
 
-  http::URL url("http", address->hostname().get(), address->port, "/");
+  http::URL url("http", address->lookup_hostname().get(), address->port, "/");
 
   http::Request request;
   request.method = "GET";

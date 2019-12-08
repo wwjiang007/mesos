@@ -27,6 +27,7 @@ if (ENABLE_NEW_CLI)
     lib/cli/docopt.py
     lib/cli/exceptions.py
     lib/cli/http.py
+    lib/cli/mesos.py
     lib/cli/util.py
     lib/cli/plugins/__init__.py
     lib/cli/plugins/base.py
@@ -51,7 +52,9 @@ if (ENABLE_NEW_CLI)
   # Creating the virtual environment required by the CLI.
   add_custom_command(
     OUTPUT .virtualenv/bin/activate
-    COMMAND VIRTUALENV_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/.virtualenv
+    COMMAND
+      VIRTUALENV_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/.virtualenv
+      PYTHON=${PYTHON_3}
       ${CMAKE_CURRENT_SOURCE_DIR}/bootstrap
     DEPENDS bootstrap pip-requirements.txt)
 
@@ -68,7 +71,7 @@ if (ENABLE_NEW_CLI)
     echo \"VERSION = \\\"${PACKAGE_VERSION}\\\"\"                           \
       > ${CMAKE_BINARY_DIR}/src/cli/version.py
     source .virtualenv/bin/activate
-    python -m PyInstaller -p ${CMAKE_CURRENT_SOURCE_DIR}/lib                \
+    ${PYTHON_3} -m PyInstaller -p ${CMAKE_CURRENT_SOURCE_DIR}/lib           \
       $MESOS_CLI_HIDDEN_IMPORTS --specpath ${CMAKE_BINARY_DIR}/src/cli      \
       --workpath ${CMAKE_BINARY_DIR}/src/cli/work                           \
       --distpath ${CMAKE_BINARY_DIR}/src\ --name mesos --noconfirm --onefile\

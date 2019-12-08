@@ -27,6 +27,7 @@
 
 #include <mesos/quota/quota.hpp>
 
+#include <mesos/resource_quantities.hpp>
 #include <mesos/resources.hpp>
 
 #include <process/future.hpp>
@@ -38,8 +39,34 @@
 #include <stout/option.hpp>
 #include <stout/try.hpp>
 
+
 namespace mesos {
 namespace allocator {
+
+/**
+ *  Pass in configuration to the allocator.
+ */
+struct Options
+{
+  Duration allocationInterval = Seconds(1);
+
+  // Resources (by name) that will be excluded from a role's fair share.
+  Option<std::set<std::string>> fairnessExcludeResourceNames = None();
+
+  // Filter GPU resources based on the `GPU_RESOURCES` framework capability.
+  bool filterGpuResources = true;
+
+  // The master's domain, if any.
+  Option<DomainInfo> domain = None();
+
+  // The minimum allocatable resource quantities, if any.
+  Option<std::vector<ResourceQuantities>> minAllocatableResources = None();
+
+  size_t maxCompletedFrameworks = 0;
+
+  bool publishPerFrameworkMetrics = true;
+};
+
 
 /**
  * Basic model of an allocator: resources are allocated to a framework
@@ -60,9 +87,15 @@ public:
    * allocator instance from a module using the given name. If `Try`
    * does not report an error, the wrapped `Allocator*` is not null.
    *
+   * TODO(bmahler): Figure out how to pass parameters without
+   * burning in the built-in module arguments.
+   *
    * @param name Name of the allocator.
    */
-  static Try<Allocator*> create(const std::string& name);
+  static Try<Allocator*> create(
+      const std::string& name,
+      const std::string& roleSorter,
+      const std::string& frameworkSorter);
 
   Allocator() {}
 
@@ -83,7 +116,7 @@ public:
    *     allocations from the frameworks.
    */
   virtual void initialize(
-      const Duration& allocationInterval,
+      const Options& options,
       const lambda::function<
           void(const FrameworkID&,
                const hashmap<std::string, hashmap<SlaveID, Resources>>&)>&
@@ -91,11 +124,7 @@ public:
       const lambda::function<
           void(const FrameworkID&,
                const hashmap<SlaveID, UnavailableResources>&)>&
-        inverseOfferCallback,
-      const Option<std::set<std::string>>&
-        fairnessExcludeResourceNames = None(),
-      bool filterGpuResources = true,
-      const Option<DomainInfo>& domain = None()) = 0;
+        inverseOfferCallback) = 0;
 
   /**
    * Informs the allocator of the recovered state from the master.
@@ -344,13 +373,22 @@ public:
     getInverseOfferStatuses() = 0;
 
   /**
+   * This method should be invoked when the offered resources has become
+   * actually allocated.
+   */
+  virtual void transitionOfferedToAllocated(
+      const SlaveID& slaveId, const Resources& resources) = 0;
+
+  /**
    * Recovers resources.
    *
    * Used to update the set of available resources for a specific agent. This
-   * method is invoked to inform the allocator about allocated resources that
-   * have been refused or are no longer in use. Allocated resources will have
-   * an `allocation_info.role` assigned and callers are expected to only call
-   * this with resources allocated to a single role.
+   * method is invoked to inform the allocator about offered resources that
+   * have been refused or allocated (i.e. used for launching tasks) resources
+   * that are no longer in use. The resources will have an
+   * `allocation_info.role` assigned and callers are expected to only call this
+   * with resources allocated to a single role.
+   *
    *
    * TODO(bmahler): We could allow resources allocated to multiple roles
    * within a single call here, but filtering them in the same way does
@@ -360,7 +398,8 @@ public:
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& resources,
-      const Option<Filters>& filters) = 0;
+      const Option<Filters>& filters,
+      bool isAllocated) = 0;
 
   /**
    * Suppresses offers.
@@ -385,43 +424,17 @@ public:
       const std::set<std::string>& roles) = 0;
 
   /**
-   * Informs the allocator to set quota for the given role.
+   * Informs the allocator to update quota for the given role.
    *
    * It is up to the allocator implementation how to satisfy quota. An
    * implementation may employ different strategies for roles with or
-   * without quota. Hence an empty (or zero) quota is not necessarily the
-   * same as an absence of quota. Logically, this method implies that the
-   * given role should be transitioned to the group of roles with quota
-   * set. An allocator implementation may assert quota for the given role
-   * is not set prior to the call and react accordingly if this assumption
-   * is violated (i.e. fail).
-   *
-   * TODO(alexr): Consider returning a future which an allocator can fail
-   * in order to report failure.
-   *
-   * TODO(alexr): Consider adding an `updateQuota()` method which allows
-   * updating existing quota.
+   * without quota. All roles have a default quota defined as `DEFAULT_QUOTA`.
+   * Currently, it is no guarantees and no limits. Thus to "remove" a quota,
+   * one should simply update the quota to be `DEFAULT_QUOTA`.
    */
-  virtual void setQuota(
+  virtual void updateQuota(
       const std::string& role,
       const Quota& quota) = 0;
-
-  /**
-   * Informs the allocator to remove quota for the given role.
-   *
-   * An allocator implementation may employ different strategies for roles
-   * with or without quota. Hence an empty (or zero) quota is not necessarily
-   * the same as an absence of quota. Logically, this method implies that the
-   * given role should be transitioned to the group of roles without quota
-   * set (absence of quota). An allocator implementation may assert quota
-   * for the given role is set prior to the call and react accordingly if
-   * this assumption is violated (i.e. fail).
-   *
-   * TODO(alexr): Consider returning a future which an allocator can fail in
-   * order to report failure.
-   */
-  virtual void removeQuota(
-      const std::string& role) = 0;
 
   /**
    * Updates the weight associated with one or more roles. If a role
@@ -430,6 +443,16 @@ public:
    */
   virtual void updateWeights(
       const std::vector<WeightInfo>& weightInfos) = 0;
+
+  /**
+   * Idempotent helper to pause allocations.
+   */
+  virtual void pause() = 0;
+
+  /**
+   * Idempotent helper to resume allocations.
+   */
+  virtual void resume() = 0;
 };
 
 } // namespace allocator {

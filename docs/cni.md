@@ -23,7 +23,7 @@ default.
   - [Adding/Deleting/Modifying CNI networks](#adding-modifying-deleting)
   - [Attaching containers to CNI networks](#attaching-containers-to-cni-networks)
   - [Accessing container network namespace](#accessing-container-network-namespace)
-  - [Passing network labels and port-mapping information to CNI plugins](#mesos-meta-data-to-cni-plugins)
+  - [Passing network labels and port-mapping information to CNI plugins](#passing-network-labels-and-port-mapping-information-to-cni-plugins)
 - [Networking Recipes](#networking-recipes)
   - [A bridge network](#a-bridge-network)
   - [A port-mapper plugin for CNI networks](#a-port-mapper-plugin)
@@ -102,6 +102,13 @@ after Agent startup, the Agent needs to be restarted. The
 `network/cni` isolator has been designed with `recover` capabilities
 and hence restarting the Agent (and therefore the `network/cni`
 isolator) will not affect container orchestration.
+
+Optionally, the operator could specify the
+`--network_cni_root_dir_persist` flag. This flag would allow
+`network/cni` isolator to persist the network related information
+across reboot and allow `network/cni` isolator to carry out network
+cleanup post reboot. This is useful for the CNI networks that depend
+on the isolator to clean their network state.
 
 #### <a name="adding-modifying-deleting"></a>Adding/Deleting/Modifying CNI networks
 
@@ -467,7 +474,7 @@ port-mapping information itself is learned by looking at the
 `NetworkInfo` set in the `args` field of the CNI configuration passed
 by Mesos to the port-mapper plugin. Please refer to the "[Passing
 network labels and port-mapping information to CNI
-plugins](#mesos-meta-data-to-cni-plugins)" section for more details.
+plugins](#passing-network-labels-and-port-mapping-information-to-cni-plugins)" section for more details.
 
 #### <a name="a-calico-network">A Calico network</a>
 

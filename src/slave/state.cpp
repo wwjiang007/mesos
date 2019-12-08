@@ -50,6 +50,7 @@
 
 #include "slave/paths.hpp"
 #include "slave/state.hpp"
+#include "slave/state.pb.h"
 
 namespace mesos {
 namespace internal {
@@ -84,7 +85,7 @@ Try<State> recover(const string& rootDir, bool strict)
   // resources checkpoint file.
   state.resources = resources.get();
 
-  const string& bootIdPath = paths::getBootIdPath(rootDir);
+  const string bootIdPath = paths::getBootIdPath(rootDir);
   if (os::exists(bootIdPath)) {
     Result<string> read = state::read<string>(bootIdPath);
     if (read.isError()) {
@@ -101,7 +102,7 @@ Try<State> recover(const string& rootDir, bool strict)
     }
   }
 
-  const string& latest = paths::getLatestSlavePath(rootDir);
+  const string latest = paths::getLatestSlavePath(rootDir);
 
   // Check if the "latest" symlink to a slave directory exists.
   if (!os::exists(latest)) {
@@ -123,7 +124,9 @@ Try<State> recover(const string& rootDir, bool strict)
   SlaveID slaveId;
   slaveId.set_value(Path(directory.get()).basename());
 
-  Try<SlaveState> slave = SlaveState::recover(rootDir, slaveId, strict);
+  Try<SlaveState> slave =
+    SlaveState::recover(rootDir, slaveId, strict, state.rebooted);
+
   if (slave.isError()) {
     return Error(slave.error());
   }
@@ -137,13 +140,14 @@ Try<State> recover(const string& rootDir, bool strict)
 Try<SlaveState> SlaveState::recover(
     const string& rootDir,
     const SlaveID& slaveId,
-    bool strict)
+    bool strict,
+    bool rebooted)
 {
   SlaveState state;
   state.id = slaveId;
 
   // Read the slave info.
-  const string& path = paths::getSlaveInfoPath(rootDir, slaveId);
+  const string path = paths::getSlaveInfoPath(rootDir, slaveId);
   if (!os::exists(path)) {
     // This could happen if the slave died before it registered with
     // the master.
@@ -154,7 +158,7 @@ Try<SlaveState> SlaveState::recover(
   Result<SlaveInfo> slaveInfo = state::read<SlaveInfo>(path);
 
   if (slaveInfo.isError()) {
-    const string& message = "Failed to read agent info from '" + path + "': " +
+    const string message = "Failed to read agent info from '" + path + "': " +
                             slaveInfo.error();
     if (strict) {
       return Error(message);
@@ -166,8 +170,8 @@ Try<SlaveState> SlaveState::recover(
   }
 
   if (slaveInfo.isNone()) {
-    // This could happen if the slave died after opening the file for
-    // writing but before it checkpointed anything.
+    // This could happen if the slave is hard rebooted after the file is created
+    // but before the data is synced on disk.
     LOG(WARNING) << "Found empty agent info file '" << path << "'";
     return state;
   }
@@ -188,7 +192,7 @@ Try<SlaveState> SlaveState::recover(
     frameworkId.set_value(Path(path).basename());
 
     Try<FrameworkState> framework =
-      FrameworkState::recover(rootDir, slaveId, frameworkId, strict);
+      FrameworkState::recover(rootDir, slaveId, frameworkId, strict, rebooted);
 
     if (framework.isError()) {
       return Error("Failed to recover framework " + frameworkId.value() +
@@ -199,6 +203,78 @@ Try<SlaveState> SlaveState::recover(
     state.errors += framework->errors;
   }
 
+  // Recover any drain state.
+  const string drainConfigPath = paths::getDrainConfigPath(rootDir, slaveId);
+  if (os::exists(drainConfigPath)) {
+    Result<DrainConfig> drainConfig = state::read<DrainConfig>(drainConfigPath);
+    if (drainConfig.isError()) {
+      string message = "Failed to read agent state file '"
+                       + drainConfigPath + "': " + drainConfig.error();
+
+      LOG(WARNING) << message;
+      state.errors++;
+    }
+    if (drainConfig.isSome()) {
+      state.drainConfig = *drainConfig;
+    }
+  }
+
+  // Operations might be checkpointed in either the target resource state file
+  // or in the final resource state checkpoint location. If the target file
+  // exists, then the agent must have crashed while attempting to sync those
+  // target resources to disk. Since agent recovery guarantees that the agent
+  // will not successfully recover until the target resources are synced to disk
+  // and moved to the final checkpoint location, here we can safely recover
+  // operations from the target file if it exists.
+
+  const string targetPath = paths::getResourceStateTargetPath(rootDir);
+  const string resourceStatePath = paths::getResourceStatePath(rootDir);
+
+  if (os::exists(targetPath)) {
+    Result<ResourceState> target = state::read<ResourceState>(targetPath);
+    if (target.isError()) {
+      string message = "Failed to read resources and operations target file '" +
+                       targetPath + "': " + target.error();
+
+      if (strict) {
+        return Error(message);
+      } else {
+        LOG(WARNING) << message;
+        state.errors++;
+        return state;
+      }
+    }
+
+    if (target.isSome()) {
+      state.operations = std::vector<Operation>();
+      foreach (const Operation& operation, target->operations()) {
+        state.operations->push_back(operation);
+      }
+    }
+  } else if (os::exists(resourceStatePath)) {
+    Result<ResourceState> resourceState =
+      state::read<ResourceState>(resourceStatePath);
+    if (resourceState.isError()) {
+      string message = "Failed to read resource and operations file '" +
+                       resourceStatePath + "': " + resourceState.error();
+
+      if (strict) {
+        return Error(message);
+      } else {
+        LOG(WARNING) << message;
+        state.errors++;
+        return state;
+      }
+    }
+
+    if (resourceState.isSome()) {
+      state.operations = std::vector<Operation>();
+      foreach (const Operation& operation, resourceState->operations()) {
+        state.operations->push_back(operation);
+      }
+    }
+  }
+
   return state;
 }
 
@@ -207,7 +283,8 @@ Try<FrameworkState> FrameworkState::recover(
     const string& rootDir,
     const SlaveID& slaveId,
     const FrameworkID& frameworkId,
-    bool strict)
+    bool strict,
+    bool rebooted)
 {
   FrameworkState state;
   state.id = frameworkId;
@@ -239,8 +316,8 @@ Try<FrameworkState> FrameworkState::recover(
   }
 
   if (frameworkInfo.isNone()) {
-    // This could happen if the slave died after opening the file for
-    // writing but before it checkpointed anything.
+    // This could happen if the slave is hard rebooted after the file is created
+    // but before the data is synced on disk.
     LOG(WARNING) << "Found empty framework info file '" << path << "'";
     return state;
   }
@@ -272,8 +349,8 @@ Try<FrameworkState> FrameworkState::recover(
   }
 
   if (pid->empty()) {
-    // This could happen if the slave died after opening the file for
-    // writing but before it checkpointed anything.
+    // This could happen if the slave is hard rebooted after the file is created
+    // but before the data is synced on disk.
     LOG(WARNING) << "Found empty framework pid file '" << path << "'";
     return state;
   }
@@ -295,8 +372,8 @@ Try<FrameworkState> FrameworkState::recover(
     ExecutorID executorId;
     executorId.set_value(Path(path).basename());
 
-    Try<ExecutorState> executor =
-      ExecutorState::recover(rootDir, slaveId, frameworkId, executorId, strict);
+    Try<ExecutorState> executor = ExecutorState::recover(
+        rootDir, slaveId, frameworkId, executorId, strict, rebooted);
 
     if (executor.isError()) {
       return Error("Failed to recover executor '" + executorId.value() +
@@ -316,7 +393,8 @@ Try<ExecutorState> ExecutorState::recover(
     const SlaveID& slaveId,
     const FrameworkID& frameworkId,
     const ExecutorID& executorId,
-    bool strict)
+    bool strict,
+    bool rebooted)
 {
   ExecutorState state;
   state.id = executorId;
@@ -337,7 +415,7 @@ Try<ExecutorState> ExecutorState::recover(
   // Recover the runs.
   foreach (const string& path, runs.get()) {
     if (Path(path).basename() == paths::LATEST_SYMLINK) {
-      const Result<string>& latest = os::realpath(path);
+      const Result<string> latest = os::realpath(path);
       if (!latest.isSome()) {
         return Error(
             "Failed to find latest run of executor '" +
@@ -356,7 +434,13 @@ Try<ExecutorState> ExecutorState::recover(
       containerId.set_value(Path(path).basename());
 
       Try<RunState> run = RunState::recover(
-          rootDir, slaveId, frameworkId, executorId, containerId, strict);
+          rootDir,
+          slaveId,
+          frameworkId,
+          executorId,
+          containerId,
+          strict,
+          rebooted);
 
       if (run.isError()) {
         return Error(
@@ -380,7 +464,7 @@ Try<ExecutorState> ExecutorState::recover(
   }
 
   // Read the executor info.
-  const string& path =
+  const string path =
     paths::getExecutorInfoPath(rootDir, slaveId, frameworkId, executorId);
   if (!os::exists(path)) {
     // This could happen if the slave died after creating the executor
@@ -405,8 +489,8 @@ Try<ExecutorState> ExecutorState::recover(
   }
 
   if (executorInfo.isNone()) {
-    // This could happen if the slave died after opening the file for
-    // writing but before it checkpointed anything.
+    // This could happen if the slave is hard rebooted after the file is created
+    // but before the data is synced on disk.
     LOG(WARNING) << "Found empty executor info file '" << path << "'";
     return state;
   }
@@ -423,7 +507,8 @@ Try<RunState> RunState::recover(
     const FrameworkID& frameworkId,
     const ExecutorID& executorId,
     const ContainerID& containerId,
-    bool strict)
+    bool strict,
+    bool rebooted)
 {
   RunState state;
   state.id = containerId;
@@ -469,18 +554,37 @@ Try<RunState> RunState::recover(
     state.errors += task->errors;
   }
 
-  // Read the forked pid.
   path = paths::getForkedPidPath(
       rootDir, slaveId, frameworkId, executorId, containerId);
+
+  // If agent host is rebooted, we do not read the forked pid and libprocess pid
+  // since those two pids are obsolete after reboot. And we remove the forked
+  // pid file to make sure we will not read it in the case the agent process is
+  // restarted after we checkpoint the new boot ID in `Slave::__recover` (i.e.,
+  // agent recovery is done after the reboot).
+  if (rebooted) {
+    if (os::exists(path)) {
+      Try<Nothing> rm = os::rm(path);
+      if (rm.isError()) {
+        return Error(
+            "Failed to remove executor forked pid file '" + path + "': " +
+            rm.error());
+      }
+    }
+
+    return state;
+  }
+
   if (!os::exists(path)) {
-    // This could happen if the slave died before the isolator
-    // checkpointed the forked pid.
+    // This could happen if the slave died before the containerizer checkpointed
+    // the forked pid or agent process is restarted after agent host is rebooted
+    // since we remove this file in the above code.
     LOG(WARNING) << "Failed to find executor forked pid file '" << path << "'";
     return state;
   }
 
+  // Read the forked pid.
   Result<string> pid = state::read<string>(path);
-
   if (pid.isError()) {
     message = "Failed to read executor forked pid from '" + path +
               "': " + pid.error();
@@ -495,8 +599,8 @@ Try<RunState> RunState::recover(
   }
 
   if (pid->empty()) {
-    // This could happen if the slave died after opening the file for
-    // writing but before it checkpointed anything.
+    // This could happen if the slave is hard rebooted after the file is created
+    // but before the data is synced on disk.
     LOG(WARNING) << "Found empty executor forked pid file '" << path << "'";
     return state;
   }
@@ -531,8 +635,8 @@ Try<RunState> RunState::recover(
     }
 
     if (pid->empty()) {
-      // This could happen if the slave died after opening the file for
-      // writing but before it checkpointed anything.
+      // This could happen if the slave is hard rebooted after the file is
+      // created but before the data is synced on disk.
       LOG(WARNING) << "Found empty executor libprocess pid file '" << path
                    << "'";
       return state;
@@ -601,8 +705,8 @@ Try<TaskState> TaskState::recover(
   }
 
   if (task.isNone()) {
-    // This could happen if the slave died after opening the file for
-    // writing but before it checkpointed anything.
+    // This could happen if the slave is hard rebooted after the file is created
+    // but before the data is synced on disk.
     LOG(WARNING) << "Found empty task info file '" << path << "'";
     return state;
   }
@@ -705,8 +809,73 @@ Try<ResourcesState> ResourcesState::recover(
 {
   ResourcesState state;
 
+  // The checkpointed resources may exist in one of two different formats:
+  // 1) Pre-operation-feedback, where only resources are written to a target
+  //    file, then moved to the final checkpoint location once any persistent
+  //    volumes have been committed to disk.
+  // 2) Post-operation-feedback, where both resources and operations are written
+  //    to a target file, then moved to the final checkpoint location once any
+  //    persistent volumes have been committed to disk.
+  //
+  // The post-operation-feedback agent writes both of these formats to disk to
+  // enable agent downgrades.
+
+  const string resourceStatePath = paths::getResourceStatePath(rootDir);
+  if (os::exists(resourceStatePath)) {
+    // The post-operation-feedback format was detected.
+    Result<ResourceState> resourceState =
+      state::read<ResourceState>(resourceStatePath);
+    if (resourceState.isError()) {
+      string message = "Failed to read resource and operations file '" +
+                       resourceStatePath + "': " + resourceState.error();
+
+      if (strict) {
+        return Error(message);
+      } else {
+        LOG(WARNING) << message;
+        state.errors++;
+        return state;
+      }
+    }
+
+    if (resourceState.isSome()) {
+      state.resources = resourceState->resources();
+    }
+
+    const string targetPath = paths::getResourceStateTargetPath(rootDir);
+    if (!os::exists(targetPath)) {
+      return state;
+    }
+
+    Result<ResourceState> target = state::read<ResourceState>(targetPath);
+    if (target.isError()) {
+      string message =
+        "Failed to read resources and operations target file '" +
+        targetPath + "': " + target.error();
+
+      if (strict) {
+        return Error(message);
+      } else {
+        LOG(WARNING) << message;
+        state.errors++;
+        return state;
+      }
+    }
+
+    if (target.isSome()) {
+      state.target = target->resources();
+    }
+
+    return state;
+  }
+
+  // Falling back to the pre-operation-feedback format.
+
+  LOG(INFO) << "No committed checkpointed resources and operations found at '"
+            << resourceStatePath << "'";
+
   // Process the committed resources.
-  const string& infoPath = paths::getResourcesInfoPath(rootDir);
+  const string infoPath = paths::getResourcesInfoPath(rootDir);
   if (!os::exists(infoPath)) {
     LOG(INFO) << "No committed checkpointed resources found at '"
               << infoPath << "'";
@@ -732,7 +901,7 @@ Try<ResourcesState> ResourcesState::recover(
   }
 
   // Process the target resources.
-  const string& targetPath = paths::getResourcesTargetPath(rootDir);
+  const string targetPath = paths::getResourcesTargetPath(rootDir);
   if (!os::exists(targetPath)) {
     return state;
   }

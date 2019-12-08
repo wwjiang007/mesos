@@ -28,6 +28,10 @@
 #include <stout/option.hpp>
 #include <stout/try.hpp>
 
+#include <process/network.hpp>
+
+#include <process/ssl/tls_config.hpp>
+
 namespace process {
 namespace network {
 namespace openssl {
@@ -41,7 +45,9 @@ namespace openssl {
 //    LIBPROCESS_SSL_CERT_FILE=(path to certificate)
 //    LIBPROCESS_SSL_KEY_FILE=(path to key)
 //    LIBPROCESS_SSL_VERIFY_CERT=(false|0,true|1)
+//    LIBPROCESS_SSL_VERIFY_SERVER_CERT=(false|0,true|1)
 //    LIBPROCESS_SSL_REQUIRE_CERT=(false|0,true|1)
+//    LIBPROCESS_SSL_REQUIRE_CLIENT_CERT=(false|0,true|1)
 //    LIBPROCESS_SSL_VERIFY_IPADD=(false|0,true|1)
 //    LIBPROCESS_SSL_VERIFY_DEPTH=(4)
 //    LIBPROCESS_SSL_CA_DIR=(path to CA directory)
@@ -51,6 +57,7 @@ namespace openssl {
 //    LIBPROCESS_SSL_ENABLE_TLS_V1_0=(false|0,true|1)
 //    LIBPROCESS_SSL_ENABLE_TLS_V1_1=(false|0,true|1)
 //    LIBPROCESS_SSL_ENABLE_TLS_V1_2=(false|0,true|1)
+//    LIBPROCESS_SSL_ENABLE_TLS_V1_3=(false|0,true|1)
 //    LIBPROCESS_SSL_ECDH_CURVES=(auto|list of curves separated by ':')
 //
 // TODO(benh): When/If we need to support multiple contexts in the
@@ -63,12 +70,30 @@ void initialize();
 // Returns the _global_ OpenSSL context.
 SSL_CTX* context();
 
+// An enum to track whether a given SSL object is in client or server mode.
+//
+// TODO(bevers): Once the minimum supported OpenSSL version is at least 1.1.1,
+// we can remove this enum and use the `SSL_is_server(ssl)` function instead.
+enum class Mode {
+  CLIENT,
+  SERVER,
+};
+
 // Verify that the hostname is properly associated with the peer
 // certificate associated with the specified SSL connection.
 Try<Nothing> verify(
     const SSL* const ssl,
+    Mode mode,
     const Option<std::string>& hostname = None(),
     const Option<net::IP>& ip = None());
+
+// Callback for setting SSL options after the TCP connection was
+// established but before the TLS handshake has started.
+Try<Nothing> configure_socket(
+    SSL* ssl,
+    Mode mode,
+    const Address& peer,
+    const Option<std::string>& peer_hostname);
 
 } // namespace openssl {
 } // namespace network {

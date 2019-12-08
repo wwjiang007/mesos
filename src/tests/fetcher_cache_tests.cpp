@@ -135,8 +135,8 @@ public:
 protected:
   void setupArchiveAsset();
 
-  virtual void SetUp();
-  virtual void TearDown();
+  void SetUp() override;
+  void TearDown() override;
 
   // Sets up the slave and starts it. Calling this late in the test
   // instead of having it included in SetUp() gives us the opportunity
@@ -413,10 +413,10 @@ static Future<Nothing> awaitFinished(FetcherCacheTest::Task task)
 // Create a future that indicates that all tasks are finished.
 // TODO(bernd-mesos): Make this abstractions as generic and generally
 // available for all testing as possible.
-static Future<list<Nothing>> awaitFinished(
+static Future<vector<Nothing>> awaitFinished(
     vector<FetcherCacheTest::Task> tasks)
 {
-  list<Future<Nothing>> futures;
+  vector<Future<Nothing>> futures;
 
   foreach (FetcherCacheTest::Task task, tasks) {
     futures.push_back(awaitFinished(task));
@@ -697,6 +697,45 @@ TEST_F(FetcherCacheTest, LocalCached)
 }
 
 
+// This test launches a task with enabled cache, then removes all cached files,
+// then attempts to launch another task with the same URIs as the first task.
+// We expect that the fetcher retries to download all the artifacts when cached
+// files are missing.
+TEST_F(FetcherCacheTest, LocalCachedMissing)
+{
+  startSlave();
+  driver->start();
+
+  for (size_t i = 0; i < 2; i++) {
+    CommandInfo::URI uri;
+    uri.set_value(commandPath);
+    uri.set_executable(true);
+    uri.set_cache(true);
+
+    CommandInfo commandInfo;
+    commandInfo.set_value("./" + COMMAND_NAME + " " + taskName(i));
+    commandInfo.add_uris()->CopyFrom(uri);
+
+    const Try<Task> task = launchTask(commandInfo, i);
+    ASSERT_SOME(task);
+
+    AWAIT_READY(awaitFinished(task.get()));
+
+    const string path = path::join(task->runDirectory.string(), COMMAND_NAME);
+    EXPECT_TRUE(isExecutable(path));
+    EXPECT_TRUE(os::exists(path + taskName(i)));
+
+    EXPECT_EQ(1u, fetcherProcess->cacheSize());
+    ASSERT_SOME(fetcherProcess->cacheFiles());
+    EXPECT_EQ(1u, fetcherProcess->cacheFiles()->size());
+
+    verifyCacheMetrics();
+
+    EXPECT_SOME(os::rm(fetcherProcess->cacheFiles()->front()));
+  }
+}
+
+
 TEST_F(FetcherCacheTest, CachedCustomFilename)
 {
   startSlave();
@@ -943,7 +982,7 @@ public:
       CHECK(!_archivePath.empty());
     }
 
-    virtual void initialize()
+    void initialize() override
     {
       provide(COMMAND_NAME, commandPath);
       provide(ARCHIVE_NAME, archivePath);
@@ -971,7 +1010,7 @@ public:
       }
     }
 
-    virtual void consume(HttpEvent&& event)
+    void consume(HttpEvent&& event) override
     {
       if (latch.get() != nullptr) {
         latch->await();
@@ -1007,7 +1046,7 @@ public:
     Owned<Latch> latch;
   };
 
-  virtual void SetUp()
+  void SetUp() override
   {
     FetcherCacheTest::SetUp();
 
@@ -1015,7 +1054,7 @@ public:
     spawn(httpServer);
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     terminate(httpServer);
     wait(httpServer);

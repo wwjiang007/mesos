@@ -54,7 +54,7 @@ class MockResourceEstimator : public mesos::slave::ResourceEstimator
 {
 public:
   MockResourceEstimator();
-  virtual ~MockResourceEstimator();
+  ~MockResourceEstimator() override;
 
   MOCK_METHOD1(
       initialize,
@@ -72,7 +72,7 @@ class MockQoSController : public mesos::slave::QoSController
 {
 public:
   MockQoSController();
-  virtual ~MockQoSController();
+  ~MockQoSController() override;
 
   MOCK_METHOD1(
       initialize,
@@ -99,6 +99,8 @@ public:
       mesos::slave::ResourceEstimator* resourceEstimator,
       mesos::slave::QoSController* qosController,
       SecretGenerator* secretGenerator,
+      slave::VolumeGidManager* volumeGidManager,
+      PendingFutureTracker* futureTracker,
       const Option<Authorizer*>& authorizer);
 
   MOCK_METHOD6(___run, void(
@@ -106,16 +108,16 @@ public:
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
       const ContainerID& containerId,
-      const std::list<TaskInfo>& tasks,
-      const std::list<TaskGroupInfo>& taskGroups));
+      const std::vector<TaskInfo>& tasks,
+      const std::vector<TaskGroupInfo>& taskGroups));
 
   void unmocked____run(
       const process::Future<Nothing>& future,
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
       const ContainerID& containerId,
-      const std::list<TaskInfo>& tasks,
-      const std::list<TaskGroupInfo>& taskGroups);
+      const std::vector<TaskInfo>& tasks,
+      const std::vector<TaskGroupInfo>& taskGroups);
 
   MOCK_METHOD7(runTask, void(
       const process::UPID& from,
@@ -191,6 +193,14 @@ public:
       const process::UPID& from,
       const KillTaskMessage& killTaskMessage);
 
+  MOCK_METHOD2(authenticate, void(
+      Duration minTimeout,
+      Duration maxTimeout));
+
+  void unmocked_authenticate(
+      Duration minTimeout,
+      Duration maxTimeout);
+
   MOCK_METHOD1(removeFramework, void(
       slave::Framework* framework));
 
@@ -244,6 +254,12 @@ public:
   void unmocked__shutdownExecutor(
       slave::Framework* framework,
       slave::Executor* executor);
+
+  MOCK_METHOD1(applyOperation, void(
+      const ApplyOperationMessage& message));
+
+  void unmocked_applyOperation(
+      const ApplyOperationMessage& message);
 };
 
 } // namespace tests {

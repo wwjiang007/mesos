@@ -16,8 +16,6 @@
 
 #include "master/master.hpp"
 
-#include <list>
-
 #include <mesos/roles.hpp>
 
 #include <mesos/authorizer/authorizer.hpp>
@@ -30,6 +28,8 @@
 #include <stout/strings.hpp>
 #include <stout/utils.hpp>
 
+#include "common/authorization.hpp"
+
 #include "master/weights.hpp"
 
 namespace http = process::http;
@@ -38,7 +38,6 @@ using google::protobuf::RepeatedPtrField;
 
 using mesos::authorization::createSubject;
 
-using std::list;
 using std::string;
 using std::vector;
 
@@ -120,7 +119,8 @@ Future<vector<WeightInfo>> Master::WeightsHandler::_getWeights(
 
   // Create a list of authorization actions for each role we may return.
   // TODO(alexr): Batch these actions once we have BatchRequest in authorizer.
-  list<Future<bool>> roleAuthorizations;
+  vector<Future<bool>> roleAuthorizations;
+  roleAuthorizations.reserve(weightInfos.size());
   foreach (const WeightInfo& info, weightInfos) {
     roleAuthorizations.push_back(authorizeGetWeight(principal, info));
   }
@@ -128,7 +128,7 @@ Future<vector<WeightInfo>> Master::WeightsHandler::_getWeights(
   return process::collect(roleAuthorizations)
     .then(defer(
         master->self(),
-        [=](const list<bool>& roleAuthorizationsCollected)
+        [=](const vector<bool>& roleAuthorizationsCollected)
           -> Future<vector<WeightInfo>> {
       return _filterWeights(weightInfos, roleAuthorizationsCollected);
   }));
@@ -137,7 +137,7 @@ Future<vector<WeightInfo>> Master::WeightsHandler::_getWeights(
 
 Future<vector<WeightInfo>> Master::WeightsHandler::_filterWeights(
     const vector<WeightInfo>& weightInfos,
-    const list<bool>& roleAuthorizations) const
+    const vector<bool>& roleAuthorizations) const
 {
   CHECK(weightInfos.size() == roleAuthorizations.size());
 
@@ -303,13 +303,7 @@ void Master::WeightsHandler::rescindOffers(
   if (rescind) {
     foreachvalue (const Slave* slave, master->slaves.registered) {
       foreach (Offer* offer, utils::copy(slave->offers)) {
-        master->allocator->recoverResources(
-            offer->framework_id(),
-            offer->slave_id(),
-            offer->resources(),
-            None());
-
-        master->removeOffer(offer, true);
+        master->rescindOffer(offer);
       }
     }
   }
@@ -336,7 +330,8 @@ Future<bool> Master::WeightsHandler::authorizeUpdateWeights(
     request.mutable_subject()->CopyFrom(subject.get());
   }
 
-  list<Future<bool>> authorizations;
+  vector<Future<bool>> authorizations;
+  authorizations.reserve(roles.size());
   foreach (const string& role, roles) {
     request.mutable_object()->set_value(role);
     authorizations.push_back(master->authorizer.get()->authorized(request));
@@ -346,17 +341,7 @@ Future<bool> Master::WeightsHandler::authorizeUpdateWeights(
     return master->authorizer.get()->authorized(request);
   }
 
-  return await(authorizations)
-      .then([](const list<Future<bool>>& authorizations)
-            -> Future<bool> {
-        // Compute a disjunction.
-        foreach (const Future<bool>& authorization, authorizations) {
-          if (!authorization.get()) {
-            return false;
-          }
-        }
-        return true;
-      });
+  return authorization::collectAuthorizations(authorizations);
 }
 
 

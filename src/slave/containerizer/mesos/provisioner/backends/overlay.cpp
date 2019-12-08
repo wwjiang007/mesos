@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "slave/containerizer/mesos/provisioner/backends/overlay.hpp"
+
 #include <process/dispatch.hpp>
 #include <process/id.hpp>
 #include <process/process.hpp>
@@ -27,7 +29,9 @@
 
 #include "linux/fs.hpp"
 
-#include "slave/containerizer/mesos/provisioner/backends/overlay.hpp"
+#include "slave/paths.hpp"
+
+#include "slave/containerizer/mesos/provisioner/constants.hpp"
 
 using process::Failure;
 using process::Future;
@@ -52,7 +56,7 @@ public:
   OverlayBackendProcess()
     : ProcessBase(process::ID::generate("overlay-provisioner-backend")) {}
 
-  Future<Nothing> provision(
+  Future<Option<vector<Path>>> provision(
       const vector<string>& layers,
       const string& rootfs,
       const string& backendDir);
@@ -61,6 +65,21 @@ public:
       const string& rootfs,
       const string& backendDir);
 };
+
+
+Try<std::list<std::string>> OverlayBackend::listEphemeralVolumes(
+    const string& workDir)
+{
+  return os::glob(path::join(
+    paths::getProvisionerDir(workDir),
+    "containers",
+    "*", /* ContainerID */
+    "backends",
+    OVERLAY_BACKEND, /* backendDir */
+    "scratch"
+    "*", /* rootfs ID */
+    "*"));
+}
 
 
 Try<Owned<Backend>> OverlayBackend::create(const Flags&)
@@ -88,7 +107,7 @@ OverlayBackend::OverlayBackend(Owned<OverlayBackendProcess> _process)
 }
 
 
-Future<Nothing> OverlayBackend::provision(
+Future<Option<vector<Path>>> OverlayBackend::provision(
     const vector<string>& layers,
     const string& rootfs,
     const string& backendDir)
@@ -114,7 +133,7 @@ Future<bool> OverlayBackend::destroy(
 }
 
 
-Future<Nothing> OverlayBackendProcess::provision(
+Future<Option<vector<Path>>> OverlayBackendProcess::provision(
     const vector<string>& layers,
     const string& rootfs,
     const string& backendDir)
@@ -237,7 +256,10 @@ Future<Nothing> OverlayBackendProcess::provision(
         "' as a shared mount: " + mount.error());
   }
 
-  return Nothing();
+  // Note that both upperdir and workdir are ephemeral. The `disk/xfs`
+  // isolator needs this because XFS will error with EXDEV when renaming
+  // a file into a tree with a different project ID (see xfs_rename).
+  return vector<Path>{Path(upperdir), Path(workdir)};
 }
 
 
@@ -252,8 +274,11 @@ Future<bool> OverlayBackendProcess::destroy(
 
   foreach (const fs::MountInfoTable::Entry& entry, mountTable->entries) {
     if (entry.target == rootfs) {
-      // NOTE: This would fail if the rootfs is still in use.
-      Try<Nothing> unmount = fs::unmount(entry.target);
+      // NOTE: Use MNT_DETACH here so that if there are still
+      // processes holding files or directories in the rootfs, the
+      // unmount will still be successful. The kernel will cleanup the
+      // mount when the number of references reach zero.
+      Try<Nothing> unmount = fs::unmount(entry.target, MNT_DETACH);
       if (unmount.isError()) {
         return Failure(
             "Failed to destroy overlay-mounted rootfs '" + rootfs + "': " +
@@ -262,9 +287,16 @@ Future<bool> OverlayBackendProcess::destroy(
 
       Try<Nothing> rmdir = os::rmdir(rootfs);
       if (rmdir.isError()) {
-        return Failure(
-            "Failed to remove rootfs mount point '" + rootfs + "': " +
-            rmdir.error());
+        // NOTE: Due to the use of MNT_DETACH above, it's possible
+        // that `rmdir` will fail with EBUSY if some other mounts in
+        // other mount namespaces are still on this mount point on
+        // some old kernel (https://lwn.net/Articles/570338/). No need
+        // to return a hard failure here because the directory will be
+        // removed later and re-attempted on agent recovery.
+        //
+        // TODO(jieyu): Consider only ignore EBUSY error.
+        LOG(ERROR) << "Failed to remove rootfs mount point "
+                   << "'" << rootfs << "': " << rmdir.error();
       }
 
       // Clean up tempDir used for image layer links.
@@ -292,7 +324,9 @@ Future<bool> OverlayBackendProcess::destroy(
       if (realpath.isSome()) {
         Try<Nothing> rmdir = os::rmdir(realpath.get());
         if (rmdir.isError()) {
-          return Failure("");
+          return Failure(
+              "Failed to remove temporary directory for symlinks at "
+              "'" + realpath.get() + "': " + rmdir.error());
         }
 
         VLOG(1) << "Removed temporary directory '" << realpath.get()

@@ -89,6 +89,15 @@ TEST(ValuesTest, InvalidInput)
 
   // Test when giving empty string.
   EXPECT_ERROR(parse("  "));
+
+  EXPECT_ERROR(parse("nan"));
+  EXPECT_ERROR(parse("-nan"));
+
+  EXPECT_ERROR(parse("inf"));
+  EXPECT_ERROR(parse("-inf"));
+
+  EXPECT_ERROR(parse("infinity"));
+  EXPECT_ERROR(parse("-infinity"));
 }
 
 
@@ -428,9 +437,21 @@ TEST(ValuesTest, RangesAddition)
 // Test subtracting two ranges.
 TEST(ValuesTest, RangesSubtraction)
 {
-  // Completely subsumes.
-  Value::Ranges ranges1 = parse("[3-8]")->ranges();
+  // Ranges1 is empty.
+  Value::Ranges ranges1 = parse("[]")->ranges();
   Value::Ranges ranges2 = parse("[1-10]")->ranges();
+
+  EXPECT_EQ(parse("[]")->ranges(), ranges1 - ranges2);
+
+  // Ranges2 is empty.
+  ranges1 = parse("[3-8]")->ranges();
+  ranges2 = parse("[]")->ranges();
+
+  EXPECT_EQ(parse("[3-8]")->ranges(), ranges1 - ranges2);
+
+  // Completely subsumes.
+  ranges1 = parse("[3-8]")->ranges();
+  ranges2 = parse("[1-10]")->ranges();
 
   EXPECT_EQ(parse("[]")->ranges(), ranges1 - ranges2);
 

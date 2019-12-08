@@ -65,25 +65,48 @@ using mesos::master::detector::MasterDetector;
 using mesos::slave::ContainerTermination;
 using mesos::slave::Isolator;
 
+namespace process {
+
+void reinitialize(
+    const Option<string>& delegate,
+    const Option<string>& readonlyAuthenticationRealm,
+    const Option<string>& readwriteAuthenticationRealm);
+
+} // namespace process {
+
+
 namespace mesos {
 namespace internal {
 namespace tests {
 
-class LinuxFilesystemIsolatorTest : public MesosTest {};
+class LinuxFilesystemIsolatorTest : public MesosTest
+{
+protected:
+  slave::Flags CreateSlaveFlags() override
+  {
+    slave::Flags flags = MesosTest::CreateSlaveFlags();
+    flags.isolation = "filesystem/linux,docker/runtime";
+    flags.docker_registry = GetRegistryPath();
+    flags.docker_store_dir = path::join(sandbox.get(), "store");
+    flags.image_providers = "docker";
+
+    return flags;
+  }
+
+  string GetRegistryPath() const
+  {
+    return path::join(sandbox.get(), "registry");
+  }
+};
 
 
 // This test verifies that the root filesystem of the container is
 // properly changed to the one that's provisioned by the provisioner.
 TEST_F(LinuxFilesystemIsolatorTest, ROOT_ChangeRootFilesystem)
 {
-  string registry = path::join(sandbox.get(), "registry");
-  AWAIT_READY(DockerArchive::create(registry, "test_image"));
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image"));
 
   slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "filesystem/linux,docker/runtime";
-  flags.docker_registry = registry;
-  flags.docker_store_dir = path::join(sandbox.get(), "store");
-  flags.image_providers = "docker";
 
   Fetcher fetcher(flags);
 
@@ -123,18 +146,118 @@ TEST_F(LinuxFilesystemIsolatorTest, ROOT_ChangeRootFilesystem)
 }
 
 
+// This test verifies that pseudo devices like /dev/random are properly mounted
+// in the container's root filesystem.
+TEST_F(LinuxFilesystemIsolatorTest, ROOT_PseudoDevicesWithRootFilesystem)
+{
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image"));
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Fetcher fetcher(flags);
+
+  Try<MesosContainerizer*> create =
+    MesosContainerizer::create(flags, true, &fetcher);
+
+  ASSERT_SOME(create);
+
+  Owned<Containerizer> containerizer(create.get());
+
+  ContainerID containerId;
+  containerId.set_value(id::UUID::random().toString());
+
+  ExecutorInfo executor = createExecutorInfo(
+      "test_executor",
+      "dd if=/dev/zero of=/dev/null bs=1024 count=1 &&"
+      "dd if=/dev/random of=/dev/null bs=1024 count=1 &&"
+      "dd if=/dev/urandom of=/dev/null bs=1024 count=1 &&"
+      "dd if=/dev/full of=/dev/null bs=1024 count=1");
+
+  executor.mutable_container()->CopyFrom(createContainerInfo("test_image"));
+
+  string directory = path::join(flags.work_dir, "sandbox");
+  ASSERT_SOME(os::mkdir(directory));
+
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
+      containerId,
+      createContainerConfig(None(), executor, directory),
+      map<string, string>(),
+      None());
+
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
+
+  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+
+  AWAIT_READY(wait);
+  ASSERT_SOME(wait.get());
+  ASSERT_TRUE(wait->get().has_status());
+  EXPECT_WEXITSTATUS_EQ(0, wait->get().status());
+}
+
+
+// This test verifies that paths can be masked in the container's
+// root filesystem.
+TEST_F(LinuxFilesystemIsolatorTest, ROOT_MaskedPathsWithRootFilesystem)
+{
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image"));
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Fetcher fetcher(flags);
+
+  Try<MesosContainerizer*> create =
+    MesosContainerizer::create(flags, true, &fetcher);
+
+  ASSERT_SOME(create);
+
+  Owned<Containerizer> containerizer(create.get());
+
+  ContainerID containerId;
+  containerId.set_value(id::UUID::random().toString());
+
+  ExecutorInfo executor = createExecutorInfo(
+      "test_executor",
+      "set -x;"
+      // /proc/keys should be a char special because we masked it.
+      "test -c /proc/keys || exit 1;"
+      "test -s /proc/keys && exit 1;"
+      // /proc/scsi/scsi should not exist since we masked /proc/scsi.
+      "test -d /proc/scsi/scsi && exit 1;"
+      // Verify masked paths are read-only.
+      "mkdir /proc/scsi/foo && exit 1;"
+      "dd if=/dev/zero of=/proc/keys count=1;"
+      "test -c /proc/keys || exit 1;"
+      "exit 0");
+
+  executor.mutable_container()->CopyFrom(createContainerInfo("test_image"));
+
+  string directory = path::join(flags.work_dir, "sandbox");
+  ASSERT_SOME(os::mkdir(directory));
+
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
+      containerId,
+      createContainerConfig(None(), executor, directory),
+      map<string, string>(),
+      None());
+
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
+
+  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+
+  AWAIT_READY(wait);
+  ASSERT_SOME(wait.get());
+  ASSERT_TRUE(wait->get().has_status());
+  EXPECT_WEXITSTATUS_EQ(0, wait->get().status());
+}
+
+
 // This test verifies that the metrics about the number of executors
 // that have root filesystem specified is correctly reported.
 TEST_F(LinuxFilesystemIsolatorTest, ROOT_Metrics)
 {
-  string registry = path::join(sandbox.get(), "registry");
-  AWAIT_READY(DockerArchive::create(registry, "test_image"));
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image"));
 
   slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "filesystem/linux,docker/runtime";
-  flags.docker_registry = registry;
-  flags.docker_store_dir = path::join(sandbox.get(), "store");
-  flags.image_providers = "docker";
 
   Fetcher fetcher(flags);
 
@@ -187,14 +310,9 @@ TEST_F(LinuxFilesystemIsolatorTest, ROOT_Metrics)
 // the container's root filesystem.
 TEST_F(LinuxFilesystemIsolatorTest, ROOT_PersistentVolumeWithRootFilesystem)
 {
-  string registry = path::join(sandbox.get(), "registry");
-  AWAIT_READY(DockerArchive::create(registry, "test_image"));
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image"));
 
   slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "filesystem/linux,docker/runtime";
-  flags.docker_registry = registry;
-  flags.docker_store_dir = path::join(sandbox.get(), "store");
-  flags.image_providers = "docker";
 
   Fetcher fetcher(flags);
 
@@ -258,14 +376,9 @@ TEST_F(LinuxFilesystemIsolatorTest, ROOT_PersistentVolumeWithRootFilesystem)
 TEST_F(LinuxFilesystemIsolatorTest,
        ROOT_PersistentVolumeAndHostVolumeWithRootFilesystem)
 {
-  string registry = path::join(sandbox.get(), "registry");
-  AWAIT_READY(DockerArchive::create(registry, "test_image"));
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image"));
 
   slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "filesystem/linux,docker/runtime";
-  flags.docker_registry = registry;
-  flags.docker_store_dir = path::join(sandbox.get(), "store");
-  flags.image_providers = "docker";
 
   Fetcher fetcher(flags);
 
@@ -330,14 +443,7 @@ TEST_F(LinuxFilesystemIsolatorTest,
 // the container does not specify a root filesystem.
 TEST_F(LinuxFilesystemIsolatorTest, ROOT_PersistentVolumeWithoutRootFilesystem)
 {
-  string registry = path::join(sandbox.get(), "registry");
-  AWAIT_READY(DockerArchive::create(registry, "test_image"));
-
   slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "filesystem/linux,docker/runtime";
-  flags.docker_registry = registry;
-  flags.docker_store_dir = path::join(sandbox.get(), "store");
-  flags.image_providers = "docker";
 
   Fetcher fetcher(flags);
 
@@ -395,15 +501,10 @@ TEST_F(LinuxFilesystemIsolatorTest, ROOT_PersistentVolumeWithoutRootFilesystem)
 // launched simultaneously with no interference.
 TEST_F(LinuxFilesystemIsolatorTest, ROOT_MultipleContainers)
 {
-  string registry = path::join(sandbox.get(), "registry");
-  AWAIT_READY(DockerArchive::create(registry, "test_image1"));
-  AWAIT_READY(DockerArchive::create(registry, "test_image2"));
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image1"));
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image2"));
 
   slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "filesystem/linux,docker/runtime";
-  flags.docker_registry = registry;
-  flags.docker_store_dir = path::join(sandbox.get(), "store");
-  flags.image_providers = "docker";
 
   Fetcher fetcher(flags);
 
@@ -471,12 +572,10 @@ TEST_F(LinuxFilesystemIsolatorTest, ROOT_MultipleContainers)
 
   // Wait on the containers.
   Future<Option<ContainerTermination>> wait1 =
-    containerizer->wait(containerId1);
+    containerizer->destroy(containerId1);
 
   Future<Option<ContainerTermination>> wait2 =
     containerizer->wait(containerId2);
-
-  containerizer->destroy(containerId1);
 
   AWAIT_READY(wait1);
   ASSERT_SOME(wait1.get());
@@ -581,7 +680,6 @@ TEST_F(LinuxFilesystemIsolatorTest, ROOT_WorkDirMountNeeded)
 TEST_F(LinuxFilesystemIsolatorTest, ROOT_PersistentVolumeMountPointCleanup)
 {
   slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "filesystem/linux";
 
   Fetcher fetcher(flags);
 
@@ -662,14 +760,9 @@ TEST_F(LinuxFilesystemIsolatorMesosTest,
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  string registry = path::join(sandbox.get(), "registry");
-  AWAIT_READY(DockerArchive::create(registry, "test_image"));
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image"));
 
   slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "filesystem/linux,docker/runtime";
-  flags.docker_registry = registry;
-  flags.docker_store_dir = path::join(sandbox.get(), "store");
-  flags.image_providers = "docker";
 
   Owned<MasterDetector> detector = master.get()->createDetector();
 
@@ -738,15 +831,10 @@ TEST_F(LinuxFilesystemIsolatorMesosTest,
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  string registry = path::join(sandbox.get(), "registry");
-  AWAIT_READY(DockerArchive::create(registry, "test_image"));
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image"));
 
   slave::Flags flags = CreateSlaveFlags();
   flags.resources = "cpus:2;mem:1024;disk(role1):1024";
-  flags.isolation = "filesystem/linux,docker/runtime";
-  flags.docker_registry = registry;
-  flags.docker_store_dir = path::join(sandbox.get(), "store");
-  flags.image_providers = "docker";
 
   Owned<MasterDetector> detector = master.get()->createDetector();
 
@@ -868,15 +956,10 @@ TEST_F(LinuxFilesystemIsolatorMesosTest,
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  string registry = path::join(sandbox.get(), "registry");
-  AWAIT_READY(DockerArchive::create(registry, "test_image"));
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image"));
 
   slave::Flags flags = CreateSlaveFlags();
   flags.resources = "cpus:2;mem:1024;disk(role1):1024";
-  flags.isolation = "filesystem/linux,docker/runtime";
-  flags.docker_registry = registry;
-  flags.docker_store_dir = path::join(sandbox.get(), "store");
-  flags.image_providers = "docker";
 
   Fetcher fetcher(flags);
 
@@ -1025,14 +1108,9 @@ TEST_F(LinuxFilesystemIsolatorMesosTest, ROOT_SandboxEnvironmentVariable)
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  string registry = path::join(sandbox.get(), "registry");
-  AWAIT_READY(DockerArchive::create(registry, "test_image"));
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image"));
 
   slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "filesystem/linux,docker/runtime";
-  flags.docker_registry = registry;
-  flags.docker_store_dir = path::join(sandbox.get(), "store");
-  flags.image_providers = "docker";
 
   Owned<MasterDetector> detector = master.get()->createDetector();
 
@@ -1106,15 +1184,11 @@ TEST_F(LinuxFilesystemIsolatorMesosTest,
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  string registry = path::join(sandbox.get(), "registry");
-  AWAIT_READY(DockerArchive::create(registry, "test_image"));
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image"));
 
   slave::Flags flags = CreateSlaveFlags();
   flags.resources = "cpus:2;mem:128;disk(role1):128";
   flags.isolation = "disk/du,filesystem/linux,docker/runtime";
-  flags.docker_registry = registry;
-  flags.docker_store_dir = path::join(sandbox.get(), "store");
-  flags.image_providers = "docker";
 
   // NOTE: We can't pause the clock because we need the reaper to reap
   // the 'du' subprocess.
@@ -1209,15 +1283,10 @@ TEST_F(LinuxFilesystemIsolatorMesosTest,
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  string registry = path::join(sandbox.get(), "registry");
-  AWAIT_READY(DockerArchive::create(registry, "test_image"));
+  AWAIT_READY(DockerArchive::create(GetRegistryPath(), "test_image"));
 
   slave::Flags flags = CreateSlaveFlags();
   flags.resources = "cpus:2;mem:128;disk(role1):128";
-  flags.isolation = "filesystem/linux,docker/runtime";
-  flags.docker_registry = registry;
-  flags.docker_store_dir = path::join(sandbox.get(), "store");
-  flags.image_providers = "docker";
 
   Owned<MasterDetector> detector = master.get()->createDetector();
 
@@ -1299,6 +1368,132 @@ TEST_F(LinuxFilesystemIsolatorMesosTest,
   AWAIT_READY(statusFailed);
   EXPECT_EQ(task.task_id(), statusFailed->task_id());
   EXPECT_EQ(TASK_FAILED, statusFailed->state());
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that a command task launched with a non-root user can
+// write to a shared persistent volume and a non-shared persistent volume.
+TEST_F(LinuxFilesystemIsolatorMesosTest,
+       ROOT_UNPRIVILEGED_USER_PersistentVolumes)
+{
+  // Reinitialize libprocess to ensure volume gid manager's metrics
+  // can be added in each iteration of this test (i.e., run this test
+  // repeatedly with the `--gtest_repeat` option).
+  process::reinitialize(None(), None(), None());
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.resources = "cpus:2;mem:128;disk(role1):128";
+  flags.isolation = "filesystem/linux,docker/runtime";
+  flags.volume_gid_range = "[10000-20000]";
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, "role1");
+  frameworkInfo.add_capabilities()->set_type(
+      FrameworkInfo::Capability::SHARED_RESOURCES);
+
+  MesosSchedulerDriver driver(
+      &sched,
+      frameworkInfo,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  // Create two persistent volumes (shared and non-shared)
+  // which shall be used by the task to write to the volumes.
+  Resource volume1 = createPersistentVolume(
+      Megabytes(4),
+      "role1",
+      "id1",
+      "volume_path1",
+      None(),
+      None(),
+      frameworkInfo.principal(),
+      true); // Shared volume.
+
+  Resource volume2 = createPersistentVolume(
+      Megabytes(4),
+      "role1",
+      "id2",
+      "volume_path2",
+      None(),
+      None(),
+      frameworkInfo.principal(),
+      false); // Non-shared volume.
+
+  Option<string> user = os::getenv("SUDO_USER");
+  ASSERT_SOME(user);
+
+  CommandInfo command = createCommandInfo(
+        "echo hello > volume_path1/file && echo world > volume_path2/file");
+
+  command.set_user(user.get());
+
+  Resources taskResources =
+    Resources::parse("cpus:1;mem:64;disk(role1):1").get() + volume1 + volume2;
+
+  TaskInfo task = createTask(
+      offers.get()[0].slave_id(),
+      taskResources,
+      command);
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFinished;
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFinished));
+
+  driver.acceptOffers(
+      {offers.get()[0].id()},
+      {CREATE(volume1),
+       CREATE(volume2),
+       LAUNCH({task})});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(task.task_id(), statusStarting->task_id());
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(task.task_id(), statusRunning->task_id());
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  AWAIT_READY(statusFinished);
+  EXPECT_EQ(task.task_id(), statusFinished->task_id());
+  EXPECT_EQ(TASK_FINISHED, statusFinished->state());
+
+  // Two gids should have been allocated to the volumes. Please note that
+  // persistent volume's gid will be deallocated only when it is destroyed.
+  JSON::Object metrics = Metrics();
+  EXPECT_EQ(
+      metrics.at<JSON::Number>("volume_gid_manager/volume_gids_total")
+        ->as<int>() - 2,
+      metrics.at<JSON::Number>("volume_gid_manager/volume_gids_free")
+        ->as<int>());
 
   driver.stop();
   driver.join();

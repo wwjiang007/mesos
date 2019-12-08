@@ -33,9 +33,24 @@ using ::testing::DoDefault;
 using ::testing::Invoke;
 using ::testing::Return;
 
+using mesos::allocator::Options;
+
 namespace mesos {
 namespace internal {
 namespace tests {
+
+// Allocator test helpers.
+
+Quota createQuota(const std::string& guarantees, const std::string& limits);
+
+
+// This is a legacy helper where we take in a resource string
+// and use that to set both quota guarantees and limits.
+Quota createQuota(const std::string& resources);
+
+
+WeightInfo createWeightInfo(const std::string& role, double weight);
+
 
 // The following actions make up for the fact that DoDefault
 // cannot be used inside a DoAll, for example:
@@ -45,7 +60,7 @@ namespace tests {
 
 ACTION_P(InvokeInitialize, allocator)
 {
-  allocator->real->initialize(arg0, arg1, arg2, arg3, arg4);
+  allocator->real->initialize(arg0, arg1, arg2);
 }
 
 
@@ -163,9 +178,15 @@ ACTION_P(InvokeGetInverseOfferStatuses, allocator)
 }
 
 
+ACTION_P(InvokeTransitionOfferedToAllocated, allocator)
+{
+  allocator->real->transitionOfferedToAllocated(arg0, arg1);
+}
+
+
 ACTION_P(InvokeRecoverResources, allocator)
 {
-  allocator->real->recoverResources(arg0, arg1, arg2, arg3);
+  allocator->real->recoverResources(arg0, arg1, arg2, arg3, arg4);
 }
 
 
@@ -174,7 +195,7 @@ ACTION_P2(InvokeRecoverResourcesWithFilters, allocator, timeout)
   Filters filters;
   filters.set_refuse_seconds(timeout);
 
-  allocator->real->recoverResources(arg0, arg1, arg2, filters);
+  allocator->real->recoverResources(arg0, arg1, arg2, filters, false);
 }
 
 
@@ -190,21 +211,27 @@ ACTION_P(InvokeReviveOffers, allocator)
 }
 
 
-ACTION_P(InvokeSetQuota, allocator)
+ACTION_P(InvokeUpdateQuota, allocator)
 {
-  allocator->real->setQuota(arg0, arg1);
-}
-
-
-ACTION_P(InvokeRemoveQuota, allocator)
-{
-  allocator->real->removeQuota(arg0);
+  allocator->real->updateQuota(arg0, arg1);
 }
 
 
 ACTION_P(InvokeUpdateWeights, allocator)
 {
   allocator->real->updateWeights(arg0);
+}
+
+
+ACTION_P(InvokePause, allocator)
+{
+  allocator->real->pause();
+}
+
+
+ACTION_P(InvokeResume, allocator)
+{
+  allocator->real->resume();
 }
 
 
@@ -235,9 +262,9 @@ public:
     // to get the best of both worlds: the ability to use 'DoDefault'
     // and no warnings when expectations are not explicit.
 
-    ON_CALL(*this, initialize(_, _, _, _, _, _))
+    ON_CALL(*this, initialize(_, _, _))
       .WillByDefault(InvokeInitialize(this));
-    EXPECT_CALL(*this, initialize(_, _, _, _, _, _))
+    EXPECT_CALL(*this, initialize(_, _, _))
       .WillRepeatedly(DoDefault());
 
     ON_CALL(*this, recover(_, _))
@@ -335,9 +362,14 @@ public:
     EXPECT_CALL(*this, getInverseOfferStatuses())
       .WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, recoverResources(_, _, _, _))
+    ON_CALL(*this, transitionOfferedToAllocated(_, _))
+      .WillByDefault(InvokeTransitionOfferedToAllocated(this));
+    EXPECT_CALL(*this, transitionOfferedToAllocated(_, _))
+      .WillRepeatedly(DoDefault());
+
+    ON_CALL(*this, recoverResources(_, _, _, _, _))
       .WillByDefault(InvokeRecoverResources(this));
-    EXPECT_CALL(*this, recoverResources(_, _, _, _))
+    EXPECT_CALL(*this, recoverResources(_, _, _, _, _))
       .WillRepeatedly(DoDefault());
 
     ON_CALL(*this, suppressOffers(_, _))
@@ -350,35 +382,37 @@ public:
     EXPECT_CALL(*this, reviveOffers(_, _))
       .WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, setQuota(_, _))
-      .WillByDefault(InvokeSetQuota(this));
-    EXPECT_CALL(*this, setQuota(_, _))
-      .WillRepeatedly(DoDefault());
-
-    ON_CALL(*this, removeQuota(_))
-      .WillByDefault(InvokeRemoveQuota(this));
-    EXPECT_CALL(*this, removeQuota(_))
+    ON_CALL(*this, updateQuota(_, _))
+      .WillByDefault(InvokeUpdateQuota(this));
+    EXPECT_CALL(*this, updateQuota(_, _))
       .WillRepeatedly(DoDefault());
 
     ON_CALL(*this, updateWeights(_))
       .WillByDefault(InvokeUpdateWeights(this));
     EXPECT_CALL(*this, updateWeights(_))
       .WillRepeatedly(DoDefault());
+
+    ON_CALL(*this, pause())
+      .WillByDefault(InvokePause(this));
+    EXPECT_CALL(*this, pause())
+      .WillRepeatedly(DoDefault());
+
+    ON_CALL(*this, resume())
+      .WillByDefault(InvokeResume(this));
+    EXPECT_CALL(*this, resume())
+      .WillRepeatedly(DoDefault());
   }
 
-  virtual ~TestAllocator() {}
+  ~TestAllocator() override {}
 
-  MOCK_METHOD6(initialize, void(
-      const Duration&,
+  MOCK_METHOD3(initialize, void(
+      const Options& options,
       const lambda::function<
           void(const FrameworkID&,
                const hashmap<std::string, hashmap<SlaveID, Resources>>&)>&,
       const lambda::function<
           void(const FrameworkID&,
-               const hashmap<SlaveID, UnavailableResources>&)>&,
-      const Option<std::set<std::string>>&,
-      bool,
-      const Option<DomainInfo>&));
+               const hashmap<SlaveID, UnavailableResources>&)>&));
 
   MOCK_METHOD2(recover, void(
       const int expectedAgentCount,
@@ -466,11 +500,16 @@ public:
           FrameworkID,
           mesos::allocator::InverseOfferStatus>>>());
 
-  MOCK_METHOD4(recoverResources, void(
+  MOCK_METHOD2(transitionOfferedToAllocated, void(
+      const SlaveID&,
+      const Resources&));
+
+  MOCK_METHOD5(recoverResources, void(
       const FrameworkID&,
       const SlaveID&,
       const Resources&,
-      const Option<Filters>& filters));
+      const Option<Filters>& filters,
+      bool isAllocated));
 
   MOCK_METHOD2(suppressOffers, void(
       const FrameworkID&,
@@ -480,15 +519,16 @@ public:
       const FrameworkID&,
       const std::set<std::string>&));
 
-  MOCK_METHOD2(setQuota, void(
+  MOCK_METHOD2(updateQuota, void(
       const std::string&,
       const Quota&));
 
-  MOCK_METHOD1(removeQuota, void(
-      const std::string&));
-
   MOCK_METHOD1(updateWeights, void(
       const std::vector<WeightInfo>&));
+
+  MOCK_METHOD0(pause, void());
+
+  MOCK_METHOD0(resume, void());
 
   process::Owned<mesos::allocator::Allocator> real;
 };

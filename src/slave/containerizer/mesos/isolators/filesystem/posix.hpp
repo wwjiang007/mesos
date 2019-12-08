@@ -23,6 +23,8 @@
 
 #include "slave/containerizer/mesos/isolator.hpp"
 
+#include "slave/volume_gid_manager/volume_gid_manager.hpp"
+
 namespace mesos {
 namespace internal {
 namespace slave {
@@ -30,29 +32,34 @@ namespace slave {
 class PosixFilesystemIsolatorProcess : public MesosIsolatorProcess
 {
 public:
-  static Try<mesos::slave::Isolator*> create(const Flags& flags);
+  static Try<mesos::slave::Isolator*> create(
+      const Flags& flags,
+      VolumeGidManager* volumeGidManager);
 
-  virtual ~PosixFilesystemIsolatorProcess();
+  ~PosixFilesystemIsolatorProcess() override;
 
-  virtual process::Future<Nothing> recover(
-      const std::list<mesos::slave::ContainerState>& states,
-      const hashset<ContainerID>& orphans);
+  process::Future<Nothing> recover(
+      const std::vector<mesos::slave::ContainerState>& states,
+      const hashset<ContainerID>& orphans) override;
 
-  virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
-      const mesos::slave::ContainerConfig& containerConfig);
+      const mesos::slave::ContainerConfig& containerConfig) override;
 
-  virtual process::Future<Nothing> update(
+  process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources);
+      const Resources& resources) override;
 
-  virtual process::Future<Nothing> cleanup(
-      const ContainerID& containerId);
+  process::Future<Nothing> cleanup(
+      const ContainerID& containerId) override;
 
 protected:
-  PosixFilesystemIsolatorProcess(const Flags& flags);
+  PosixFilesystemIsolatorProcess(
+      const Flags& flags,
+      VolumeGidManager* volumeGidManager);
 
   const Flags flags;
+  VolumeGidManager* volumeGidManager;
 
   struct Info
   {
@@ -63,6 +70,8 @@ protected:
 
     // Track resources so we can unlink unneeded persistent volumes.
     Resources resources;
+
+    std::vector<gid_t> gids;
   };
 
   hashmap<ContainerID, process::Owned<Info>> infos;

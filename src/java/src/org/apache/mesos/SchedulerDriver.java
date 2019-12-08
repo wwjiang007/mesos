@@ -254,9 +254,13 @@ public interface SchedulerDriver {
   Status declineOffer(OfferID offerId);
 
   /**
-   * Removes all filters, previously set by the framework (via {@link
-   * #launchTasks}). This enables the framework to receive offers
-   * from those filtered slaves.
+   * Removes all filters previously set by the framework (via launchTasks()
+   * or declineOffer()) and clears the set of suppressed roles.
+   *
+   * NOTE: If the framework is not connected to the master, the set
+   * of suppressed roles stored by the driver will be cleared, and an
+   * up-to-date set of suppressed roles will be sent to the master
+   * during re-registration.
    *
    * @return    The state of the driver after the call.
    *
@@ -265,14 +269,50 @@ public interface SchedulerDriver {
   Status reviveOffers();
 
   /**
-   * Inform Mesos master to stop sending offers to the framework. The
-   * scheduler should call reviveOffers() to resume getting offers.
+   * Removes filters for the specified roles and removes these roles from
+   * the suppressed set. If the framework is not connected to the master,
+   * an up-to-date set of suppressed roles will be sent to the master
+   * during re-registration.
+   *
+   * @param roles The collection of the framework roles to be revivied.
+   *              If empty, this method does nothing.
+   *
+   * @return    The state of the driver after the call.
+   *
+   * @see Status
+   */
+  Status reviveOffers(Collection<String> roles);
+
+  /**
+   * Informs Mesos master to stop sending offers to the framework (i.e.
+   * to suppress all roles of the framework). To resume getting offers,
+   * the scheduler can call reviveOffers() or set the suppressed roles
+   * explicitly via updateFramework().
+   *
+   * NOTE: If the framework is not connected to the master, all the roles
+   * will be added to the set of suppressed roles in the driver, and an
+   * up-to-date suppressed roles set will be sent to the master during
+   * re-registration.
    *
    * @return    The state of the driver after the call.
    *
    * @see Status
    */
   Status suppressOffers();
+
+  /**
+   * Adds the roles to the suppressed set. If the framework is not connected
+   * to the master, an up-to-date set of suppressed roles will be sent to
+   * the master during re-registration.
+   *
+   * @param roles The collection of framework roles to be suppressed.
+   *              If empty, the method does nothing.
+   *
+   * @return    The state of the driver after the call.
+   *
+   * @see Status
+   */
+  Status suppressOffers(Collection<String> roles);
 
   /**
    * Acknowledges the status update. This should only be called
@@ -323,4 +363,32 @@ public interface SchedulerDriver {
    * @see SlaveID
    */
   Status reconcileTasks(Collection<TaskStatus> statuses);
+
+  /**
+   * Inform Mesos master about changes to the `FrameworkInfo` and the list of
+   * suppressed roles. The driver will store the new `FrameworkInfo` and the new
+   * suppressed roles list, and all subsequent re-registrations will use it.
+   *
+   * NOTE: If the supplied info is invalid or fails authorization,
+   * the `error()` callback will be invoked asynchronously (after
+   * the master replies with a `FrameworkErrorMessage`).
+   *
+   * NOTE: This must be called after initial registration with the
+   * master completes and the `FrameworkID` is assigned. The assigned
+   * `FrameworkID` must be set in `frameworkInfo`.
+   *
+   * NOTE: The `FrameworkInfo.user` and `FrameworkInfo.hostname`
+   * fields will be auto-populated using the same approach used
+   * during driver initialization.
+   *
+   * @param frameworkInfo  The new FrameworkInfo.
+   *
+   * @param suppressedRoles The new list of suppressed roles.
+   *
+   * @return               The state of the driver after the call.
+   *
+   * @see FrameworkInfo
+   */
+  Status updateFramework(FrameworkInfo frameworkInfo,
+                         Collection<String> suppressedRoles);
 }

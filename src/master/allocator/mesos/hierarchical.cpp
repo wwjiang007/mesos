@@ -23,7 +23,9 @@
 #include <vector>
 
 #include <mesos/attributes.hpp>
+#include <mesos/resource_quantities.hpp>
 #include <mesos/resources.hpp>
+#include <mesos/roles.hpp>
 #include <mesos/type_utils.hpp>
 
 #include <process/after.hpp>
@@ -40,13 +42,19 @@
 #include <stout/stopwatch.hpp>
 #include <stout/stringify.hpp>
 
+#include "common/http.hpp"
 #include "common/protobuf_utils.hpp"
+#include "common/resources_utils.hpp"
 
+using std::make_shared;
 using std::set;
+using std::shared_ptr;
 using std::string;
 using std::vector;
+using std::weak_ptr;
 
 using mesos::allocator::InverseOfferStatus;
+using mesos::allocator::Options;
 
 using process::after;
 using process::Continue;
@@ -58,9 +66,13 @@ using process::Owned;
 using process::PID;
 using process::Timeout;
 
-using mesos::internal::protobuf::framework::Capabilities;
 
 namespace mesos {
+
+// Needed to prevent shadowing of template '::operator-<std::set<T>>'
+// by non-template '::mesos::operator-'
+using ::operator-;
+
 namespace internal {
 namespace master {
 namespace allocator {
@@ -79,20 +91,38 @@ public:
 class RefusedOfferFilter : public OfferFilter
 {
 public:
-  RefusedOfferFilter(const Resources& _resources) : resources(_resources) {}
+  RefusedOfferFilter(
+      const Resources& _resources,
+      const Duration& timeout)
+    : _resources(_resources),
+      _expired(after(timeout)) {}
 
-  virtual bool filter(const Resources& _resources) const
+  ~RefusedOfferFilter() override
   {
+    // Cancel the timeout upon destruction to avoid lingering timers.
+    _expired.discard();
+  }
+
+  Future<Nothing> expired() const { return _expired; };
+
+  bool filter(const Resources& resources) const override
+  {
+    // NOTE: We do not check for the filter being expired here
+    // because `recoverResources()` expects the filter to apply
+    // until the filter is removed, see:
+    // https://github.com/apache/mesos/commit/2f170f302fe94c4
+    //
     // TODO(jieyu): Consider separating the superset check for regular
     // and revocable resources. For example, frameworks might want
     // more revocable resources only or non-revocable resources only,
     // but currently the filter only expires if there is more of both
     // revocable and non-revocable resources.
-    return resources.contains(_resources); // Refused resources are superset.
+    return _resources.contains(resources); // Refused resources are superset.
   }
 
 private:
-  const Resources resources;
+  const Resources _resources;
+  Future<Nothing> _expired;
 };
 
 
@@ -119,32 +149,400 @@ public:
 class RefusedInverseOfferFilter : public InverseOfferFilter
 {
 public:
-  RefusedInverseOfferFilter(const Timeout& _timeout)
-    : timeout(_timeout) {}
+  RefusedInverseOfferFilter(const Duration& timeout)
+    : _expired(after(timeout)) {}
 
-  virtual bool filter() const
+  ~RefusedInverseOfferFilter() override
+  {
+    // Cancel the timeout upon destruction to avoid lingering timers.
+    _expired.discard();
+  }
+
+  Future<Nothing> expired() const { return _expired; };
+
+  bool filter() const override
   {
     // See comment above why we currently don't do more fine-grained filtering.
-    return timeout.remaining() > Seconds(0);
+    return _expired.isPending();
   }
 
 private:
-  const Timeout timeout;
+  Future<Nothing> _expired;
 };
 
 
-HierarchicalAllocatorProcess::Framework::Framework(
+// Helper function to unpack a map of per-role `OfferFilters` to the
+// format used by the allocator.
+static hashmap<string, vector<ResourceQuantities>> unpackFrameworkOfferFilters(
+    const ::google::protobuf::Map<string, OfferFilters>& roleOfferFilters)
+{
+  hashmap<string, vector<ResourceQuantities>> result;
+
+  // Use `auto` in place of `protobuf::MapPair<string, AllocatableResources>`
+  // below since `foreach` is a macro and cannot contain angle brackets.
+  foreach (auto&& offerFilters, roleOfferFilters) {
+    const string& role = offerFilters.first;
+    const OfferFilters& allocatableResources = offerFilters.second;
+
+    if (allocatableResources.has_min_allocatable_resources()) {
+      result.insert({role, {}});
+
+      vector<ResourceQuantities>& allocatableResourcesRole = result[role];
+
+      foreach (
+          const OfferFilters::ResourceQuantities& quantities,
+          allocatableResources.min_allocatable_resources().quantities()) {
+        allocatableResourcesRole.push_back(
+          ResourceQuantities(quantities.quantities()));
+      }
+    }
+  }
+
+  return result;
+}
+
+
+Role::Role(const string& _role, Role* _parent)
+  : role(_role),
+    basename(strings::split(role, "/").back()),
+    parent(_parent),
+    quota_(DEFAULT_QUOTA),
+    weight_(DEFAULT_WEIGHT) {}
+
+
+void Role::addChild(Role* child)
+{
+  CHECK_NOT_CONTAINS(children_, child->basename);
+  children_.put(child->basename, child);
+}
+
+
+void Role::removeChild(Role* child)
+{
+  CHECK_CONTAINS(children_, child->basename);
+  children_.erase(child->basename);
+}
+
+
+RoleTree::RoleTree() : root_(new Role("", nullptr)) {}
+
+
+RoleTree::RoleTree(Metrics* metrics_)
+  : root_(new Role("", nullptr)), metrics(metrics_) {}
+
+
+RoleTree::~RoleTree()
+{
+  delete root_;
+}
+
+
+Option<const Role*> RoleTree::get(const std::string& role) const
+{
+  auto found = roles_.find(role);
+
+  if (found == roles_.end()) {
+    return None();
+  } else {
+    return &(found->second);
+  }
+}
+
+
+Option<Role*> RoleTree::get_(const std::string& role)
+{
+  auto found = roles_.find(role);
+
+  if (found == roles_.end()) {
+    return None();
+  } else {
+    return &(found->second);
+  }
+}
+
+
+Role& RoleTree::operator[](const std::string& rolePath)
+{
+  if (roles_.contains(rolePath)) {
+    return roles_.at(rolePath);
+  }
+
+  // We go through the path from top to bottom and create any missing
+  // node along the way.
+  Role* current = root_;
+  foreach (const string& token, strings::split(rolePath, "/")) {
+    Option<Role*> child = current->children_.get(token);
+
+    if (child.isSome()) {
+      current = *child;
+      continue;
+    }
+
+    // Create a new role.
+    string newRolePath =
+      current == root_ ? token : strings::join("/", current->role, token);
+    CHECK_NOT_CONTAINS(roles_, newRolePath);
+    roles_.put(newRolePath, Role(newRolePath, current));
+
+    if (metrics.isSome()) {
+      (*metrics)->addRole(newRolePath);
+    }
+
+    Role& role = roles_.at(newRolePath);
+    current->addChild(&role);
+    current = &role;
+  }
+
+  return roles_.at(rolePath);
+}
+
+
+bool RoleTree::tryRemove(const std::string& role)
+{
+  CHECK_CONTAINS(roles_, role);
+  Role* current = &(roles_.at(role));
+
+  if (!current->isEmpty()) {
+    return false;
+  }
+
+  // We go through the path from bottom to top and remove empty nodes
+  // along the way.
+  vector<string> tokens = strings::split(role, "/");
+  for (auto token = tokens.crbegin(); token != tokens.crend(); ++token) {
+    CHECK_EQ(current->basename, *token);
+    if (!current->isEmpty()) {
+      break;
+    }
+
+    CHECK(current->allocatedScalars_.empty())
+      << "An empty role " << current->role
+      << " has non-empty allocated scalar resources: "
+      << current->allocatedScalars_;
+
+    Role* parent = CHECK_NOTNULL(current->parent);
+
+    parent->removeChild(current);
+
+    if (metrics.isSome()) {
+      (*metrics)->removeRole(current->role);
+    }
+
+    CHECK(current->offeredOrAllocatedScalars_.empty())
+      << " role: " << role
+      << " offeredOrAllocated: " << current->offeredOrAllocatedScalars_;
+    roles_.erase(current->role);
+
+    current = parent;
+  }
+
+  return true;
+}
+
+
+void RoleTree::updateQuotaConsumedMetric(const Role* role)
+{
+  if (metrics.isSome()) {
+    (*metrics)->updateConsumed(role->role, role->quotaConsumed());
+  }
+}
+
+
+void RoleTree::trackReservations(const Resources& resources)
+{
+  foreach (const Resource& r, resources.scalars()) {
+    CHECK(Resources::isReserved(r));
+
+    const string& reservationRole = Resources::reservationRole(r);
+    ResourceQuantities quantities = ResourceQuantities::fromScalarResources(r);
+
+    // NOTE: If necessary, a new role tree node is created.
+    applyToRoleAndAncestors(&(*this)[reservationRole], [&](Role* current) {
+      current->reservationScalarQuantities_ += quantities;
+      updateQuotaConsumedMetric(current);
+    });
+  }
+}
+
+
+void RoleTree::untrackReservations(const Resources& resources)
+{
+  foreach (const Resource& r, resources.scalars()) {
+    CHECK(Resources::isReserved(r));
+
+    const string& reservationRole = Resources::reservationRole(r);
+    ResourceQuantities quantities = ResourceQuantities::fromScalarResources(r);
+
+    applyToRoleAndAncestors(
+      CHECK_NOTNONE(get_(reservationRole)), [&](Role* current) {
+        CHECK_CONTAINS(current->reservationScalarQuantities_, quantities);
+        current->reservationScalarQuantities_ -= quantities;
+        updateQuotaConsumedMetric(current);
+      });
+
+    tryRemove(reservationRole);
+  }
+}
+
+
+void RoleTree::trackAllocated(const Resources& resources_)
+{
+  foreachpair (
+      const string& role,
+      const Resources& resources,
+      resources_.scalars().allocations()) {
+    applyToRoleAndAncestors(CHECK_NOTNONE(get_(role)), [&](Role* current) {
+      current->allocatedScalars_ += resources;
+      updateQuotaConsumedMetric(current);
+    });
+  }
+}
+
+
+void RoleTree::untrackAllocated(const Resources& resources_)
+{
+  foreachpair (
+      const string& role,
+      const Resources& resources,
+      resources_.scalars().allocations()) {
+    applyToRoleAndAncestors(CHECK_NOTNONE(get_(role)), [&](Role* current) {
+      current->allocatedScalars_ -= resources;
+      updateQuotaConsumedMetric(current);
+    });
+  }
+}
+
+
+void RoleTree::trackFramework(
+    const FrameworkID& frameworkId, const string& rolePath)
+{
+  Role* role = &(*this)[rolePath];
+
+  CHECK_NOT_CONTAINS(role->frameworks_, frameworkId)
+    << " for role " << rolePath;
+  role->frameworks_.insert(frameworkId);
+}
+
+
+void RoleTree::untrackFramework(
+    const FrameworkID& frameworkId, const string& rolePath)
+{
+  CHECK_CONTAINS(roles_, rolePath);
+  Role& role = roles_.at(rolePath);
+
+  CHECK_CONTAINS(role.frameworks_, frameworkId) << " for role " << rolePath;
+  role.frameworks_.erase(frameworkId);
+
+  tryRemove(rolePath);
+}
+
+
+void RoleTree::updateQuota(const string& role, const Quota& quota)
+{
+  (*this)[role].quota_ = quota;
+
+  tryRemove(role);
+}
+
+
+void RoleTree::updateWeight(const string& role, double weight)
+{
+  (*this)[role].weight_ = weight;
+
+  tryRemove(role);
+}
+
+
+void RoleTree::trackOfferedOrAllocated(const Resources& resources_)
+{
+  // TODO(mzhu): avoid building a map by traversing `resources`
+  // and look for the allocation role of individual resource.
+  // However, due to MESOS-9242, this currently does not work
+  // as traversing resources would lose the shared count.
+  foreachpair (
+      const string& role,
+      const Resources& resources,
+      resources_.scalars().allocations()) {
+    applyToRoleAndAncestors(
+        CHECK_NOTNONE(get_(role)), [&resources](Role* current) {
+      current->offeredOrAllocatedScalars_ += resources;
+    });
+  }
+}
+
+
+void RoleTree::untrackOfferedOrAllocated(const Resources& resources_)
+{
+  // TODO(mzhu): avoid building a map by traversing `resources`
+  // and look for the allocation role of individual resource.
+  // However, due to MESOS-9242, this currently does not work
+  // as traversing resources would lose the shared count.
+  foreachpair (
+      const string& role,
+      const Resources& resources,
+      resources_.scalars().allocations()) {
+    applyToRoleAndAncestors(
+        CHECK_NOTNONE(get_(role)), [&resources](Role* current) {
+      CHECK_CONTAINS(current->offeredOrAllocatedScalars_, resources)
+        << " Role: " << current->role
+        << " offeredOrAllocated: " << current->offeredOrAllocatedScalars_;
+      current->offeredOrAllocatedScalars_ -= resources;
+    });
+  }
+}
+
+
+std::string RoleTree::toJSON() const
+{
+  std::function<void(JSON::ObjectWriter*, const Role*)> json =
+    [&](JSON::ObjectWriter* writer, const Role* role) {
+      writer->field("basename", role->basename);
+      writer->field("role", role->role);
+      writer->field("weight", role->weight_);
+      writer->field("guarantees", role->quota_.guarantees);
+      writer->field("limits", role->quota_.limits);
+      writer->field(
+          "reservation_quantities", role->reservationScalarQuantities_);
+      writer->field(
+          "offered_or_allocated_scalars", role->offeredOrAllocatedScalars_);
+
+      writer->field("frameworks", [&](JSON::ArrayWriter* writer) {
+        foreach (const FrameworkID& id, role->frameworks_) {
+          writer->element(id.value());
+        }
+      });
+
+      writer->field("children", [&](JSON::ArrayWriter* writer) {
+        foreachvalue (const Role* child, role->children_) {
+          writer->element(
+              [&](JSON::ObjectWriter* writer) { json(writer, child); });
+        }
+      });
+    };
+
+  auto tree = [&](JSON::ObjectWriter* writer) { json(writer, root_); };
+
+  return jsonify(tree);
+}
+
+
+Framework::Framework(
     const FrameworkInfo& frameworkInfo,
     const set<string>& _suppressedRoles,
-    bool _active)
-  : roles(protobuf::framework::getRoles(frameworkInfo)),
+    bool _active,
+    bool publishPerFrameworkMetrics)
+  : frameworkId(frameworkInfo.id()),
+    roles(protobuf::framework::getRoles(frameworkInfo)),
     suppressedRoles(_suppressedRoles),
     capabilities(frameworkInfo.capabilities()),
-    active(_active) {}
+    active(_active),
+    metrics(new FrameworkMetrics(frameworkInfo, publishPerFrameworkMetrics)),
+    minAllocatableResources(
+        unpackFrameworkOfferFilters(frameworkInfo.offer_filters())) {}
 
 
 void HierarchicalAllocatorProcess::initialize(
-    const Duration& _allocationInterval,
+    const Options& _options,
     const lambda::function<
         void(const FrameworkID&,
              const hashmap<string, hashmap<SlaveID, Resources>>&)>&
@@ -152,38 +550,34 @@ void HierarchicalAllocatorProcess::initialize(
     const lambda::function<
         void(const FrameworkID&,
              const hashmap<SlaveID, UnavailableResources>&)>&
-      _inverseOfferCallback,
-    const Option<set<string>>& _fairnessExcludeResourceNames,
-    bool _filterGpuResources,
-    const Option<DomainInfo>& _domain)
+      _inverseOfferCallback)
 {
-  allocationInterval = _allocationInterval;
+  options = _options;
   offerCallback = _offerCallback;
   inverseOfferCallback = _inverseOfferCallback;
-  fairnessExcludeResourceNames = _fairnessExcludeResourceNames;
-  filterGpuResources = _filterGpuResources;
-  domain = _domain;
   initialized = true;
   paused = false;
 
-  // Resources for quota'ed roles are allocated separately and prior to
-  // non-quota'ed roles, hence a dedicated sorter for quota'ed roles is
-  // necessary.
-  roleSorter->initialize(fairnessExcludeResourceNames);
-  quotaRoleSorter->initialize(fairnessExcludeResourceNames);
+  completedFrameworkMetrics =
+    BoundedHashMap<FrameworkID, process::Owned<FrameworkMetrics>>(
+        options.maxCompletedFrameworks);
+
+  roleSorter->initialize(options.fairnessExcludeResourceNames);
 
   VLOG(1) << "Initialized hierarchical allocator process";
 
   // Start a loop to run allocation periodically.
   PID<HierarchicalAllocatorProcess> _self = self();
 
+  // Set a temporary variable for the lambda capture.
+  Duration allocationInterval = options.allocationInterval;
   loop(
       None(), // Use `None` so we iterate outside the allocator process.
-      [_allocationInterval]() {
-        return after(_allocationInterval);
+      [allocationInterval]() {
+        return after(allocationInterval);
       },
       [_self](const Nothing&) {
-        return dispatch(_self, &HierarchicalAllocatorProcess::allocate)
+        return dispatch(_self, &HierarchicalAllocatorProcess::generateOffers)
           .then([]() -> ControlFlow<Nothing> { return Continue(); });
       });
 }
@@ -196,7 +590,6 @@ void HierarchicalAllocatorProcess::recover(
   // Recovery should start before actual allocation starts.
   CHECK(initialized);
   CHECK(slaves.empty());
-  CHECK_EQ(0u, quotaRoleSorter->count());
   CHECK(_expectedAgentCount >= 0);
 
   // If there is no quota, recovery is a no-op. Otherwise, we need
@@ -216,9 +609,8 @@ void HierarchicalAllocatorProcess::recover(
     return;
   }
 
-  // NOTE: `quotaRoleSorter` is updated implicitly in `setQuota()`.
   foreachpair (const string& role, const Quota& quota, quotas) {
-    setQuota(role, quota);
+    updateQuota(role, quota);
   }
 
   // TODO(alexr): Consider exposing these constants.
@@ -261,22 +653,31 @@ void HierarchicalAllocatorProcess::addFramework(
     const set<string>& suppressedRoles)
 {
   CHECK(initialized);
-  CHECK(!frameworks.contains(frameworkId));
+  CHECK_NOT_CONTAINS(frameworks, frameworkId);
 
-  frameworks.insert(
-      {frameworkId, Framework(frameworkInfo, suppressedRoles, active)});
+  // TODO(mzhu): remove the `frameworkId` parameter.
+  CHECK_EQ(frameworkId, frameworkInfo.id());
 
-  const Framework& framework = frameworks.at(frameworkId);
+  frameworks.insert({frameworkId,
+                     Framework(
+                         frameworkInfo,
+                         suppressedRoles,
+                         active,
+                         options.publishPerFrameworkMetrics)});
+
+  const Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
 
   foreach (const string& role, framework.roles) {
-    trackFrameworkUnderRole(frameworkId, role);
+    trackFrameworkUnderRole(framework, role);
 
-    CHECK(frameworkSorters.contains(role));
+    Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
 
     if (suppressedRoles.count(role)) {
-      frameworkSorters.at(role)->deactivate(frameworkId.value());
+      frameworkSorter->deactivate(frameworkId.value());
+      framework.metrics->suppressRole(role);
     } else {
-      frameworkSorters.at(role)->activate(frameworkId.value());
+      frameworkSorter->activate(frameworkId.value());
+      framework.metrics->reviveRole(role);
     }
   }
 
@@ -292,12 +693,14 @@ void HierarchicalAllocatorProcess::addFramework(
     // The slave struct will already be aware of the allocated
     // resources, so we only need to track them in the sorters.
     trackAllocatedResources(slaveId, frameworkId, resources);
+
+    roleTree.trackAllocated(resources);
   }
 
   LOG(INFO) << "Added framework " << frameworkId;
 
   if (active) {
-    allocate();
+    generateOffers();
   } else {
     deactivateFramework(frameworkId);
   }
@@ -308,37 +711,47 @@ void HierarchicalAllocatorProcess::removeFramework(
     const FrameworkID& frameworkId)
 {
   CHECK(initialized);
-  CHECK(frameworks.contains(frameworkId)) << frameworkId;
 
-  const Framework& framework = frameworks.at(frameworkId);
+  // To free up offered or allocated resources of a framework, we need to
+  // do two things: update available resources in the agent and update
+  // tracking info in the role tree and role sorter.
+  // We do both at the same time.
+  foreachvalue (Slave& slave, slaves) {
+    const hashmap<FrameworkID, Resources>& offeredOrAllocated =
+      slave.getOfferedOrAllocated();
+    auto frameworkResources = offeredOrAllocated.find(frameworkId);
 
-  foreach (const string& role, framework.roles) {
-    // Might not be in 'frameworkSorters[role]' because it
-    // was previously deactivated and never re-added.
-    //
-    // TODO(mzhu): This check may no longer be necessary.
-    if (!frameworkSorters.contains(role) ||
-        !frameworkSorters.at(role)->contains(frameworkId.value())) {
+    if (frameworkResources == offeredOrAllocated.end()) {
       continue;
     }
 
-    hashmap<SlaveID, Resources> allocation =
-      frameworkSorters.at(role)->allocation(frameworkId.value());
+    VLOG(1) << "Recovering " << frameworkResources->second
+            << " from removing framework " << frameworkId
+            << " (agent total: " << slave.getTotal() << ","
+            << " offered or allocated: "
+            << slave.getTotalOfferedOrAllocated() << ")";
 
-    // Update the allocation for this framework.
-    foreachpair (const SlaveID& slaveId,
-                 const Resources& allocated,
-                 allocation) {
-      untrackAllocatedResources(slaveId, frameworkId, allocated);
-    }
+    untrackAllocatedResources(
+        slave.id, frameworkId, frameworkResources->second);
 
-    untrackFrameworkUnderRole(frameworkId, role);
+    // Note: this method might mutate `offeredOrAllocated`.
+    slave.increaseAvailable(frameworkId, frameworkResources->second);
   }
 
-  // Do not delete the filters contained in this
-  // framework's `offerFilters` hashset yet, see comments in
-  // HierarchicalAllocatorProcess::reviveOffers and
-  // HierarchicalAllocatorProcess::expire.
+  Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
+
+  // Untack framework from roles.
+  foreach (const string& role, framework.roles) {
+    CHECK(tryUntrackFrameworkUnderRole(framework, role))
+      << " Framework: " << frameworkId << " role: " << role;
+  }
+
+  // Transfer ownership of this framework's metrics to
+  // `completedFrameworkMetrics`.
+  completedFrameworkMetrics.set(
+      frameworkId,
+      Owned<FrameworkMetrics>(framework.metrics.release()));
+
   frameworks.erase(frameworkId);
 
   LOG(INFO) << "Removed framework " << frameworkId;
@@ -349,9 +762,8 @@ void HierarchicalAllocatorProcess::activateFramework(
     const FrameworkID& frameworkId)
 {
   CHECK(initialized);
-  CHECK(frameworks.contains(frameworkId));
 
-  Framework& framework = frameworks.at(frameworkId);
+  Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
 
   framework.active = true;
 
@@ -361,16 +773,16 @@ void HierarchicalAllocatorProcess::activateFramework(
   // role is specified in `suppressed_roles` during framework
   // (re)registration, or via a subsequent `SUPPRESS` call.
   foreach (const string& role, framework.roles) {
-    CHECK(frameworkSorters.contains(role));
+    Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
 
     if (!framework.suppressedRoles.count(role)) {
-      frameworkSorters.at(role)->activate(frameworkId.value());
+      frameworkSorter->activate(frameworkId.value());
     }
   }
 
   LOG(INFO) << "Activated framework " << frameworkId;
 
-  allocate();
+  generateOffers();
 }
 
 
@@ -378,13 +790,13 @@ void HierarchicalAllocatorProcess::deactivateFramework(
     const FrameworkID& frameworkId)
 {
   CHECK(initialized);
-  CHECK(frameworks.contains(frameworkId)) << frameworkId;
 
-  Framework& framework = frameworks.at(frameworkId);
+  Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
 
   foreach (const string& role, framework.roles) {
-    CHECK(frameworkSorters.contains(role));
-    frameworkSorters.at(role)->deactivate(frameworkId.value());
+    Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
+
+    frameworkSorter->deactivate(frameworkId.value());
 
     // Note that the Sorter *does not* remove the resources allocated
     // to this framework. For now, this is important because if the
@@ -395,10 +807,6 @@ void HierarchicalAllocatorProcess::deactivateFramework(
 
   framework.active = false;
 
-  // Do not delete the filters contained in this
-  // framework's `offerFilters` hashset yet, see comments in
-  // HierarchicalAllocatorProcess::reviveOffers and
-  // HierarchicalAllocatorProcess::expire.
   framework.offerFilters.clear();
   framework.inverseOfferFilters.clear();
 
@@ -412,84 +820,54 @@ void HierarchicalAllocatorProcess::updateFramework(
     const set<string>& suppressedRoles)
 {
   CHECK(initialized);
-  CHECK(frameworks.contains(frameworkId));
 
-  Framework& framework = frameworks.at(frameworkId);
+  Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
 
-  set<string> oldRoles = framework.roles;
-  set<string> newRoles = protobuf::framework::getRoles(frameworkInfo);
-  set<string> oldSuppressedRoles = framework.suppressedRoles;
+  const set<string> oldRoles = framework.roles;
+  const set<string> newRoles = protobuf::framework::getRoles(frameworkInfo);
+  const set<string> oldSuppressedRoles = framework.suppressedRoles;
 
-  // TODO(xujyan): Add a stout set difference method that wraps around
-  // `std::set_difference` for this.
-  const set<string> removedRoles = [&]() {
-    set<string> result = oldRoles;
-    foreach (const string& role, newRoles) {
-      result.erase(role);
-    }
-    return result;
-  }();
+  foreach (const string& role, newRoles - oldRoles) {
+    framework.metrics->addSubscribedRole(role);
 
-  const set<string> newSuppressedRoles = [&]() {
-    set<string> result = suppressedRoles;
-    foreach (const string& role, oldSuppressedRoles) {
-      result.erase(role);
-    }
-    return result;
-  }();
-
-  foreach (const string& role, removedRoles | newSuppressedRoles) {
-    CHECK(frameworkSorters.contains(role));
-    frameworkSorters.at(role)->deactivate(frameworkId.value());
-  }
-
-  foreach (const string& role, removedRoles) {
-    // Stop tracking the framework under this role if there are
-    // no longer any resources allocated to it.
-    if (frameworkSorters.at(role)->allocation(frameworkId.value()).empty()) {
-      untrackFrameworkUnderRole(frameworkId, role);
-    }
-
-    if (framework.offerFilters.contains(role)) {
-      framework.offerFilters.erase(role);
-    }
-  }
-
-  const set<string> addedRoles = [&]() {
-    set<string> result = newRoles;
-    foreach (const string& role, oldRoles) {
-      result.erase(role);
-    }
-    return result;
-  }();
-
-  const set<string> newRevivedRoles = [&]() {
-    set<string> result = oldSuppressedRoles;
-    foreach (const string& role, suppressedRoles) {
-      result.erase(role);
-    }
-    return result;
-  }();
-
-  foreach (const string& role, addedRoles) {
     // NOTE: It's possible that we're already tracking this framework
     // under the role because a framework can unsubscribe from a role
     // while it still has resources allocated to the role.
     if (!isFrameworkTrackedUnderRole(frameworkId, role)) {
-      trackFrameworkUnderRole(frameworkId, role);
+      // TODO(mzhu): `CHECK` the above case.
+      trackFrameworkUnderRole(framework, role);
     }
-  }
 
-  // TODO(anindya_sinha): We should activate the roles only if the
-  // framework is active (instead of always).
-  foreach (const string& role, addedRoles | newRevivedRoles) {
-    CHECK(frameworkSorters.contains(role));
     frameworkSorters.at(role)->activate(frameworkId.value());
   }
 
+  foreach (const string& role, oldRoles - newRoles) {
+    Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
+
+    frameworkSorter->deactivate(frameworkId.value());
+
+    tryUntrackFrameworkUnderRole(framework, role);
+
+    if (framework.offerFilters.contains(role)) {
+      framework.offerFilters.erase(role);
+    }
+
+    framework.metrics->removeSubscribedRole(role);
+    framework.suppressedRoles.erase(role);
+  }
+
   framework.roles = newRoles;
-  framework.suppressedRoles = suppressedRoles;
   framework.capabilities = frameworkInfo.capabilities();
+  framework.minAllocatableResources =
+    unpackFrameworkOfferFilters(frameworkInfo.offer_filters());
+
+  suppressRoles(framework, suppressedRoles - oldSuppressedRoles);
+  reviveRoles(framework, (oldSuppressedRoles - suppressedRoles) & newRoles);
+
+  CHECK(framework.suppressedRoles == suppressedRoles)
+    << "After updating framework " << frameworkId
+    << " its set of suppressed roles " << stringify(framework.suppressedRoles)
+    << " differs from required " << stringify(suppressedRoles);
 }
 
 
@@ -502,19 +880,19 @@ void HierarchicalAllocatorProcess::addSlave(
     const hashmap<FrameworkID, Resources>& used)
 {
   CHECK(initialized);
-  CHECK(!slaves.contains(slaveId));
+  CHECK_NOT_CONTAINS(slaves, slaveId);
   CHECK_EQ(slaveId, slaveInfo.id());
   CHECK(!paused || expectedAgentCount.isSome());
 
-  slaves[slaveId] = Slave();
+  slaves.insert({slaveId,
+                 Slave(
+                     slaveInfo,
+                     protobuf::slave::Capabilities(capabilities),
+                     true,
+                     total,
+                     used)});
 
-  Slave& slave = slaves.at(slaveId);
-
-  slave.total = total;
-  slave.allocated = Resources::sum(used);
-  slave.activated = true;
-  slave.info = slaveInfo;
-  slave.capabilities = protobuf::slave::Capabilities(capabilities);
+  Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
 
   // NOTE: We currently implement maintenance in the allocator to be able to
   // leverage state and features such as the FrameworkSorter and OfferFilter.
@@ -522,12 +900,17 @@ void HierarchicalAllocatorProcess::addSlave(
     slave.maintenance = Slave::Maintenance(unavailability.get());
   }
 
-  trackReservations(total.reservations());
+  roleTree.trackReservations(total.reserved());
 
-  roleSorter->add(slaveId, total);
+  const ResourceQuantities agentScalarQuantities =
+    ResourceQuantities::fromScalarResources(total.scalars());
 
-  // See comment at `quotaRoleSorter` declaration regarding non-revocable.
-  quotaRoleSorter->add(slaveId, total.nonRevocable());
+  totalScalarQuantities += agentScalarQuantities;
+  roleSorter->addSlave(slaveId, agentScalarQuantities);
+
+  foreachvalue (const Owned<Sorter>& sorter, frameworkSorters) {
+    sorter->addSlave(slaveId, agentScalarQuantities);
+  }
 
   foreachpair (const FrameworkID& frameworkId,
                const Resources& allocation,
@@ -551,6 +934,8 @@ void HierarchicalAllocatorProcess::addSlave(
     }
 
     trackAllocatedResources(slaveId, frameworkId, allocation);
+
+    roleTree.trackAllocated(allocation);
   }
 
   // If we have just a number of recovered agents, we cannot distinguish
@@ -571,11 +956,12 @@ void HierarchicalAllocatorProcess::addSlave(
     resume();
   }
 
-  LOG(INFO) << "Added agent " << slaveId << " (" << slave.info.hostname() << ")"
-            << " with " << slave.total
-            << " (allocated: " << slave.allocated << ")";
+  LOG(INFO)
+    << "Added agent " << slaveId << " (" << slave.info.hostname() << ")"
+    << " with " << slave.getTotal()
+    << " (offered or allocated: " << slave.getTotalOfferedOrAllocated() << ")";
 
-  allocate(slaveId);
+  generateOffers(slaveId);
 }
 
 
@@ -583,28 +969,41 @@ void HierarchicalAllocatorProcess::removeSlave(
     const SlaveID& slaveId)
 {
   CHECK(initialized);
-  CHECK(slaves.contains(slaveId));
 
-  // TODO(bmahler): Per MESOS-621, this should remove the allocations
-  // that any frameworks have on this slave. Otherwise the caller may
-  // "leak" allocated resources accidentally if they forget to recover
-  // all the resources. Fixing this would require more information
-  // than what we currently track in the allocator.
+  {
+    const Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
 
-  roleSorter->remove(slaveId, slaves.at(slaveId).total);
+    // untrackAllocatedResources() potentially removes allocation roles, thus
+    // we need to untrack actually allocated resources in the roles tree first.
+    roleTree.untrackAllocated(slave.totalAllocated);
 
-  // See comment at `quotaRoleSorter` declaration regarding non-revocable.
-  quotaRoleSorter->remove(slaveId, slaves.at(slaveId).total.nonRevocable());
+    // Untrack resources in roleTree and sorter.
+    foreachpair (
+        const FrameworkID& frameworkId,
+        const Resources& resources,
+        slave.getOfferedOrAllocated()) {
+      untrackAllocatedResources(slaveId, frameworkId, resources);
+    }
 
-  untrackReservations(slaves.at(slaveId).total.reservations());
+    roleSorter->removeSlave(slaveId);
+
+    foreachvalue (const Owned<Sorter>& sorter, frameworkSorters) {
+      sorter->removeSlave(slaveId);
+    }
+
+    roleTree.untrackReservations(slave.getTotal().reserved());
+
+    const ResourceQuantities agentScalarQuantities =
+        ResourceQuantities::fromScalarResources(slave.getTotal().scalars());
+
+    CHECK_CONTAINS(totalScalarQuantities, agentScalarQuantities);
+    totalScalarQuantities -= agentScalarQuantities;
+  }
 
   slaves.erase(slaveId);
   allocationCandidates.erase(slaveId);
 
-  // Note that we DO NOT actually delete any filters associated with
-  // this slave, that will occur when the delayed
-  // HierarchicalAllocatorProcess::expire gets invoked (or the framework
-  // that applied the filters gets removed).
+  removeFilters(slaveId);
 
   LOG(INFO) << "Removed agent " << slaveId;
 }
@@ -617,10 +1016,9 @@ void HierarchicalAllocatorProcess::updateSlave(
     const Option<vector<SlaveInfo::Capability>>& capabilities)
 {
   CHECK(initialized);
-  CHECK(slaves.contains(slaveId));
   CHECK_EQ(slaveId, info.id());
 
-  Slave& slave = slaves.at(slaveId);
+  Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
 
   bool updated = false;
 
@@ -671,7 +1069,7 @@ void HierarchicalAllocatorProcess::updateSlave(
   }
 
   if (updated) {
-    allocate(slaveId);
+    generateOffers(slaveId);
   }
 }
 
@@ -682,7 +1080,9 @@ void HierarchicalAllocatorProcess::addResourceProvider(
     const hashmap<FrameworkID, Resources>& used)
 {
   CHECK(initialized);
-  CHECK(slaves.contains(slaveId));
+
+  Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
+  updateSlaveTotal(slaveId, slave.getTotal() + total);
 
   foreachpair (const FrameworkID& frameworkId,
                const Resources& allocation,
@@ -690,7 +1090,8 @@ void HierarchicalAllocatorProcess::addResourceProvider(
     // There are two cases here:
     //
     //   (1) The framework has already been added to the allocator.
-    //       In this case, we track the allocation in the sorters.
+    //       In this case, we track the allocation in the sorters
+    //       and the role tree.
     //
     //   (2) The framework has not yet been added to the allocator.
     //       We do not track the resources allocated to this
@@ -702,12 +1103,9 @@ void HierarchicalAllocatorProcess::addResourceProvider(
       continue;
     }
 
+    slave.decreaseAvailable(frameworkId, allocation);
     trackAllocatedResources(slaveId, frameworkId, allocation);
   }
-
-  Slave& slave = slaves.at(slaveId);
-  updateSlaveTotal(slaveId, slave.total + total);
-  slave.allocated += Resources::sum(used);
 
   VLOG(1)
     << "Grew agent " << slaveId << " by "
@@ -720,22 +1118,14 @@ void HierarchicalAllocatorProcess::removeFilters(const SlaveID& slaveId)
 {
   CHECK(initialized);
 
-  foreachpair (const FrameworkID& id,
-               Framework& framework,
-               frameworks) {
+  foreachvalue (Framework& framework, frameworks) {
     framework.inverseOfferFilters.erase(slaveId);
 
     // Need a typedef here, otherwise the preprocessor gets confused
     // by the comma in the template argument list.
-    typedef hashmap<SlaveID, hashset<OfferFilter*>> Filters;
-    foreachpair(const string& role,
-                Filters& filters,
-                framework.offerFilters) {
-      size_t erased = filters.erase(slaveId);
-      if (erased) {
-        frameworkSorters.at(role)->activate(id.value());
-        framework.suppressedRoles.erase(role);
-      }
+    typedef hashmap<SlaveID, hashset<shared_ptr<OfferFilter>>> Filters;
+    foreachvalue (Filters& filters, framework.offerFilters) {
+      filters.erase(slaveId);
     }
   }
 
@@ -747,9 +1137,9 @@ void HierarchicalAllocatorProcess::activateSlave(
     const SlaveID& slaveId)
 {
   CHECK(initialized);
-  CHECK(slaves.contains(slaveId));
 
-  slaves.at(slaveId).activated = true;
+  Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
+  slave.activated = true;
 
   LOG(INFO) << "Agent " << slaveId << " reactivated";
 }
@@ -759,9 +1149,9 @@ void HierarchicalAllocatorProcess::deactivateSlave(
     const SlaveID& slaveId)
 {
   CHECK(initialized);
-  CHECK(slaves.contains(slaveId));
 
-  slaves.at(slaveId).activated = false;
+  Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
+  slave.activated = false;
 
   LOG(INFO) << "Agent " << slaveId << " deactivated";
 }
@@ -803,10 +1193,9 @@ void HierarchicalAllocatorProcess::updateAllocation(
     const vector<ResourceConversion>& conversions)
 {
   CHECK(initialized);
-  CHECK(slaves.contains(slaveId));
-  CHECK(frameworks.contains(frameworkId));
+  CHECK_CONTAINS(frameworks, frameworkId);
 
-  Slave& slave = slaves.at(slaveId);
+  Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
 
   // We require that an allocation is tied to a single role.
   //
@@ -819,9 +1208,8 @@ void HierarchicalAllocatorProcess::updateAllocation(
 
   string role = allocations.begin()->first;
 
-  CHECK(frameworkSorters.contains(role));
+  Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
 
-  const Owned<Sorter>& frameworkSorter = frameworkSorters.at(role);
   const Resources frameworkAllocation =
     frameworkSorter->allocation(frameworkId.value(), slaveId);
 
@@ -838,14 +1226,15 @@ void HierarchicalAllocatorProcess::updateAllocation(
   //  foreach (const ResourceConversion& conversion, conversions) {
   //    CHECK_NONE(validateConversionOnAllocatedResources(conversion));
   //  }
-  Try<Resources> _updatedOfferedResources = offeredResources.apply(conversions);
-  CHECK_SOME(_updatedOfferedResources);
-
-  const Resources& updatedOfferedResources = _updatedOfferedResources.get();
+  Resources updatedOfferedResources =
+    CHECK_NOTERROR(offeredResources.apply(conversions));
 
   // Update the per-slave allocation.
-  slave.allocated -= offeredResources;
-  slave.allocated += updatedOfferedResources;
+  slave.increaseAvailable(frameworkId, offeredResources);
+  slave.decreaseAvailable(frameworkId, updatedOfferedResources);
+
+  roleTree.untrackOfferedOrAllocated(offeredResources);
+  roleTree.trackOfferedOrAllocated(updatedOfferedResources);
 
   // Update the allocation in the framework sorter.
   frameworkSorter->update(
@@ -861,17 +1250,6 @@ void HierarchicalAllocatorProcess::updateAllocation(
       offeredResources,
       updatedOfferedResources);
 
-  // Update the allocated resources in the quota sorter. We only update
-  // the allocated resources if this role has quota set.
-  if (quotas.contains(role)) {
-    // See comment at `quotaRoleSorter` declaration regarding non-revocable.
-    quotaRoleSorter->update(
-        role,
-        slaveId,
-        offeredResources.nonRevocable(),
-        updatedOfferedResources.nonRevocable());
-  }
-
   // Update the agent total resources so they are consistent with the updated
   // allocation. We do not directly use `updatedOfferedResources` here because
   // the agent's total resources shouldn't contain:
@@ -881,6 +1259,7 @@ void HierarchicalAllocatorProcess::updateAllocation(
   // We strip `AllocationInfo` from conversions in order to apply them
   // successfully, since agent's total is stored as unallocated resources.
   vector<ResourceConversion> strippedConversions;
+  Resources removedResources;
   foreach (const ResourceConversion& conversion, conversions) {
     // TODO(jieyu): Ideally, we should make sure agent's total
     // resources are consistent with agent's allocation in terms of
@@ -895,6 +1274,12 @@ void HierarchicalAllocatorProcess::updateAllocation(
       continue;
     }
 
+    // NOTE: For now, a resource conversion must either not change the resource
+    // quantities, or completely remove the consumed resources. See MESOS-8825.
+    if (conversion.converted.empty()) {
+      removedResources += conversion.consumed;
+    }
+
     Resources consumed = conversion.consumed;
     Resources converted = conversion.converted;
 
@@ -904,23 +1289,25 @@ void HierarchicalAllocatorProcess::updateAllocation(
     strippedConversions.emplace_back(consumed, converted);
   }
 
-  Try<Resources> updatedTotal = slave.total.apply(strippedConversions);
+  Try<Resources> updatedTotal = slave.getTotal().apply(strippedConversions);
   CHECK_SOME(updatedTotal);
 
   updateSlaveTotal(slaveId, updatedTotal.get());
 
-  // Update the total resources in the framework sorter.
-  frameworkSorter->remove(slaveId, offeredResources);
-  frameworkSorter->add(slaveId, updatedOfferedResources);
-
-  // Check that the unreserved quantities for framework allocations
-  // have not changed by the above resource conversions.
   const Resources updatedFrameworkAllocation =
     frameworkSorter->allocation(frameworkId.value(), slaveId);
 
+  // Check that the changed quantities of the framework's allocation is exactly
+  // the same as the resources removed by the resource conversions.
+  //
+  // TODO(chhsiao): Revisit this constraint if we want to support other type of
+  // resource conversions. See MESOS-9015.
+  const Resources removedAllocationQuantities =
+    frameworkAllocation.createStrippedScalarQuantity() -
+    updatedFrameworkAllocation.createStrippedScalarQuantity();
   CHECK_EQ(
-      frameworkAllocation.toUnreserved().createStrippedScalarQuantity(),
-      updatedFrameworkAllocation.toUnreserved().createStrippedScalarQuantity());
+      removedAllocationQuantities,
+      removedResources.createStrippedScalarQuantity());
 
   LOG(INFO) << "Updated allocation of framework " << frameworkId
             << " on agent " << slaveId
@@ -939,9 +1326,8 @@ Future<Nothing> HierarchicalAllocatorProcess::updateAvailable(
   // for the operations to contain only unallocated resources.
 
   CHECK(initialized);
-  CHECK(slaves.contains(slaveId));
 
-  Slave& slave = slaves.at(slaveId);
+  Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
 
   // It's possible for this 'apply' to fail here because a call to
   // 'allocate' could have been enqueued by the allocator itself
@@ -955,7 +1341,7 @@ Future<Nothing> HierarchicalAllocatorProcess::updateAvailable(
   //                \___/ \___/
   //
   //   where A = allocate, R = reserve, U = updateAvailable
-  Try<Resources> updatedAvailable = slave.available().apply(operations);
+  Try<Resources> updatedAvailable = slave.getAvailable().apply(operations);
   if (updatedAvailable.isError()) {
     VLOG(1) << "Failed to update available resources on agent " << slaveId
             << ": " << updatedAvailable.error();
@@ -963,10 +1349,10 @@ Future<Nothing> HierarchicalAllocatorProcess::updateAvailable(
   }
 
   // Update the total resources.
-  Try<Resources> updatedTotal = slave.total.apply(operations);
+  Try<Resources> updatedTotal = slave.getTotal().apply(operations);
   CHECK_SOME(updatedTotal);
 
-  // Update the total resources in the allocator and role and quota sorters.
+  // Update the total resources in the sorter.
   updateSlaveTotal(slaveId, updatedTotal.get());
 
   return Nothing();
@@ -978,9 +1364,8 @@ void HierarchicalAllocatorProcess::updateUnavailability(
     const Option<Unavailability>& unavailability)
 {
   CHECK(initialized);
-  CHECK(slaves.contains(slaveId));
 
-  Slave& slave = slaves.at(slaveId);
+  Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
 
   // NOTE: We currently implement maintenance in the allocator to be able to
   // leverage state and features such as the FrameworkSorter and OfferFilter.
@@ -1002,7 +1387,7 @@ void HierarchicalAllocatorProcess::updateUnavailability(
     slave.maintenance = Slave::Maintenance(unavailability.get());
   }
 
-  allocate(slaveId);
+  generateOffers(slaveId);
 }
 
 
@@ -1014,13 +1399,13 @@ void HierarchicalAllocatorProcess::updateInverseOffer(
     const Option<Filters>& filters)
 {
   CHECK(initialized);
-  CHECK(frameworks.contains(frameworkId));
-  CHECK(slaves.contains(slaveId));
 
-  Framework& framework = frameworks.at(frameworkId);
-  Slave& slave = slaves.at(slaveId);
+  Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
+  Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
 
-  CHECK(slave.maintenance.isSome());
+  CHECK(slave.maintenance.isSome())
+    << "Agent " << slaveId
+    << " (" << slave.info.hostname() << ") should have maintenance scheduled";
 
   // NOTE: We currently implement maintenance in the allocator to be able to
   // leverage state and features such as the FrameworkSorter and OfferFilter.
@@ -1089,25 +1474,17 @@ void HierarchicalAllocatorProcess::updateInverseOffer(
             << " for " << timeout.get();
 
     // Create a new inverse offer filter and delay its expiration.
-    InverseOfferFilter* inverseOfferFilter =
-      new RefusedInverseOfferFilter(Timeout::in(timeout.get()));
+    shared_ptr<RefusedInverseOfferFilter> inverseOfferFilter =
+      make_shared<RefusedInverseOfferFilter>(*timeout);
 
     framework.inverseOfferFilters[slaveId].insert(inverseOfferFilter);
 
-    // We need to disambiguate the function call to pick the correct
-    // `expire()` overload.
-    void (Self::*expireInverseOffer)(
-             const FrameworkID&,
-             const SlaveID&,
-             InverseOfferFilter*) = &Self::expire;
+    weak_ptr<InverseOfferFilter> weakPtr = inverseOfferFilter;
 
-    delay(
-        timeout.get(),
-        self(),
-        expireInverseOffer,
-        frameworkId,
-        slaveId,
-        inverseOfferFilter);
+    inverseOfferFilter->expired()
+      .onReady(defer(self(), [=](Nothing) {
+        expire(frameworkId, slaveId, weakPtr);
+      }));
   }
 }
 
@@ -1130,15 +1507,47 @@ HierarchicalAllocatorProcess::getInverseOfferStatuses()
 }
 
 
+void HierarchicalAllocatorProcess::transitionOfferedToAllocated(
+    const SlaveID& slaveId,
+    const Resources& resources)
+{
+  CHECK_NOTNONE(getSlave(slaveId))->totalAllocated += resources;
+  roleTree.trackAllocated(resources);
+}
+
+
 void HierarchicalAllocatorProcess::recoverResources(
     const FrameworkID& frameworkId,
     const SlaveID& slaveId,
     const Resources& resources,
-    const Option<Filters>& filters)
+    const Option<Filters>& filters,
+    bool isAllocated)
 {
   CHECK(initialized);
 
   if (resources.empty()) {
+    return;
+  }
+
+  Option<Slave*> slave = getSlave(slaveId);
+
+  if (isAllocated && slave.isSome()) {
+    CHECK_CONTAINS((*slave)->totalAllocated, resources);
+    (*slave)->totalAllocated -= resources;
+    roleTree.untrackAllocated(resources);
+  }
+
+  Option<Framework*> framework = getFramework(frameworkId);
+  // No work to do if either the framework or the agent no longer exists.
+  //
+  // The framework may not exist if we dispatched Master::offer before we
+  // received MesosAllocatorProcess::removeFramework or
+  // MesosAllocatorProcess::deactivateFramework, in which case we will
+  // have already recovered all of its resources).
+  //
+  // The agent may not exist if we dispatched Master::offer before we
+  // received `removeSlave`.
+  if (framework.isNone() || slave.isNone()) {
     return;
   }
 
@@ -1155,45 +1564,26 @@ void HierarchicalAllocatorProcess::recoverResources(
 
   string role = allocations.begin()->first;
 
-  // Updated resources allocated to framework (if framework still
-  // exists, which it might not in the event that we dispatched
-  // Master::offer before we received
-  // MesosAllocatorProcess::removeFramework or
-  // MesosAllocatorProcess::deactivateFramework, in which case we will
-  // have already recovered all of its resources).
-  if (frameworks.contains(frameworkId)) {
-    CHECK(frameworkSorters.contains(role));
+  // Update resources on the agent.
 
-    const Owned<Sorter>& frameworkSorter = frameworkSorters.at(role);
+  CHECK((*slave)->getTotalOfferedOrAllocated().contains(resources))
+    << "agent " << slaveId << " resources "
+    << (*slave)->getTotalOfferedOrAllocated() << " do not contain "
+    << resources;
 
-    if (frameworkSorter->contains(frameworkId.value())) {
-      untrackAllocatedResources(slaveId, frameworkId, resources);
+  (*slave)->increaseAvailable(frameworkId, resources);
 
-      // Stop tracking the framework under this role if it's no longer
-      // subscribed and no longer has resources allocated to the role.
-      if (frameworks.at(frameworkId).roles.count(role) == 0 &&
-          frameworkSorter->allocation(frameworkId.value()).empty()) {
-        untrackFrameworkUnderRole(frameworkId, role);
-      }
-    }
-  }
+  VLOG(1) << "Recovered " << resources << " (total: " << (*slave)->getTotal()
+          << ", offered or allocated: "
+          << (*slave)->getTotalOfferedOrAllocated() << ")"
+          << " on agent " << slaveId << " from framework " << frameworkId;
 
-  // Update resources allocated on slave (if slave still exists,
-  // which it might not in the event that we dispatched Master::offer
-  // before we received Allocator::removeSlave).
-  if (slaves.contains(slaveId)) {
-    Slave& slave = slaves.at(slaveId);
+  // Update role tree and sorter.
 
-    CHECK(slave.allocated.contains(resources))
-      << slave.allocated << " does not contain " << resources;
+  Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
 
-    slave.allocated -= resources;
-
-    VLOG(1) << "Recovered " << resources
-            << " (total: " << slave.total
-            << ", allocated: " << slave.allocated << ")"
-            << " on agent " << slaveId
-            << " from framework " << frameworkId;
+  if (frameworkSorter->contains(frameworkId.value())) {
+    untrackAllocatedResources(slaveId, frameworkId, resources);
   }
 
   // No need to install the filter if 'filters' is none.
@@ -1201,10 +1591,7 @@ void HierarchicalAllocatorProcess::recoverResources(
     return;
   }
 
-  // No need to install the filter if slave/framework does not exist.
-  if (!frameworks.contains(frameworkId) || !slaves.contains(slaveId)) {
-    return;
-  }
+  // Update filters.
 
   // Create a refused resources filter.
   Try<Duration> timeout = Duration::create(Filters().refuse_seconds());
@@ -1239,15 +1626,6 @@ void HierarchicalAllocatorProcess::recoverResources(
             << " filtered agent " << slaveId
             << " for " << timeout.get();
 
-    // Create a new filter. Note that we unallocate the resources
-    // since filters are applied per-role already.
-    Resources unallocated = resources;
-    unallocated.unallocate();
-
-    OfferFilter* offerFilter = new RefusedOfferFilter(unallocated);
-    frameworks.at(frameworkId)
-      .offerFilters[role][slaveId].insert(offerFilter);
-
     // Expire the filter after both an `allocationInterval` and the
     // `timeout` have elapsed. This ensures that the filter does not
     // expire before we perform the next allocation for this agent,
@@ -1259,24 +1637,49 @@ void HierarchicalAllocatorProcess::recoverResources(
     //
     // TODO(alexr): If we allocated upon resource recovery
     // (MESOS-3078), we would not need to increase the timeout here.
-    timeout = std::max(allocationInterval, timeout.get());
+    timeout = std::max(options.allocationInterval, timeout.get());
 
-    // We need to disambiguate the function call to pick the correct
-    // `expire()` overload.
-    void (Self::*expireOffer)(
-        const FrameworkID&,
-        const string&,
-        const SlaveID&,
-        OfferFilter*) = &Self::expire;
+    // Create a new filter. Note that we unallocate the resources
+    // since filters are applied per-role already.
+    Resources unallocated = resources;
+    unallocated.unallocate();
 
-    delay(timeout.get(),
-          self(),
-          expireOffer,
-          frameworkId,
-          role,
-          slaveId,
-          offerFilter);
+    shared_ptr<RefusedOfferFilter> offerFilter =
+      make_shared<RefusedOfferFilter>(unallocated, *timeout);
+
+    (*framework)->offerFilters[role][slaveId].insert(offerFilter);
+
+    weak_ptr<OfferFilter> weakPtr = offerFilter;
+
+    offerFilter->expired()
+      .onReady(defer(self(), [=](Nothing) {
+        expire(frameworkId, role, slaveId, weakPtr);
+      }));
   }
+}
+
+
+void HierarchicalAllocatorProcess::suppressRoles(
+    Framework& framework, const set<string>& roles)
+{
+  CHECK(initialized);
+
+  // Deactivating the framework in the sorter is fine as long as
+  // SUPPRESS is not parameterized. When parameterization is added,
+  // we have to differentiate between the cases here.
+
+  foreach (const string& role, roles) {
+    Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
+
+    frameworkSorter->deactivate(framework.frameworkId.value());
+    framework.suppressedRoles.insert(role);
+    framework.metrics->suppressRole(role);
+  }
+
+  // TODO(bmahler): This logs roles that were already suppressed,
+  // only log roles that transitioned from unsuppressed -> suppressed.
+  LOG(INFO) << "Suppressed offers for roles " << stringify(roles)
+            << " of framework " << framework.frameworkId;
 }
 
 
@@ -1284,133 +1687,67 @@ void HierarchicalAllocatorProcess::suppressOffers(
     const FrameworkID& frameworkId,
     const set<string>& roles_)
 {
-  CHECK(initialized);
-  CHECK(frameworks.contains(frameworkId));
+  Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
 
-  Framework& framework = frameworks.at(frameworkId);
-
-  // Deactivating the framework in the sorter is fine as long as
-  // SUPPRESS is not parameterized. When parameterization is added,
-  // we have to differentiate between the cases here.
   const set<string>& roles = roles_.empty() ? framework.roles : roles_;
+  suppressRoles(framework, roles);
+}
+
+
+void HierarchicalAllocatorProcess::reviveRoles(
+    Framework& framework, const set<string>& roles)
+{
+  CHECK(initialized);
+
+  framework.inverseOfferFilters.clear();
 
   foreach (const string& role, roles) {
-    CHECK(frameworkSorters.contains(role));
-
-    frameworkSorters.at(role)->deactivate(frameworkId.value());
-    framework.suppressedRoles.insert(role);
+    framework.offerFilters.erase(role);
   }
 
-  LOG(INFO) << "Suppressed offers for roles " << stringify(roles)
-            << " of framework " << frameworkId;
+  // Activating the framework in the sorter is fine as long as
+  // SUPPRESS is not parameterized. When parameterization is added,
+  // we may need to differentiate between the cases here.
+  foreach (const string& role, roles) {
+    Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
+
+    frameworkSorter->activate(framework.frameworkId.value());
+    framework.suppressedRoles.erase(role);
+    framework.metrics->reviveRole(role);
+  }
+
+  // TODO(bmahler): This logs roles that were already unsuppressed,
+  // only log roles that transitioned from suppressed -> unsuppressed.
+  LOG(INFO) << "Unsuppressed offers and cleared filters for roles "
+            << stringify(roles) << " of framework " << framework.frameworkId;
 }
 
 
 void HierarchicalAllocatorProcess::reviveOffers(
     const FrameworkID& frameworkId,
-    const set<string>& roles_)
+    const set<string>& roles)
 {
   CHECK(initialized);
-  CHECK(frameworks.contains(frameworkId));
 
-  Framework& framework = frameworks.at(frameworkId);
-  framework.offerFilters.clear();
-  framework.inverseOfferFilters.clear();
+  Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
 
-  const set<string>& roles = roles_.empty() ? framework.roles : roles_;
+  reviveRoles(framework, roles.empty() ? framework.roles : roles);
 
-  // Activating the framework in the sorter on REVIVE is fine as long as
-  // SUPPRESS is not parameterized. When parameterization is added,
-  // we may need to differentiate between the cases here.
-  foreach (const string& role, roles) {
-    CHECK(frameworkSorters.contains(role));
-
-    frameworkSorters.at(role)->activate(frameworkId.value());
-    framework.suppressedRoles.erase(role);
-  }
-
-  // We delete each actual `OfferFilter` when
-  // `HierarchicalAllocatorProcess::expire` gets invoked. If we delete the
-  // `OfferFilter` here it's possible that the same `OfferFilter` (i.e., same
-  // address) could get reused and `HierarchicalAllocatorProcess::expire`
-  // would expire that filter too soon. Note that this only works
-  // right now because ALL Filter types "expire".
-
-  LOG(INFO) << "Revived offers for roles " << stringify(roles)
-            << " of framework " << frameworkId;
-
-  allocate();
+  generateOffers();
 }
 
 
-void HierarchicalAllocatorProcess::setQuota(
-    const string& role,
-    const Quota& quota)
+void HierarchicalAllocatorProcess::updateQuota(
+    const string& role, const Quota& quota)
 {
   CHECK(initialized);
 
-  // This method should be called by the master only if the quota for
-  // the role is not set. Setting quota differs from updating it because
-  // the former moves the role to a different allocation group with a
-  // dedicated sorter, while the later just updates the actual quota.
-  CHECK(!quotas.contains(role));
+  roleTree.updateQuota(role, quota);
+  metrics.updateQuota(role, quota);
 
-  // Persist quota in memory and add the role into the corresponding
-  // allocation group.
-  quotas[role] = quota;
-  quotaRoleSorter->add(role);
-  quotaRoleSorter->activate(role);
-
-  // Copy allocation information for the quota'ed role.
-  if (roleSorter->contains(role)) {
-    hashmap<SlaveID, Resources> roleAllocation = roleSorter->allocation(role);
-    foreachpair (
-        const SlaveID& slaveId, const Resources& resources, roleAllocation) {
-      // See comment at `quotaRoleSorter` declaration regarding non-revocable.
-      quotaRoleSorter->allocated(role, slaveId, resources.nonRevocable());
-    }
-  }
-
-  metrics.setQuota(role, quota);
-
-  // TODO(alexr): Print all quota info for the role.
-  LOG(INFO) << "Set quota " << quota.info.guarantee() << " for role '" << role
-            << "'";
-
-  // NOTE: Since quota changes do not result in rebalancing of
-  // offered resources, we do not trigger an allocation here; the
-  // quota change will be reflected in subsequent allocations.
-  //
-  // If we add the ability for quota changes to incur a rebalancing
-  // of offered resources, then we should trigger that here.
-}
-
-
-void HierarchicalAllocatorProcess::removeQuota(
-    const string& role)
-{
-  CHECK(initialized);
-
-  // Do not allow removing quota if it is not set.
-  CHECK(quotas.contains(role));
-  CHECK(quotaRoleSorter->contains(role));
-
-  // TODO(alexr): Print all quota info for the role.
-  LOG(INFO) << "Removed quota " << quotas[role].info.guarantee()
-            << " for role '" << role << "'";
-
-  // Remove the role from the quota'ed allocation group.
-  quotas.erase(role);
-  quotaRoleSorter->remove(role);
-
-  metrics.removeQuota(role);
-
-  // NOTE: Since quota changes do not result in rebalancing of
-  // offered resources, we do not trigger an allocation here; the
-  // quota change will be reflected in subsequent allocations.
-  //
-  // If we add the ability for quota changes to incur a rebalancing
-  // of offered resources, then we should trigger that here.
+  LOG(INFO) << "Updated quota for role '" << role << "', "
+            << " guarantees: " << quota.guarantees
+            << " limits: " << quota.limits;
 }
 
 
@@ -1421,8 +1758,7 @@ void HierarchicalAllocatorProcess::updateWeights(
 
   foreach (const WeightInfo& weightInfo, weightInfos) {
     CHECK(weightInfo.has_role());
-
-    quotaRoleSorter->updateWeight(weightInfo.role(), weightInfo.weight());
+    roleTree.updateWeight(weightInfo.role(), weightInfo.weight());
     roleSorter->updateWeight(weightInfo.role(), weightInfo.weight());
   }
 
@@ -1455,21 +1791,21 @@ void HierarchicalAllocatorProcess::resume()
 }
 
 
-Future<Nothing> HierarchicalAllocatorProcess::allocate()
+Future<Nothing> HierarchicalAllocatorProcess::generateOffers()
 {
-  return allocate(slaves.keys());
+  return generateOffers(slaves.keys());
 }
 
 
-Future<Nothing> HierarchicalAllocatorProcess::allocate(
+Future<Nothing> HierarchicalAllocatorProcess::generateOffers(
     const SlaveID& slaveId)
 {
   hashset<SlaveID> slaves({slaveId});
-  return allocate(slaves);
+  return generateOffers(slaves);
 }
 
 
-Future<Nothing> HierarchicalAllocatorProcess::allocate(
+Future<Nothing> HierarchicalAllocatorProcess::generateOffers(
     const hashset<SlaveID>& slaveIds)
 {
   if (paused) {
@@ -1480,16 +1816,16 @@ Future<Nothing> HierarchicalAllocatorProcess::allocate(
 
   allocationCandidates |= slaveIds;
 
-  if (allocation.isNone() || !allocation->isPending()) {
+  if (offerGeneration.isNone() || !offerGeneration->isPending()) {
     metrics.allocation_run_latency.start();
-    allocation = dispatch(self(), &Self::_allocate);
+    offerGeneration = dispatch(self(), &Self::_generateOffers);
   }
 
-  return allocation.get();
+  return offerGeneration.get();
 }
 
 
-Nothing HierarchicalAllocatorProcess::_allocate()
+Nothing HierarchicalAllocatorProcess::_generateOffers()
 {
   metrics.allocation_run_latency.stop();
 
@@ -1505,12 +1841,12 @@ Nothing HierarchicalAllocatorProcess::_allocate()
   stopwatch.start();
   metrics.allocation_run.start();
 
-  __allocate();
+  __generateOffers();
 
   // NOTE: For now, we implement maintenance inverse offers within the
   // allocator. We leverage the existing timer/cycle of offers to also do any
-  // "deallocation" (inverse offers) necessary to satisfy maintenance needs.
-  deallocate();
+  // inverse offers generation necessary to satisfy maintenance needs.
+  generateInverseOffers();
 
   metrics.allocation_run.stop();
 
@@ -1525,7 +1861,7 @@ Nothing HierarchicalAllocatorProcess::_allocate()
 
 
 // TODO(alexr): Consider factoring out the quota allocation logic.
-void HierarchicalAllocatorProcess::__allocate()
+void HierarchicalAllocatorProcess::__generateOffers()
 {
   // Compute the offerable resources, per framework:
   //   (1) For reserved resources on the slave, allocate these to a
@@ -1544,9 +1880,9 @@ void HierarchicalAllocatorProcess::__allocate()
   // Filter out non-whitelisted, removed, and deactivated slaves
   // in order not to send offers for them.
   foreach (const SlaveID& slaveId, allocationCandidates) {
-    if (isWhitelisted(slaveId) &&
-        slaves.contains(slaveId) &&
-        slaves.at(slaveId).activated) {
+    Option<Slave*> slave = getSlave(slaveId);
+
+    if (isWhitelisted(slaveId) && slave.isSome() && (*slave)->activated) {
       slaveIds.push_back(slaveId);
     }
   }
@@ -1555,63 +1891,6 @@ void HierarchicalAllocatorProcess::__allocate()
   //
   // TODO(vinod): Implement a smarter sorting algorithm.
   std::random_shuffle(slaveIds.begin(), slaveIds.end());
-
-  // Returns the __quantity__ of resources allocated to a role with
-  // non-default quota. Since we account for reservations and persistent
-  // volumes toward quota, we strip reservation and persistent volumes
-  // related information for comparability. The result is used to
-  // determine whether a role's quota guarantee is satisfied, and
-  // also to determine how many resources the role would need in
-  // order to meet its quota guarantee.
-  //
-  // NOTE: Revocable resources are excluded in `quotaRoleSorter`.
-  auto getQuotaRoleAllocatedScalarQuantities = [this](const string& role) {
-    CHECK(quotas.contains(role));
-
-    // NOTE: `allocationScalarQuantities` omits dynamic reservation,
-    // persistent volume info, and allocation info. We additionally
-    // remove the static reservations here via `toUnreserved()`.
-    return quotaRoleSorter->allocationScalarQuantities(role).toUnreserved();
-  };
-
-  // Returns the result of shrinking the provided resources down to the
-  // target scalar quantities. If a resource does not have a target
-  // quantity provided, it will not be shrunk.
-  //
-  // Note that some resources are indivisible (e.g. MOUNT volume) and
-  // may be excluded in entirety in order to achieve the target size
-  // (this may lead to the result size being smaller than the target size).
-  //
-  // Note also that there may be more than one result that satisfies
-  // the target sizes (e.g. need to exclude 1 of 2 disks); this function
-  // will make a random choice in these cases.
-  auto shrinkResources =
-    [](const Resources& resources,
-       hashmap<string, Value::Scalar> targetScalarQuantites) {
-    google::protobuf::RepeatedPtrField<Resource>
-      resourceVector = resources;
-
-    random_shuffle(resourceVector.begin(), resourceVector.end());
-
-    Resources result;
-    foreach (Resource& resource, resourceVector) {
-      if (!targetScalarQuantites.contains(resource.name())) {
-        // Resource that has no target quantity is left as is.
-        result += std::move(resource);
-        continue;
-      }
-
-      Option<Value::Scalar> limitScalar =
-        targetScalarQuantites.get(resource.name());
-
-      if (Resources::shrink(&resource, limitScalar.get())) {
-        targetScalarQuantites[resource.name()] -= limitScalar.get();
-        result += std::move(resource);
-      }
-    }
-
-    return result;
-  };
 
   // To enforce quota, we keep track of consumed quota for roles with a
   // non-default quota.
@@ -1633,36 +1912,37 @@ void HierarchicalAllocatorProcess::__allocate()
   //
   //   (2) Simplify the quota enforcement logic -- the allocator
   //       would no longer need to track reservations separately.
-  //
-  // Note these are __quantities__ with no meta-data.
-  hashmap<string, Resources> rolesConsumedQuotaScalarQuantites;
+  hashmap<string, ResourceQuantities> rolesConsumedQuota;
 
-  // We charge a role against its quota by considering its allocation as well
-  // as any unallocated reservations since reservations are bound to the role.
-  // In other words, we always consider reservations as consuming quota,
-  // regardless of whether they are allocated.
+  // We only log headroom info if there is any non-default quota set.
+  // We set this flag value as we iterate through all roles below.
+  //
+  // TODO(mzhu): remove this once we can determine if there is any non-default
+  // quota set by looking into the allocator memory state in constant time.
+  bool logHeadroomInfo = false;
+
+  // We charge a role against its quota by considering its allocation
+  // (including all subrole allocations) as well as any unallocated
+  // reservations (including all subrole reservations) since reservations
+  // are bound to the role. In other words, we always consider reservations
+  // as consuming quota, regardless of whether they are allocated.
   // It is calculated as:
   //
   //   Consumed Quota = reservations + unreserved allocation
-  //                  = reservations + allocation - allocated reservations
-  foreachkey (const string& role, quotas) {
-    // First add reservations.
-    rolesConsumedQuotaScalarQuantites[role] +=
-      reservationScalarQuantities.get(role).getOrElse(Resources());
 
-    // Then add allocated resoruces.
-    rolesConsumedQuotaScalarQuantites[role] +=
-      getQuotaRoleAllocatedScalarQuantities(role);
-
-    // Lastly subtract allocated reservations on each agent.
-    const hashmap<SlaveID, Resources> allocations =
-      quotaRoleSorter->allocation(role);
-
-    foreachvalue (const Resources& resources, allocations) {
-      // We need to remove the static reservation metadata here via
-      // `toUnreserved()`.
-      rolesConsumedQuotaScalarQuantites[role] -=
-        resources.reserved().createStrippedScalarQuantity().toUnreserved();
+  // Add reservations and unreserved offeredOrAllocated.
+  //
+  // Currently, only top level roles can have quota set and thus
+  // we only track consumed quota for top level roles.
+  foreach (const Role* r, roleTree.root()->children()) {
+    // TODO(mzhu): Track all role consumed quota. We may want to expose
+    // these as metrics.
+    if (r->quota() != DEFAULT_QUOTA) {
+      logHeadroomInfo = true;
+      rolesConsumedQuota[r->role] +=
+        r->reservationScalarQuantities() +
+        ResourceQuantities::fromScalarResources(
+            r->offeredOrAllocatedScalars().unreserved().nonRevocable());
     }
   }
 
@@ -1676,13 +1956,11 @@ void HierarchicalAllocatorProcess::__allocate()
   // Given the above, if a role has more reservations (which count towards
   // consumed quota) than quota guarantee, we don't need to hold back any
   // unreserved headroom for it.
-  Resources requiredHeadroom;
-  foreachpair (const string& role, const Quota& quota, quotas) {
-    // We can safely subtract resources without checking inclusion. If the
-    // minuend resource is less than the subtrahend resource, the result is an
-    // empty resource.
-    requiredHeadroom += Resources(quota.info.guarantee()) -
-      rolesConsumedQuotaScalarQuantites.get(role).getOrElse(Resources());
+  ResourceQuantities requiredHeadroom;
+  foreach (const Role* r, roleTree.root()->children()) {
+    requiredHeadroom +=
+      r->quota().guarantees -
+      rolesConsumedQuota.get(r->role).getOrElse(ResourceQuantities());
   }
 
   // We will allocate resources while ensuring that the required
@@ -1697,57 +1975,32 @@ void HierarchicalAllocatorProcess::__allocate()
   //                        allocated resources -
   //                        unallocated reservations -
   //                        unallocated revocable resources
+  ResourceQuantities availableHeadroom = totalScalarQuantities;
 
-  // NOTE: `totalScalarQuantities` omits dynamic reservation,
-  // persistent volume info, and allocation info. We additionally
-  // remove the static reservations here via `toUnreserved()`.
-  Resources availableHeadroom =
-    roleSorter->totalScalarQuantities().toUnreserved();
+  // NOTE: The role sorter does not return aggregated allocation
+  // information whereas `reservationScalarQuantities` does, so
+  // we need to loop over only top level roles for the latter.
 
   // Subtract allocated resources from the total.
-  foreachkey (const string& role, roles) {
-    // NOTE: `totalScalarQuantities` omits dynamic reservation,
-    // persistent volume info, and allocation info. We additionally
-    // remove the static reservations here via `toUnreserved()`.
-    availableHeadroom -=
-      roleSorter->allocationScalarQuantities(role).toUnreserved();
-  }
-
-  // Calculate total allocated reservations. Note that we need to ensure
-  // we count a reservation for "a" being allocated to "a/b", therefore
-  // we cannot simply loop over the reservations' roles.
-  Resources totalAllocatedReservationScalarQuantities;
-  foreachkey (const string& role, roles) {
-    hashmap<SlaveID, Resources> allocations;
-    if (quotaRoleSorter->contains(role)) {
-      allocations = quotaRoleSorter->allocation(role);
-    } else if (roleSorter->contains(role)) {
-      allocations = roleSorter->allocation(role);
-    } else {
-      continue; // This role has no allocation.
-    }
-
-    foreachvalue (const Resources& resources, allocations) {
-      // NOTE: `totalScalarQuantities` omits dynamic reservation,
-      // persistent volume info, and allocation info. We additionally
-      // remove the static reservations here via `toUnreserved()`.
-      totalAllocatedReservationScalarQuantities +=
-        resources.reserved().createStrippedScalarQuantity().toUnreserved();
-    }
-  }
+  availableHeadroom -= roleSorter->allocationScalarQuantities();
 
   // Subtract total unallocated reservations.
+  // unallocated reservations = total reservations - allocated reservations
   availableHeadroom -=
-    Resources::sum(reservationScalarQuantities) -
-    totalAllocatedReservationScalarQuantities;
+    roleTree.root()->reservationScalarQuantities() -
+    ResourceQuantities::fromScalarResources(
+        roleTree.root()->offeredOrAllocatedScalars().reserved());
 
   // Subtract revocable resources.
   foreachvalue (const Slave& slave, slaves) {
-    // NOTE: `totalScalarQuantities` omits dynamic reservation,
-    // persistent volume info, and allocation info. We additionally
-    // remove the static reservations here via `toUnreserved()`.
-    availableHeadroom -= slave.available().revocable()
-      .createStrippedScalarQuantity().toUnreserved();
+    availableHeadroom -= ResourceQuantities::fromScalarResources(
+        slave.getAvailable().revocable().scalars());
+  }
+
+  if (logHeadroomInfo) {
+    LOG(INFO) << "Before allocation, required quota headroom is "
+              << requiredHeadroom
+              << " and available quota headroom is " << availableHeadroom;
   }
 
   // Due to the two stages in the allocation algorithm and the nature of
@@ -1761,413 +2014,411 @@ void HierarchicalAllocatorProcess::__allocate()
   // allocated in the current cycle.
   hashmap<SlaveID, Resources> offeredSharedResources;
 
-  // Quota guarantee comes first and bursting above the quota guarantee
-  // up to the quota limit comes second. Here we process only those
-  // roles for that have a non-empty quota guarantee.
+  // In the 1st stage, we allocate to roles with non-default quota guarantees.
   //
   // NOTE: Even though we keep track of the available headroom, we still
-  // dedicate the first stage to satisfy role's quota guarantee. The reason
-  // is that quota guarantee headroom only acts as a quantity guarantee.
-  // Frameworks might have filters or capabilities such that those resources
-  // set aside for the headroom cannot be used by these frameworks, resulting
-  // in unsatisfied quota guarantee (despite enough quota headroom). Thus
-  // we try to satisfy the quota guarantee in this first stage so that those
-  // roles with unsatisfied guarantee can have more choices and higher
-  // probability in getting their guarantee satisfied.
+  // dedicate the first stage for roles with non-default quota guarantees.
+  // The reason is that quota guarantees headroom only acts as a quantity
+  // guarantee. Frameworks might have filters or capabilities such that the
+  // resources set aside for the headroom cannot be used by these frameworks,
+  // resulting in unsatisfied guarantees (despite enough headroom set aside).
+  // Thus we try to satisfy the quota guarantees in this first stage so that
+  // those roles with unsatisfied guarantees can have more choices and higher
+  // probability in getting their guarantees satisfied.
   foreach (const SlaveID& slaveId, slaveIds) {
-    foreach (const string& role, quotaRoleSorter->sort()) {
-      CHECK(quotas.contains(role));
+    Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
 
-      const Quota& quota = quotas.at(role);
+    foreach (const string& role, roleSorter->sort()) {
+      const Quota& quota = getQuota(role);
 
-      // If there are no active frameworks in this role, we do not
-      // need to do any allocations for this role.
-      if (!roles.contains(role)) {
+      const ResourceQuantities& quotaGuarantees = quota.guarantees;
+      const ResourceLimits& quotaLimits = quota.limits;
+
+      // We only allocate to roles with non-default guarantees
+      // in the first stage.
+      if (quotaGuarantees.empty()) {
         continue;
       }
 
-      // Fetch frameworks according to their fair share.
+      // If there are no active frameworks in this role, we do not
+      // need to do any allocations for this role.
+      bool noFrameworks = [&]() {
+        Option<const Role*> r = roleTree.get(role);
+
+        return r.isNone() || (*r)->frameworks().empty();
+      }();
+
+      if (noFrameworks) {
+        continue;
+      }
+
+      // TODO(bmahler): Handle shared volumes, which are always available but
+      // should be excluded here based on `offeredSharedResources`.
+      if (slave.getAvailable().empty()) {
+        break; // Nothing left on this agent.
+      }
+
+      ResourceQuantities unsatisfiedQuotaGuarantees =
+        quotaGuarantees -
+        rolesConsumedQuota.get(role).getOrElse(ResourceQuantities());
+
+      // We only allocate to roles with unsatisfied guarantees
+      // in the first stage.
+      if (unsatisfiedQuotaGuarantees.empty()) {
+        continue;
+      }
+
+      // Fetch frameworks in the order provided by the sorter.
       // NOTE: Suppressed frameworks are not included in the sort.
-      CHECK(frameworkSorters.contains(role));
-      const Owned<Sorter>& frameworkSorter = frameworkSorters.at(role);
+      Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
 
       foreach (const string& frameworkId_, frameworkSorter->sort()) {
-        FrameworkID frameworkId;
-        frameworkId.set_value(frameworkId_);
-
-        CHECK(slaves.contains(slaveId));
-        CHECK(frameworks.contains(frameworkId));
-
-        const Framework& framework = frameworks.at(frameworkId);
-        CHECK(framework.active) << frameworkId;
-
-        Slave& slave = slaves.at(slaveId);
-
-        // Only offer resources from slaves that have GPUs to
-        // frameworks that are capable of receiving GPUs.
-        // See MESOS-5634.
-        if (filterGpuResources &&
-            !framework.capabilities.gpuResources &&
-            slave.total.gpus().getOrElse(0) > 0) {
-          continue;
-        }
-
-        // If this framework is not region-aware, don't offer it
-        // resources on agents in remote regions.
-        if (!framework.capabilities.regionAware && isRemoteSlave(slave)) {
-          continue;
-        }
-
-        // Calculate the currently available resources on the slave, which
-        // is the difference in non-shared resources between total and
-        // allocated, plus all shared resources on the agent (if applicable).
-        Resources available = slave.available().nonShared();
-
-        // Since shared resources are offerable even when they are in use, we
-        // make one copy of the shared resources available regardless of the
-        // past allocations. Offer a shared resource only if it has not been
-        // offered in this offer cycle to a framework.
-        if (framework.capabilities.sharedResources) {
-          available += slave.total.shared();
-          if (offeredSharedResources.contains(slaveId)) {
-            available -= offeredSharedResources[slaveId];
-          }
-        }
-
-        // In this first stage, we allocate the role's reservations as well as
-        // any unreserved resources while ensuring the role stays within its
-        // quota guarantee. This means that we'll "chop" the unreserved
-        // resources up to the quota guarantee if necessary.
-        //
-        // E.g. A role has no allocations or reservations yet and a 10 cpu
-        //      quota limit. We'll chop a 15 cpu agent down to only
-        //      allocate 10 cpus to the role to keep it within its guarantee.
-        //
-        // In the case that the role needs some of the resources on this
-        // agent to make progress towards its quota, or the role is being
-        // allocated some reservation(s), we'll *also* allocate all of
-        // the resources for which it does not have quota guarantee.
-        //
-        // E.g. The agent has 1 cpu, 1024 mem, 1024 disk, 1 gpu, 5 ports
-        //      and the role has quota for 1 cpu, 1024 mem. We'll include
-        //      the disk, gpu, and ports in the allocation, despite the
-        //      role not having any quota guarantee for them.
-        //
-        // We have to do this for now because it's not possible to set
-        // quota on non-scalar resources, like ports. For scalar resources
-        // that this role has no quota for, it can be allocated as long
-        // as the quota headroom is not violated.
-        //
-        // TODO(mzhu): Since we're treating the resources with unset
-        // quota as having no guarantee and no limit, these should be
-        // also be allocated further in the second allocation "phase"
-        // below (above guarantee up to limit).
-
-        // NOTE: Currently, frameworks are allowed to have '*' role.
-        // Calling reserved('*') returns an empty Resources object.
-        //
-        // NOTE: Since we currently only support top-level roles to
-        // have quota, there are no ancestor reservations involved here.
-        Resources toAllocate = available.reserved(role).nonRevocable();
-
-        // This is a scalar quantity with no meta-data.
-        Resources unsatisfiedQuotaGuarantee =
-          Resources(quota.info.guarantee()) -
-            rolesConsumedQuotaScalarQuantites.get(role).getOrElse(Resources());
-
-        Resources unreserved = available.nonRevocable().unreserved();
-
-        // First, allocate resources up to a role's quota guarantee.
-
-        hashmap<string, Value::Scalar> unsatisfiedQuotaGuaranteeScalarLimit;
-        foreach (const string& name, unsatisfiedQuotaGuarantee.names()) {
-          unsatisfiedQuotaGuaranteeScalarLimit[name] +=
-            CHECK_NOTNONE(unsatisfiedQuotaGuarantee.get<Value::Scalar>(name));
-        }
-
-        Resources newQuotaAllocation =
-          unreserved.filter([&](const Resource& resource) {
-            return
-              unsatisfiedQuotaGuaranteeScalarLimit.contains(resource.name());
-          });
-
-        newQuotaAllocation = shrinkResources(newQuotaAllocation,
-            unsatisfiedQuotaGuaranteeScalarLimit);
-
-        toAllocate += newQuotaAllocation;
-
-        // We only include the non-quota guarantee resources (with headroom
-        // taken into account) if this role is getting any other resources
-        // as well i.e. it is getting either some quota guarantee resources or
-        // a reservation. Otherwise, this role is not going to get any
-        // allocation. We can safely `continue` here.
-        if (toAllocate.empty()) {
-          continue;
-        }
-
-        // Second, allocate scalar resources with unset quota while maintaining
-        // the quota headroom.
-
-        set<string> quotaGuaranteeResourceNames =
-          Resources(quota.info.guarantee()).names();
-
-        Resources nonQuotaGuaranteeResources =
-          unreserved.filter(
-              [&quotaGuaranteeResourceNames] (const Resource& resource) {
-                return quotaGuaranteeResourceNames.count(resource.name()) == 0;
-              }
-          );
-
-        // Allocation Limit = Available Headroom - Required Headroom
-        Resources headroomResourcesLimit = availableHeadroom - requiredHeadroom;
-
-        hashmap<string, Value::Scalar> headroomScalarLimit;
-        foreach (const string& name, headroomResourcesLimit.names()) {
-          headroomScalarLimit[name] =
-            CHECK_NOTNONE(headroomResourcesLimit.get<Value::Scalar>(name));
-        }
-
-        // If a resource type is absent in `headroomScalarLimit`, it means this
-        // type of resource is already in quota headroom deficit and we make
-        // no more allocations. They are filtered out.
-        nonQuotaGuaranteeResources = nonQuotaGuaranteeResources.filter(
-            [&] (const Resource& resource) {
-              return headroomScalarLimit.contains(resource.name());
-            }
-          );
-
-        nonQuotaGuaranteeResources =
-          shrinkResources(nonQuotaGuaranteeResources, headroomScalarLimit);
-
-        toAllocate += nonQuotaGuaranteeResources;
-
-        // Lastly, allocate non-scalar resources--we currently do not support
-        // setting quota for non-scalar resources. They are always allocated
-        // in full.
-        toAllocate +=
-          unreserved.filter([] (const Resource& resource) {
-            return resource.type() != Value::SCALAR;
-          });
-
-        // It is safe to break here, because all frameworks under a role would
-        // consider the same resources, so in case we don't have allocatable
-        // resources, we don't have to check for other frameworks under the
-        // same role. We only break out of the innermost loop, so the next step
-        // will use the same `slaveId`, but a different role.
-        //
-        // NOTE: The resources may not be allocatable here, but they can be
-        // accepted by one of the frameworks during the second allocation
-        // stage.
-        if (!allocatable(toAllocate)) {
+        if (unsatisfiedQuotaGuarantees.empty()) {
           break;
         }
 
-        // When reservation refinements are present, old frameworks without the
-        // RESERVATION_REFINEMENT capability won't be able to understand the
-        // new format. While it's possible to translate the refined reservations
-        // into the old format by "hiding" the intermediate reservations in the
-        // "stack", this leads to ambiguity when processing RESERVE / UNRESERVE
-        // operations. This is due to the loss of information when we drop the
-        // intermediate reservations. Therefore, for now we simply filter out
-        // resources with refined reservations if the framework does not have
-        // the capability.
-        if (!framework.capabilities.reservationRefinement) {
-          toAllocate = toAllocate.filter([](const Resource& resource) {
-            return !Resources::hasRefinedReservations(resource);
-          });
+        // Offer a shared resource only if it has not been offered in this
+        // offer cycle to a framework.
+        Resources available =
+          slave.getAvailable().allocatableTo(role) -
+          offeredSharedResources.get(slaveId).getOrElse(Resources());
+
+        if (available.empty()) {
+          break; // Nothing left for the role.
         }
 
-        // If the framework filters these resources, ignore.
-        if (isFiltered(frameworkId, role, slaveId, toAllocate)) {
+        FrameworkID frameworkId;
+        frameworkId.set_value(frameworkId_);
+
+        const Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
+        CHECK(framework.active) << frameworkId;
+
+        // An early `continue` optimization.
+        if (!allocatable(available, role, framework)) {
           continue;
         }
 
-        VLOG(2) << "Allocating " << toAllocate << " on agent " << slaveId
+        if (!isCapableOfReceivingAgent(framework.capabilities, slave)) {
+          continue;
+        }
+
+        available = stripIncapableResources(available, framework.capabilities);
+
+        // In this first stage, we allocate the role's reservations as well as
+        // any unreserved resources while enforcing the role's quota limits and
+        // the global headroom. We'll "chop" the unreserved resources if needed.
+        //
+        // E.g. A role has no allocations or reservations yet and a 10 cpu
+        //      quota limits. We'll chop a 15 cpu agent down to only
+        //      allocate 10 cpus to the role to keep it within its limits.
+        //
+        // Note on bursting above guarantees up to the limits in the 1st stage:
+        //
+        // In this 1st stage, for resources that the role has non-default
+        // guarantees, we allow the role to burst above this guarantee up to
+        // its limit (while maintaining the global headroom). In addition,
+        // if the role is allocated any resources that help it to make
+        // progress towards its quota guarantees, or the role is being
+        // allocated some reservation(s), we will also allocate all of the
+        // resources (subject to its limits and global headroom) for which it
+        // does not have any guarantees for.
+        //
+        // E.g. The agent has 1 cpu, 1024 mem, 1024 disk, 1 gpu, 5 ports
+        //      and the role has guarantees for 1 cpu, 512 mem and no limits.
+        //      We'll include all the disk, gpu, and ports in the allocation,
+        //      despite the role not having any quota guarantee for them. In
+        //      addition, we will also allocate all the 1024 mem to the role.
+        //
+        // Rationale of allocating all non-guaranteed resources on the agent
+        // (subject to role limits and global headroom requirements):
+        //
+        // Currently, it is not possible to set quota on non-scalar resources,
+        // like ports. A user may also only choose to set guarantees on some
+        // scalar resources (e.g. on cpu but not on memory). If we do not
+        // allocate these resources together with the guarantees, frameworks
+        // will get non-usable offers (e.g. with no ports or memory).
+        // However, the downside of this approach is that, after one allocation,
+        // the agent will be deprived of some resources (e.g. no ports),
+        // rendering any subsequent offers non-usable. Users are advised to
+        // leverage the `min_allocatbale_resources` to help prevent such offers
+        // and reduce resource fragmentation.
+        //
+        // Rationale of allowing roles to burst scalar resource allocations up
+        // to its limits (subject to headroom requirements) in this first stage:
+        //
+        // Allowing roles to burst in this first stage would help to reduce
+        // fragmentation--guaranteed resources and non-guarantee bursting
+        // resources are combined into one offer from one agent. However,
+        // the downside is that, such premature bursting will may prevent
+        // subsequent roles from getting guarantees, especially if their
+        // frameworks are picky. This is true despite the enforced headroom
+        // which only enforces quantity. Nevertheless, We choose to allow
+        // such bursting for less resource fragmentation.
+
+        // Resources that can be used to to increase a role's quota consumption.
+        //
+        // This is hot path, we use explicit filter calls to avoid
+        // multiple traversal.
+        Resources quotaResources =
+          available.filter([&](const Resource& resource) {
+            return resource.type() == Value::SCALAR &&
+                   Resources::isUnreserved(resource) &&
+                   !Resources::isRevocable(resource);
+          });
+
+        Resources guaranteesOffering =
+          shrinkResources(quotaResources, unsatisfiedQuotaGuarantees);
+
+        // We allocate this agent only if the role can make progress towards
+        // its quota guarantees i.e. it is getting some unreserved resources
+        // for its guarantees . Otherwise, this role is not going to get any
+        // allocation. We can safely continue here.
+        //
+        // NOTE: For roles with unallocated reservations on this agent, if
+        // its guarantees are already satisfied or this agent has no resources
+        // that can contribute to its guarantees (except the reservation), we
+        // will also skip it here. Its reservations will be allocated in the
+        // second stage.
+        //
+        // NOTE: Since we currently only support top-level roles to
+        // have quota, there are no ancestor reservations involved here.
+        if (guaranteesOffering.empty()) {
+          continue;
+        }
+
+        // This role's reservations, non-scalar resources and revocable
+        // resources, as well as guarantees are always allocated.
+        //
+        // We need to allocate guarantees unconditionally here so that
+        // even the cluster is overcommitted by guarantees (thus deficit in
+        // headroom), this role's guarantees can still be allocated.
+        Resources toOffer = guaranteesOffering +
+                               available.filter([&](const Resource& resource) {
+                                 return Resources::isReserved(resource, role) ||
+                                        resource.type() != Value::SCALAR ||
+                                        Resources::isRevocable(resource);
+                               });
+
+        Resources additionalScalarOffering =
+          quotaResources - guaranteesOffering;
+
+        // Then, non-guaranteed quota resources are subject to quota limits
+        // and global headroom enforcements.
+
+        // Limits enforcement.
+        if (!quotaLimits.empty()) {
+          additionalScalarOffering = shrinkResources(
+              additionalScalarOffering,
+              quotaLimits - CHECK_NOTNONE(rolesConsumedQuota.get(role)) -
+                ResourceQuantities::fromScalarResources(guaranteesOffering));
+        }
+
+        // Headroom enforcement.
+        //
+        // This check is only for performance optimization.
+        if (!requiredHeadroom.empty() && !additionalScalarOffering.empty()) {
+          // Shrink down to surplus headroom.
+          //
+          // Surplus headroom = (availableHeadroom - guaranteesOffering) -
+          //                      (requiredHeadroom - guaranteesOffering)
+          //                  = availableHeadroom - requiredHeadroom
+          additionalScalarOffering = shrinkResources(
+              additionalScalarOffering, availableHeadroom - requiredHeadroom);
+        }
+
+        toOffer += additionalScalarOffering;
+
+        // If the framework filters these resources, ignore.
+        if (!allocatable(toOffer, role, framework) ||
+            isFiltered(framework, role, slave, toOffer)) {
+          continue;
+        }
+
+        VLOG(2) << "Offering " << toOffer << " on agent " << slaveId
                 << " to role " << role << " of framework " << frameworkId
                 << " as part of its role quota";
 
-        toAllocate.allocate(role);
+        toOffer.allocate(role);
 
-        offerable[frameworkId][role][slaveId] += toAllocate;
-        offeredSharedResources[slaveId] += toAllocate.shared();
+        offerable[frameworkId][role][slaveId] += toOffer;
+        offeredSharedResources[slaveId] += toOffer.shared();
 
-        Resources allocatedUnreserved =
-          toAllocate.unreserved().createStrippedScalarQuantity();
+        // Update role consumed quota and quota headroom.
 
-        // Update role consumed quota.
-        rolesConsumedQuotaScalarQuantites[role] += allocatedUnreserved;
+        ResourceQuantities increasedQuotaConsumption =
+          ResourceQuantities::fromScalarResources(
+              guaranteesOffering + additionalScalarOffering);
 
-        // Track quota guarantee headroom change.
+        unsatisfiedQuotaGuarantees -= increasedQuotaConsumption;
+        rolesConsumedQuota[role] += increasedQuotaConsumption;
+        for (const string& ancestor : roles::ancestors(role)) {
+          rolesConsumedQuota[ancestor] += increasedQuotaConsumption;
+        }
 
-        // `requiredHeadroom` counts total unsatisfied quota guarantee. Thus
-        // only the part of the allocated resources that satisfy some of the
-        // role's guarantee should be subtracted. Allocation of reserved
-        // resources or resources that this role has unset guarantee do not
-        // affect `requiredHeadroom`.
-        requiredHeadroom -= newQuotaAllocation.createStrippedScalarQuantity();
+        requiredHeadroom -=
+          ResourceQuantities::fromScalarResources(guaranteesOffering);
+        availableHeadroom -= increasedQuotaConsumption;
 
-        // `availableHeadroom` counts total unreserved non-revocable resources
-        // in the cluster.
-        availableHeadroom -= allocatedUnreserved;
+        slave.decreaseAvailable(frameworkId, toOffer);
 
-        slave.allocated += toAllocate;
-
-        trackAllocatedResources(slaveId, frameworkId, toAllocate);
+        trackAllocatedResources(slaveId, frameworkId, toOffer);
       }
     }
   }
 
   // Similar to the first stage, we will allocate resources while ensuring
   // that the required unreserved non-revocable headroom is still available
-  // for unsastified quota guarantees. Otherwise, we will not be able to
-  // satisfy quota guarantees later. Reservations to non-quota roles and
-  // revocable resources will always be included in the offers since these
-  // are not part of the headroom (and therefore can't be used to satisfy
-  // quota guarantees).
+  // for unsatisfied quota guarantees. Otherwise, we will not be able to
+  // satisfy quota guarantees later. Reservations and revocable resources
+  // will always be included in the offers since allocating these does not
+  // make progress towards satisifying quota guarantees.
+  //
+  // For logging purposes, we track the number of agents that had resources
+  // held back for quota headroom, as well as how many resources in total
+  // were held back.
+  //
+  // While we also held resources back for quota headroom in the first stage,
+  // we do not track it there. This is because in the second stage, we try to
+  // allocate all resources (including the ones held back in the first stage).
+  // Thus only resources held back in the second stage are truly held back for
+  // the whole allocation cycle.
+  ResourceQuantities heldBackForHeadroom;
+  size_t heldBackAgentCount = 0;
+
+  // We randomize the agents here to "spread out" the effect of the first
+  // stage, which tends to allocate from the front of the agent list more
+  // so than the back.
+  std::random_shuffle(slaveIds.begin(), slaveIds.end());
 
   foreach (const SlaveID& slaveId, slaveIds) {
+    Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
+
     foreach (const string& role, roleSorter->sort()) {
-      // In the second allocation stage, we only allocate
-      // for non-quota roles.
-      if (quotas.contains(role)) {
-        continue;
+      // TODO(bmahler): Handle shared volumes, which are always available but
+      // should be excluded here based on `offeredSharedResources`.
+      if (slave.getAvailable().empty()) {
+        break; // Nothing left on this agent.
       }
 
+      const ResourceLimits& quotaLimits = getQuota(role).limits;
+
       // NOTE: Suppressed frameworks are not included in the sort.
-      CHECK(frameworkSorters.contains(role));
-      const Owned<Sorter>& frameworkSorter = frameworkSorters.at(role);
+      Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
 
       foreach (const string& frameworkId_, frameworkSorter->sort()) {
+        // Offer a shared resource only if it has not been offered in this
+        // offer cycle to a framework.
+        Resources available =
+          slave.getAvailable().allocatableTo(role) -
+          offeredSharedResources.get(slaveId).getOrElse(Resources());
+
+        if (available.empty()) {
+          break; // Nothing left for the role.
+        }
+
         FrameworkID frameworkId;
         frameworkId.set_value(frameworkId_);
 
-        CHECK(slaves.contains(slaveId));
-        CHECK(frameworks.contains(frameworkId));
+        const Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
 
-        const Framework& framework = frameworks.at(frameworkId);
-        Slave& slave = slaves.at(slaveId);
-
-        // Only offer resources from slaves that have GPUs to
-        // frameworks that are capable of receiving GPUs.
-        // See MESOS-5634.
-        if (filterGpuResources &&
-            !framework.capabilities.gpuResources &&
-            slave.total.gpus().getOrElse(0) > 0) {
+        // An early `continue` optimization.
+        if (!allocatable(available, role, framework)) {
           continue;
         }
 
-        // If this framework is not region-aware, don't offer it
-        // resources on agents in remote regions.
-        if (!framework.capabilities.regionAware && isRemoteSlave(slave)) {
+        if (!isCapableOfReceivingAgent(framework.capabilities, slave)) {
           continue;
         }
 
-        // Calculate the currently available resources on the slave, which
-        // is the difference in non-shared resources between total and
-        // allocated, plus all shared resources on the agent (if applicable).
-        Resources available = slave.available().nonShared();
+        available = stripIncapableResources(available, framework.capabilities);
 
-        // Since shared resources are offerable even when they are in use, we
-        // make one copy of the shared resources available regardless of the
-        // past allocations. Offer a shared resource only if it has not been
-        // offered in this offer cycle to a framework.
-        if (framework.capabilities.sharedResources) {
-          available += slave.total.shared();
-          if (offeredSharedResources.contains(slaveId)) {
-            available -= offeredSharedResources[slaveId];
+        // Reservations (including the roles ancestors' reservations),
+        // non-scalar resources and revocable resources are always allocated.
+        Resources toOffer = available.filter([&](const Resource& resource) {
+          return Resources::isReserved(resource) ||
+                 resource.type() != Value::SCALAR ||
+                 Resources::isRevocable(resource);
+        });
+
+        // Then, unreserved scalar resources are subject to quota limits
+        // and global headroom enforcement.
+        //
+        // This is hot path, we use explicit filter calls to avoid
+        // multiple traversal.
+        Resources additionalScalarOffering =
+          available.filter([&](const Resource& resource) {
+            return resource.type() == Value::SCALAR &&
+                   Resources::isUnreserved(resource) &&
+                   !Resources::isRevocable(resource);
+          });
+
+        // Limits enforcement.
+        if (!quotaLimits.empty()) {
+          additionalScalarOffering = shrinkResources(
+              additionalScalarOffering,
+              quotaLimits - CHECK_NOTNONE(rolesConsumedQuota.get(role)));
+        }
+
+        // Headroom enforcement.
+        //
+        // This check is only for performance optimization.
+        if (!requiredHeadroom.empty() && !additionalScalarOffering.empty()) {
+          Resources shrunk = shrinkResources(
+              additionalScalarOffering, availableHeadroom - requiredHeadroom);
+
+          // If resources are held back.
+          if (shrunk != additionalScalarOffering) {
+            heldBackForHeadroom += ResourceQuantities::fromScalarResources(
+                additionalScalarOffering - shrunk);
+            ++heldBackAgentCount;
+
+            additionalScalarOffering = std::move(shrunk);
           }
         }
 
-        // The resources we offer are the unreserved resources as well as the
-        // reserved resources for this particular role and all its ancestors
-        // in the role hierarchy.
-        //
-        // NOTE: Currently, frameworks are allowed to have '*' role.
-        // Calling reserved('*') returns an empty Resources object.
-        //
-        // TODO(mpark): Offer unreserved resources as revocable beyond quota.
-        Resources toAllocate = available.allocatableTo(role);
-
-        // It is safe to break here, because all frameworks under a role would
-        // consider the same resources, so in case we don't have allocatable
-        // resources, we don't have to check for other frameworks under the
-        // same role. We only break out of the innermost loop, so the next step
-        // will use the same slaveId, but a different role.
-        //
-        // The difference to the second `allocatable` check is that here we also
-        // check for revocable resources, which can be disabled on a per frame-
-        // work basis, which requires us to go through all frameworks in case we
-        // have allocatable revocable resources.
-        if (!allocatable(toAllocate)) {
-          break;
-        }
-
-        // Remove revocable resources if the framework has not opted for them.
-        if (!framework.capabilities.revocableResources) {
-          toAllocate = toAllocate.nonRevocable();
-        }
-
-        // When reservation refinements are present, old frameworks without the
-        // RESERVATION_REFINEMENT capability won't be able to understand the
-        // new format. While it's possible to translate the refined reservations
-        // into the old format by "hiding" the intermediate reservations in the
-        // "stack", this leads to ambiguity when processing RESERVE / UNRESERVE
-        // operations. This is due to the loss of information when we drop the
-        // intermediate reservations. Therefore, for now we simply filter out
-        // resources with refined reservations if the framework does not have
-        // the capability.
-        if (!framework.capabilities.reservationRefinement) {
-          toAllocate = toAllocate.filter([](const Resource& resource) {
-            return !Resources::hasRefinedReservations(resource);
-          });
-        }
-
-        // If allocating these resources would reduce the headroom
-        // below what is required, we will hold them back.
-        const Resources headroomToAllocate = toAllocate
-          .scalars().unreserved().nonRevocable();
-
-        bool sufficientHeadroom =
-          (availableHeadroom -
-            headroomToAllocate.createStrippedScalarQuantity())
-            .contains(requiredHeadroom);
-
-        if (!sufficientHeadroom) {
-          toAllocate -= headroomToAllocate;
-        }
-
-        // If the resources are not allocatable, ignore. We cannot break
-        // here, because another framework under the same role could accept
-        // revocable resources and breaking would skip all other frameworks.
-        if (!allocatable(toAllocate)) {
-          continue;
-        }
+        toOffer += additionalScalarOffering;
 
         // If the framework filters these resources, ignore.
-        if (isFiltered(frameworkId, role, slaveId, toAllocate)) {
+        if (!allocatable(toOffer, role, framework) ||
+            isFiltered(framework, role, slave, toOffer)) {
           continue;
         }
 
-        VLOG(2) << "Allocating " << toAllocate << " on agent " << slaveId
+        VLOG(2) << "Offering " << toOffer << " on agent " << slaveId
                 << " to role " << role << " of framework " << frameworkId;
 
-        toAllocate.allocate(role);
+        toOffer.allocate(role);
 
-        // NOTE: We perform "coarse-grained" allocation, meaning that we always
-        // allocate the entire remaining slave resources to a single framework.
-        offerable[frameworkId][role][slaveId] += toAllocate;
-        offeredSharedResources[slaveId] += toAllocate.shared();
+        offerable[frameworkId][role][slaveId] += toOffer;
+        offeredSharedResources[slaveId] += toOffer.shared();
 
-        if (sufficientHeadroom) {
-          availableHeadroom -=
-            headroomToAllocate.createStrippedScalarQuantity();
+        // Update role consumed quota and quota headroom
+
+        ResourceQuantities increasedQuotaConsumption =
+          ResourceQuantities::fromScalarResources(additionalScalarOffering);
+
+        if (getQuota(role) != DEFAULT_QUOTA) {
+          rolesConsumedQuota[role] += increasedQuotaConsumption;
+          for (const string& ancestor : roles::ancestors(role)) {
+            rolesConsumedQuota[ancestor] += increasedQuotaConsumption;
+          }
         }
 
-        slave.allocated += toAllocate;
+        availableHeadroom -= increasedQuotaConsumption;
 
-        trackAllocatedResources(slaveId, frameworkId, toAllocate);
+        slave.decreaseAvailable(frameworkId, toOffer);
+
+        trackAllocatedResources(slaveId, frameworkId, toOffer);
       }
     }
+  }
+
+  if (logHeadroomInfo) {
+    LOG(INFO) << "After allocation, " << requiredHeadroom
+              << " are required for quota headroom, "
+              << heldBackForHeadroom << " were held back from "
+              << heldBackAgentCount
+              << " agents to ensure sufficient quota headroom";
   }
 
   if (offerable.empty()) {
@@ -2181,89 +2432,69 @@ void HierarchicalAllocatorProcess::__allocate()
 }
 
 
-void HierarchicalAllocatorProcess::deallocate()
+void HierarchicalAllocatorProcess::generateInverseOffers()
 {
-  // If no frameworks are currently registered, no work to do.
-  if (roles.empty()) {
-    return;
-  }
-  CHECK(!frameworkSorters.empty());
-
   // In this case, `offerable` is actually the slaves and/or resources that we
   // want the master to create `InverseOffer`s from.
   hashmap<FrameworkID, hashmap<SlaveID, UnavailableResources>> offerable;
 
-  // For maintenance, we use the framework sorters to determine which frameworks
-  // have (1) reserved and / or (2) unreserved resource on the specified
-  // slaveIds. This way we only send inverse offers to frameworks that have the
-  // potential to lose something. We keep track of which frameworks already have
-  // an outstanding inverse offer for the given slave in the
-  // UnavailabilityStatus of the specific slave using the `offerOutstanding`
-  // flag. This is equivalent to the accounting we do for resources when we send
-  // regular offers. If we didn't keep track of outstanding offers then we would
-  // keep generating new inverse offers even though the framework had not
-  // responded yet.
+  // For maintenance, we only send inverse offers to frameworks that have the
+  // potential to lose something (i.e. it has resources offered or allocated on
+  // a given agent). We keep track of which frameworks already have an
+  // outstanding inverse offer for the given slave in the UnavailabilityStatus
+  // of the specific slave using the `offerOutstanding` flag. This is equivalent
+  // to the accounting we do for resources when we send regular offers. If we
+  // didn't keep track of outstanding offers then we would keep generating new
+  // inverse offers even though the framework had not responded yet.
+  //
+  // TODO(mzhu): Need to consider reservations as well.
+  foreach (const SlaveID& slaveId, allocationCandidates) {
+    Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
 
-  foreachvalue (const Owned<Sorter>& frameworkSorter, frameworkSorters) {
-    foreach (const SlaveID& slaveId, allocationCandidates) {
-      CHECK(slaves.contains(slaveId));
+    if (slave.maintenance.isSome()) {
+      // We use a reference by alias because we intend to modify the
+      // `maintenance` and to improve readability.
+      Slave::Maintenance& maintenance = slave.maintenance.get();
 
-      Slave& slave = slaves.at(slaveId);
+      foreachkey (
+          const FrameworkID& frameworkId, slave.getOfferedOrAllocated()) {
+        const Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
 
-      if (slave.maintenance.isSome()) {
-        // We use a reference by alias because we intend to modify the
-        // `maintenance` and to improve readability.
-        Slave::Maintenance& maintenance = slave.maintenance.get();
+        // No need to deallocate for an inactive framework as the master
+        // will not send it inverse offers.
+        if (!framework.active) {
+          continue;
+        }
 
-        hashmap<string, Resources> allocation =
-          frameworkSorter->allocation(slaveId);
-
-        foreachkey (const string& frameworkId_, allocation) {
-          FrameworkID frameworkId;
-          frameworkId.set_value(frameworkId_);
-
-          CHECK(frameworks.contains(frameworkId)) << frameworkId;
-
-          const Framework& framework = frameworks.at(frameworkId);
-
-          // No need to deallocate for an inactive framework as the master
-          // will not send it inverse offers.
-          if (!framework.active) {
-            continue;
-          }
-
-          // If this framework doesn't already have inverse offers for the
-          // specified slave.
-          if (!offerable[frameworkId].contains(slaveId)) {
-            // If there isn't already an outstanding inverse offer to this
-            // framework for the specified slave.
-            if (!maintenance.offersOutstanding.contains(frameworkId)) {
-              // Ignore in case the framework filters inverse offers for this
-              // slave.
-              //
-              // NOTE: Since this specific allocator implementation only sends
-              // inverse offers for maintenance primitives, and those are at the
-              // whole slave level, we only need to filter based on the
-              // time-out.
-              if (isFiltered(frameworkId, slaveId)) {
-                continue;
-              }
-
-              const UnavailableResources unavailableResources =
-                UnavailableResources{
-                    Resources(),
-                    maintenance.unavailability};
-
-              // For now we send inverse offers with empty resources when the
-              // inverse offer represents maintenance on the machine. In the
-              // future we could be more specific about the resources on the
-              // host, as we have the information available.
-              offerable[frameworkId][slaveId] = unavailableResources;
-
-              // Mark this framework as having an offer outstanding for the
-              // specified slave.
-              maintenance.offersOutstanding.insert(frameworkId);
+        // If this framework doesn't already have inverse offers for the
+        // specified slave.
+        if (!offerable[frameworkId].contains(slaveId)) {
+          // If there isn't already an outstanding inverse offer to this
+          // framework for the specified slave.
+          if (!maintenance.offersOutstanding.contains(frameworkId)) {
+            // Ignore in case the framework filters inverse offers for this
+            // slave.
+            //
+            // NOTE: Since this specific allocator implementation only sends
+            // inverse offers for maintenance primitives, and those are at the
+            // whole slave level, we only need to filter based on the
+            // time-out.
+            if (isFiltered(framework, slave)) {
+              continue;
             }
+
+            const UnavailableResources unavailableResources =
+              UnavailableResources{Resources(), maintenance.unavailability};
+
+            // For now we send inverse offers with empty resources when the
+            // inverse offer represents maintenance on the machine. In the
+            // future we could be more specific about the resources on the
+            // host, as we have the information available.
+            offerable[frameworkId][slaveId] = unavailableResources;
+
+            // Mark this framework as having an offer outstanding for the
+            // specified slave.
+            maintenance.offersOutstanding.insert(frameworkId);
           }
         }
       }
@@ -2285,36 +2516,40 @@ void HierarchicalAllocatorProcess::_expire(
     const FrameworkID& frameworkId,
     const string& role,
     const SlaveID& slaveId,
-    OfferFilter* offerFilter)
+    const weak_ptr<OfferFilter>& offerFilter)
 {
   // The filter might have already been removed (e.g., if the
-  // framework no longer exists or in `reviveOffers()`) but not
-  // yet deleted (to keep the address from getting reused
-  // possibly causing premature expiration).
-  //
-  // Since this is a performance-sensitive piece of code,
-  // we use find to avoid the doing any redundant lookups.
+  // framework no longer exists or in `reviveOffers()`) but
+  // we may land here if the cancelation of the expiry timeout
+  // did not succeed (due to the dispatch already being in the
+  // queue).
+  shared_ptr<OfferFilter> filter = offerFilter.lock();
 
-  auto frameworkIterator = frameworks.find(frameworkId);
-  if (frameworkIterator != frameworks.end()) {
-    Framework& framework = frameworkIterator->second;
-
-    auto roleFilters = framework.offerFilters.find(role);
-    if (roleFilters != framework.offerFilters.end()) {
-      auto agentFilters = roleFilters->second.find(slaveId);
-
-      if (agentFilters != roleFilters->second.end()) {
-        // Erase the filter (may be a no-op per the comment above).
-        agentFilters->second.erase(offerFilter);
-
-        if (agentFilters->second.empty()) {
-          roleFilters->second.erase(slaveId);
-        }
-      }
-    }
+  if (filter.get() == nullptr) {
+    return;
   }
 
-  delete offerFilter;
+  // Since this is a performance-sensitive piece of code,
+  // we use find to avoid the doing any redundant lookups.
+  auto frameworkIterator = frameworks.find(frameworkId);
+  CHECK(frameworkIterator != frameworks.end());
+
+  Framework& framework = frameworkIterator->second;
+
+  auto roleFilters = framework.offerFilters.find(role);
+  CHECK(roleFilters != framework.offerFilters.end());
+
+  auto agentFilters = roleFilters->second.find(slaveId);
+  CHECK(agentFilters != roleFilters->second.end());
+
+  // Erase the filter (may be a no-op per the comment above).
+  agentFilters->second.erase(filter);
+  if (agentFilters->second.empty()) {
+    roleFilters->second.erase(slaveId);
+  }
+  if (roleFilters->second.empty()) {
+    framework.offerFilters.erase(role);
+  }
 }
 
 
@@ -2322,7 +2557,7 @@ void HierarchicalAllocatorProcess::expire(
     const FrameworkID& frameworkId,
     const string& role,
     const SlaveID& slaveId,
-    OfferFilter* offerFilter)
+    const weak_ptr<OfferFilter>& offerFilter)
 {
   dispatch(
       self(),
@@ -2337,58 +2572,51 @@ void HierarchicalAllocatorProcess::expire(
 void HierarchicalAllocatorProcess::expire(
     const FrameworkID& frameworkId,
     const SlaveID& slaveId,
-    InverseOfferFilter* inverseOfferFilter)
+    const weak_ptr<InverseOfferFilter>& inverseOfferFilter)
 {
   // The filter might have already been removed (e.g., if the
   // framework no longer exists or in
-  // HierarchicalAllocatorProcess::reviveOffers) but not yet deleted (to
-  // keep the address from getting reused possibly causing premature
-  // expiration).
-  //
-  // Since this is a performance-sensitive piece of code,
-  // we use find to avoid the doing any redundant lookups.
+  // HierarchicalAllocatorProcess::reviveOffers) but
+  // we may land here if the cancelation of the expiry timeout
+  // did not succeed (due to the dispatch already being in the
+  // queue).
+  shared_ptr<InverseOfferFilter> filter = inverseOfferFilter.lock();
 
-  auto frameworkIterator = frameworks.find(frameworkId);
-  if (frameworkIterator != frameworks.end()) {
-    Framework& framework = frameworkIterator->second;
-
-    auto filters = framework.inverseOfferFilters.find(slaveId);
-    if (filters != framework.inverseOfferFilters.end()) {
-      filters->second.erase(inverseOfferFilter);
-
-      if (filters->second.empty()) {
-        framework.inverseOfferFilters.erase(slaveId);
-      }
-    }
+  if (filter.get() == nullptr) {
+    return;
   }
 
-  delete inverseOfferFilter;
+  // Since this is a performance-sensitive piece of code,
+  // we use find to avoid the doing any redundant lookups.
+  auto frameworkIterator = frameworks.find(frameworkId);
+  CHECK(frameworkIterator != frameworks.end());
+
+  Framework& framework = frameworkIterator->second;
+
+  auto filters = framework.inverseOfferFilters.find(slaveId);
+  CHECK(filters != framework.inverseOfferFilters.end());
+
+  filters->second.erase(filter);
+  if (filters->second.empty()) {
+    framework.inverseOfferFilters.erase(slaveId);
+  }
 }
 
 
 bool HierarchicalAllocatorProcess::isWhitelisted(
     const SlaveID& slaveId) const
 {
-  CHECK(slaves.contains(slaveId));
-
-  const Slave& slave = slaves.at(slaveId);
-
-  return whitelist.isNone() || whitelist->contains(slave.info.hostname());
+  return whitelist.isNone() ||
+    whitelist->contains(CHECK_NOTNONE(getSlave(slaveId))->info.hostname());
 }
 
 
 bool HierarchicalAllocatorProcess::isFiltered(
-    const FrameworkID& frameworkId,
+    const Framework& framework,
     const string& role,
-    const SlaveID& slaveId,
+    const Slave& slave,
     const Resources& resources) const
 {
-  CHECK(frameworks.contains(frameworkId));
-  CHECK(slaves.contains(slaveId));
-
-  const Framework& framework = frameworks.at(frameworkId);
-  const Slave& slave = slaves.at(slaveId);
-
   // TODO(mpark): Consider moving these filter logic out and into the master,
   // since they are not specific to the hierarchical allocator but rather are
   // global allocation constraints.
@@ -2397,8 +2625,8 @@ bool HierarchicalAllocatorProcess::isFiltered(
   // to MULTI_ROLE frameworks.
   if (framework.capabilities.multiRole &&
       !slave.capabilities.multiRole) {
-    LOG(WARNING) << "Implicitly filtering agent " << slaveId
-                 << " from framework " << frameworkId
+    LOG(WARNING) << "Implicitly filtering agent " << slave.info.id()
+                 << " from framework " << framework.frameworkId
                  << " because the framework is MULTI_ROLE capable"
                  << " but the agent is not";
 
@@ -2408,7 +2636,7 @@ bool HierarchicalAllocatorProcess::isFiltered(
   // Prevent offers from non-HIERARCHICAL_ROLE agents to be allocated
   // to hierarchical roles.
   if (!slave.capabilities.hierarchicalRole && strings::contains(role, "/")) {
-    LOG(WARNING) << "Implicitly filtering agent " << slaveId
+    LOG(WARNING) << "Implicitly filtering agent " << slave.info.id()
                  << " from role " << role
                  << " because the role is hierarchical but the agent is not"
                  << " HIERARCHICAL_ROLE capable";
@@ -2423,17 +2651,17 @@ bool HierarchicalAllocatorProcess::isFiltered(
     return false;
   }
 
-  auto agentFilters = roleFilters->second.find(slaveId);
+  auto agentFilters = roleFilters->second.find(slave.info.id());
   if (agentFilters == roleFilters->second.end()) {
     return false;
   }
 
-  foreach (OfferFilter* offerFilter, agentFilters->second) {
+  foreach (const shared_ptr<OfferFilter>& offerFilter, agentFilters->second) {
     if (offerFilter->filter(resources)) {
       VLOG(1) << "Filtered offer with " << resources
-              << " on agent " << slaveId
+              << " on agent " << slave.info.id()
               << " for role " << role
-              << " of framework " << frameworkId;
+              << " of framework " << framework.frameworkId;
 
       return true;
     }
@@ -2444,20 +2672,14 @@ bool HierarchicalAllocatorProcess::isFiltered(
 
 
 bool HierarchicalAllocatorProcess::isFiltered(
-    const FrameworkID& frameworkId,
-    const SlaveID& slaveId) const
+    const Framework& framework, const Slave& slave) const
 {
-  CHECK(frameworks.contains(frameworkId));
-  CHECK(slaves.contains(slaveId));
-
-  const Framework& framework = frameworks.at(frameworkId);
-
-  if (framework.inverseOfferFilters.contains(slaveId)) {
-    foreach (InverseOfferFilter* inverseOfferFilter,
-             framework.inverseOfferFilters.at(slaveId)) {
+  if (framework.inverseOfferFilters.contains(slave.info.id())) {
+    foreach (const shared_ptr<InverseOfferFilter>& inverseOfferFilter,
+             framework.inverseOfferFilters.at(slave.info.id())) {
       if (inverseOfferFilter->filter()) {
-        VLOG(1) << "Filtered unavailability on agent " << slaveId
-                << " for framework " << frameworkId;
+        VLOG(1) << "Filtered unavailability on agent " << slave.info.id()
+                << " for framework " << framework.frameworkId;
 
         return true;
       }
@@ -2469,13 +2691,39 @@ bool HierarchicalAllocatorProcess::isFiltered(
 
 
 bool HierarchicalAllocatorProcess::allocatable(
-    const Resources& resources)
+    const Resources& resources,
+    const string& role,
+    const Framework& framework) const
 {
-  Option<double> cpus = resources.cpus();
-  Option<Bytes> mem = resources.mem();
+  if (resources.empty()) {
+    return false;
+  }
 
-  return (cpus.isSome() && cpus.get() >= MIN_CPUS) ||
-         (mem.isSome() && mem.get() >= MIN_MEM);
+  // By default we check against the globally configured minimal
+  // allocatable resources.
+  //
+  // NOTE: We use a pointer instead of `Option` semantics here to
+  // avoid copying vectors in code in the hot path of the allocator.
+  const vector<ResourceQuantities>* _minAllocatableResources =
+    options.minAllocatableResources.isSome()
+      ? &options.minAllocatableResources.get()
+      : nullptr;
+
+  if (framework.minAllocatableResources.contains(role)) {
+    _minAllocatableResources = &framework.minAllocatableResources.at(role);
+  }
+
+  // If no minimal requirements or an empty set of requirments are
+  // configured any resource is allocatable.
+  if (_minAllocatableResources == nullptr ||
+      _minAllocatableResources->empty()) {
+    return true;
+  }
+
+  return std::any_of(
+      _minAllocatableResources->begin(),
+      _minAllocatableResources->end(),
+      [&](const ResourceQuantities& qs) { return resources.contains(qs); });
 }
 
 
@@ -2486,7 +2734,7 @@ double HierarchicalAllocatorProcess::_resources_offered_or_allocated(
 
   foreachvalue (const Slave& slave, slaves) {
     Option<Value::Scalar> value =
-      slave.allocated.get<Value::Scalar>(resource);
+      slave.getTotalOfferedOrAllocated().get<Value::Scalar>(resource);
 
     if (value.isSome()) {
       offered_or_allocated += value->value();
@@ -2500,23 +2748,21 @@ double HierarchicalAllocatorProcess::_resources_offered_or_allocated(
 double HierarchicalAllocatorProcess::_resources_total(
     const string& resource)
 {
-  Option<Value::Scalar> total =
-    roleSorter->totalScalarQuantities()
-      .get<Value::Scalar>(resource);
-
-  return total.isSome() ? total->value() : 0;
+  return totalScalarQuantities.get(resource).value();
 }
 
 
-double HierarchicalAllocatorProcess::_quota_allocated(
+double HierarchicalAllocatorProcess::_quota_offered_or_allocated(
     const string& role,
     const string& resource)
 {
-  Option<Value::Scalar> used =
-    quotaRoleSorter->allocationScalarQuantities(role)
-      .get<Value::Scalar>(resource);
+  if (!roleSorter->contains(role)) {
+    // This can occur when execution of this callback races with removal of the
+    // metric for a role which does not have any associated frameworks.
+    return 0.;
+  }
 
-  return used.isSome() ? used->value() : 0;
+  return roleSorter->allocationScalarQuantities(role).get(resource).value();
 }
 
 
@@ -2540,111 +2786,116 @@ double HierarchicalAllocatorProcess::_offer_filters_active(
 
 
 bool HierarchicalAllocatorProcess::isFrameworkTrackedUnderRole(
-    const FrameworkID& frameworkId,
+    const FrameworkID& frameworkId, const string& role) const
+{
+  Option<const Role*> r = roleTree.get(role);
+  return r.isSome() && (*r)->frameworks().contains(frameworkId);
+}
+
+
+Option<Slave*> HierarchicalAllocatorProcess::getSlave(
+    const SlaveID& slaveId) const
+{
+  auto it = slaves.find(slaveId);
+
+  if (it == slaves.end()) return None();
+
+  return const_cast<Slave*>(&it->second);
+}
+
+
+Option<Framework*> HierarchicalAllocatorProcess::getFramework(
+    const FrameworkID& frameworkId) const
+{
+  auto it = frameworks.find(frameworkId);
+
+  if (it == frameworks.end()) return None();
+
+  return const_cast<Framework*>(&it->second);
+}
+
+
+Option<Sorter*> HierarchicalAllocatorProcess::getFrameworkSorter(
     const string& role) const
 {
-  return roles.contains(role) &&
-         roles.at(role).contains(frameworkId);
+  auto it = frameworkSorters.find(role);
+
+  if (it == frameworkSorters.end()) return None();
+
+  return const_cast<Sorter*>(it->second.get());
+}
+
+
+const Quota& HierarchicalAllocatorProcess::getQuota(const string& role) const
+{
+  Option<const Role*> r = roleTree.get(role);
+
+  return r.isSome() ? (*r)->quota() : DEFAULT_QUOTA;
 }
 
 
 void HierarchicalAllocatorProcess::trackFrameworkUnderRole(
-    const FrameworkID& frameworkId,
-    const string& role)
+    const Framework& framework, const string& role)
 {
   CHECK(initialized);
 
-  // If this is the first framework to subscribe to this role, or have
-  // resources allocated to this role, initialize state as necessary.
-  if (!roles.contains(role)) {
-    roles[role] = {};
-    CHECK(!roleSorter->contains(role));
+  // If this is the first framework to subscribe to this role,
+  // initialize state as necessary.
+  if (roleTree.get(role).isNone() ||
+      (*roleTree.get(role))->frameworks().empty()) {
+    CHECK_NOT_CONTAINS(*roleSorter, role);
     roleSorter->add(role);
     roleSorter->activate(role);
 
-    CHECK(!frameworkSorters.contains(role));
+    CHECK_NOT_CONTAINS(frameworkSorters, role);
     frameworkSorters.insert({role, Owned<Sorter>(frameworkSorterFactory())});
-    frameworkSorters.at(role)->initialize(fairnessExcludeResourceNames);
-    metrics.addRole(role);
+
+    Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
+
+    frameworkSorter->initialize(options.fairnessExcludeResourceNames);
+
+    foreachvalue (const Slave& slave, slaves) {
+      frameworkSorter->addSlave(
+          slave.info.id(),
+          ResourceQuantities::fromScalarResources(slave.getTotal().scalars()));
+    }
   }
 
-  CHECK(!roles.at(role).contains(frameworkId));
-  roles.at(role).insert(frameworkId);
+  roleTree.trackFramework(framework.frameworkId, role);
 
-  CHECK(!frameworkSorters.at(role)->contains(frameworkId.value()));
-  frameworkSorters.at(role)->add(frameworkId.value());
+  Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
+
+  CHECK_NOT_CONTAINS(*frameworkSorter, framework.frameworkId.value())
+    << " for role " << role;
+  frameworkSorter->add(framework.frameworkId.value());
 }
 
 
-void HierarchicalAllocatorProcess::untrackFrameworkUnderRole(
-    const FrameworkID& frameworkId,
-    const string& role)
+bool HierarchicalAllocatorProcess::tryUntrackFrameworkUnderRole(
+    const Framework& framework, const string& role)
 {
   CHECK(initialized);
 
-  CHECK(roles.contains(role));
-  CHECK(roles.at(role).contains(frameworkId));
-  CHECK(frameworkSorters.contains(role));
-  CHECK(frameworkSorters.at(role)->contains(frameworkId.value()));
+  Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
+  CHECK_CONTAINS(*frameworkSorter, framework.frameworkId.value())
+    << " for role " << role;
 
-  roles.at(role).erase(frameworkId);
-  frameworkSorters.at(role)->remove(frameworkId.value());
+  if (!frameworkSorter->allocation(framework.frameworkId.value()).empty()) {
+    return false;
+  }
 
-  // If no more frameworks are subscribed to this role or have resources
-  // allocated to this role, cleanup associated state. This is not necessary
-  // for correctness (roles with no registered frameworks will not be offered
-  // any resources), but since many different role names might be used over
-  // time, we want to avoid leaking resources for no-longer-used role names.
-  // Note that we don't remove the role from `quotaRoleSorter` if it exists
-  // there, since roles with a quota set still influence allocation even if
-  // they don't have any registered frameworks.
+  roleTree.untrackFramework(framework.frameworkId, role);
 
-  if (roles.at(role).empty()) {
-    CHECK_EQ(frameworkSorters.at(role)->count(), 0u);
+  frameworkSorter->remove(framework.frameworkId.value());
 
-    roles.erase(role);
+  if (roleTree.get(role).isNone() ||
+      (*roleTree.get(role))->frameworks().empty()) {
+    CHECK_EQ(frameworkSorter->count(), 0u);
     roleSorter->remove(role);
-
     frameworkSorters.erase(role);
-
-    metrics.removeRole(role);
   }
-}
 
-
-void HierarchicalAllocatorProcess::trackReservations(
-    const hashmap<std::string, Resources>& reservations)
-{
-  foreachpair (const string& role,
-               const Resources& resources, reservations) {
-    // We remove the static reservation metadata here via `toUnreserved()`.
-    const Resources scalarQuantitesToTrack =
-        resources.createStrippedScalarQuantity().toUnreserved();
-
-    reservationScalarQuantities[role] += scalarQuantitesToTrack;
-  }
-}
-
-
-void HierarchicalAllocatorProcess::untrackReservations(
-    const hashmap<std::string, Resources>& reservations)
-{
-  foreachpair (const string& role,
-               const Resources& resources, reservations) {
-    CHECK(reservationScalarQuantities.contains(role));
-    Resources& currentReservationQuantity =
-        reservationScalarQuantities.at(role);
-
-    // We remove the static reservation metadata here via `toUnreserved()`.
-    const Resources scalarQuantitesToUntrack =
-        resources.createStrippedScalarQuantity().toUnreserved();
-    CHECK(currentReservationQuantity.contains(scalarQuantitesToUntrack));
-    currentReservationQuantity -= scalarQuantitesToUntrack;
-
-    if (currentReservationQuantity.empty()) {
-      reservationScalarQuantities.erase(role);
-    }
-  }
+  return true;
 }
 
 
@@ -2652,37 +2903,37 @@ bool HierarchicalAllocatorProcess::updateSlaveTotal(
     const SlaveID& slaveId,
     const Resources& total)
 {
-  CHECK(slaves.contains(slaveId));
+  Slave& slave = *CHECK_NOTNONE(getSlave(slaveId));
 
-  Slave& slave = slaves.at(slaveId);
-
-  const Resources oldTotal = slave.total;
+  const Resources oldTotal = slave.getTotal();
 
   if (oldTotal == total) {
     return false;
   }
 
-  slave.total = total;
+  slave.updateTotal(total);
 
-  hashmap<std::string, Resources> oldReservations = oldTotal.reservations();
-  hashmap<std::string, Resources> newReservations = total.reservations();
+  roleTree.untrackReservations(oldTotal.reserved());
+  roleTree.trackReservations(total.reserved());
 
-  if (oldReservations != newReservations) {
-    untrackReservations(oldReservations);
-    trackReservations(newReservations);
+  // Update the total in the allocator and totals in the sorters.
+  const ResourceQuantities oldAgentScalarQuantities =
+    ResourceQuantities::fromScalarResources(oldTotal.scalars());
+
+  const ResourceQuantities agentScalarQuantities =
+    ResourceQuantities::fromScalarResources(total.scalars());
+
+  CHECK_CONTAINS(totalScalarQuantities, oldAgentScalarQuantities);
+  totalScalarQuantities -= oldAgentScalarQuantities;
+  totalScalarQuantities += agentScalarQuantities;
+
+  roleSorter->removeSlave(slaveId);
+  roleSorter->addSlave(slaveId, agentScalarQuantities);
+
+  foreachvalue (const Owned<Sorter>& sorter, frameworkSorters) {
+    sorter->removeSlave(slaveId);
+    sorter->addSlave(slaveId, agentScalarQuantities);
   }
-
-  // Currently `roleSorter` and `quotaRoleSorter`, being the root-level
-  // sorters, maintain all of `slaves[slaveId].total` (or the `nonRevocable()`
-  // portion in the case of `quotaRoleSorter`) in their own totals (which
-  // don't get updated in the allocation runs or during recovery of allocated
-  // resources). So, we update them using the resources in `slave.total`.
-  roleSorter->remove(slaveId, oldTotal);
-  roleSorter->add(slaveId, total);
-
-  // See comment at `quotaRoleSorter` declaration regarding non-revocable.
-  quotaRoleSorter->remove(slaveId, oldTotal.nonRevocable());
-  quotaRoleSorter->add(slaveId, total.nonRevocable());
 
   return true;
 }
@@ -2707,18 +2958,74 @@ bool HierarchicalAllocatorProcess::isRemoteSlave(const Slave& slave) const
   // If the slave has a configured domain (and it has been allowed to
   // register with the master), the master must also have a configured
   // domain.
-  CHECK(domain.isSome());
+  CHECK(options.domain.isSome());
 
   // The master will not startup if configured with a domain but no
   // fault domain.
-  CHECK(domain->has_fault_domain());
+  CHECK(options.domain->has_fault_domain());
 
   const DomainInfo::FaultDomain::RegionInfo& masterRegion =
-    domain->fault_domain().region();
+    options.domain->fault_domain().region();
   const DomainInfo::FaultDomain::RegionInfo& slaveRegion =
     slave.info.domain().fault_domain().region();
 
   return masterRegion != slaveRegion;
+}
+
+
+bool HierarchicalAllocatorProcess::isCapableOfReceivingAgent(
+    const protobuf::framework::Capabilities& frameworkCapabilities,
+    const Slave& slave) const
+{
+  // Only offer resources from slaves that have GPUs to
+  // frameworks that are capable of receiving GPUs.
+  // See MESOS-5634.
+  if (options.filterGpuResources && !frameworkCapabilities.gpuResources &&
+      slave.hasGpu()) {
+    return false;
+  }
+
+  // If this framework is not region-aware, don't offer it
+  // resources on agents in remote regions.
+  if (!frameworkCapabilities.regionAware && isRemoteSlave(slave)) {
+    return false;
+  }
+
+  return true;
+}
+
+
+Resources HierarchicalAllocatorProcess::stripIncapableResources(
+    const Resources& resources,
+    const protobuf::framework::Capabilities& frameworkCapabilities) const
+{
+  return resources.filter([&](const Resource& resource) {
+    if (!frameworkCapabilities.sharedResources &&
+        Resources::isShared(resource)) {
+      return false;
+    }
+
+    if (!frameworkCapabilities.revocableResources &&
+        Resources::isRevocable(resource)) {
+      return false;
+    }
+
+    // When reservation refinements are present, old frameworks without the
+    // RESERVATION_REFINEMENT capability won't be able to understand the
+    // new format. While it's possible to translate the refined reservations
+    // into the old format by "hiding" the intermediate reservations in the
+    // "stack", this leads to ambiguity when processing RESERVE / UNRESERVE
+    // operations. This is due to the loss of information when we drop the
+    // intermediate reservations. Therefore, for now we simply filter out
+    // resources with refined reservations if the framework does not have
+    // the capability.
+    if (!frameworkCapabilities.reservationRefinement &&
+        Resources::hasRefinedReservations(resource)) {
+      return false;
+    }
+
+    return true;
+  });
 }
 
 
@@ -2727,8 +3034,8 @@ void HierarchicalAllocatorProcess::trackAllocatedResources(
     const FrameworkID& frameworkId,
     const Resources& allocated)
 {
-  CHECK(slaves.contains(slaveId));
-  CHECK(frameworks.contains(frameworkId));
+  CHECK_CONTAINS(slaves, slaveId);
+  CHECK_CONTAINS(frameworks, frameworkId);
 
   // TODO(bmahler): Calling allocations() is expensive since it has
   // to construct a map. Avoid this.
@@ -2739,22 +3046,21 @@ void HierarchicalAllocatorProcess::trackAllocatedResources(
     // or may not be subscribed to the role. Either way, we need to
     // track the framework under the role.
     if (!isFrameworkTrackedUnderRole(frameworkId, role)) {
-      trackFrameworkUnderRole(frameworkId, role);
+      trackFrameworkUnderRole(*CHECK_NOTNONE(getFramework(frameworkId)), role);
     }
 
-    CHECK(roleSorter->contains(role));
-    CHECK(frameworkSorters.contains(role));
-    CHECK(frameworkSorters.at(role)->contains(frameworkId.value()));
+    CHECK_CONTAINS(*roleSorter, role);
+
+    Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
+
+    CHECK_CONTAINS(*frameworkSorter, frameworkId.value())
+      << " for role " << role;
+
+    roleTree.trackOfferedOrAllocated(allocation);
 
     roleSorter->allocated(role, slaveId, allocation);
-    frameworkSorters.at(role)->add(slaveId, allocation);
-    frameworkSorters.at(role)->allocated(
+    frameworkSorter->allocated(
         frameworkId.value(), slaveId, allocation);
-
-    if (quotas.contains(role)) {
-      // See comment at `quotaRoleSorter` declaration regarding non-revocable.
-      quotaRoleSorter->allocated(role, slaveId, allocation.nonRevocable());
-    }
   }
 }
 
@@ -2770,29 +3076,34 @@ void HierarchicalAllocatorProcess::untrackAllocatedResources(
   // But currently, a slave is removed first via `removeSlave()`
   // and later a call to `recoverResources()` occurs to recover
   // the framework's resources.
-  CHECK(frameworks.contains(frameworkId));
+  Framework* framework = CHECK_NOTNONE(getFramework(frameworkId));
 
   // TODO(bmahler): Calling allocations() is expensive since it has
   // to construct a map. Avoid this.
   foreachpair (const string& role,
                const Resources& allocation,
                allocated.allocations()) {
-    CHECK(roleSorter->contains(role));
-    CHECK(frameworkSorters.contains(role));
-    CHECK(frameworkSorters.at(role)->contains(frameworkId.value()));
+    CHECK_CONTAINS(*roleSorter, role);
 
-    frameworkSorters.at(role)->unallocated(
-        frameworkId.value(), slaveId, allocation);
-    frameworkSorters.at(role)->remove(slaveId, allocation);
+    Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
+
+    CHECK_CONTAINS(*frameworkSorter, frameworkId.value())
+      << "for role " << role;
+
+    roleTree.untrackOfferedOrAllocated(allocation);
+
+    frameworkSorter->unallocated(frameworkId.value(), slaveId, allocation);
 
     roleSorter->unallocated(role, slaveId, allocation);
 
-    if (quotas.contains(role)) {
-      // See comment at `quotaRoleSorter` declaration regarding non-revocable.
-      quotaRoleSorter->unallocated(role, slaveId, allocation.nonRevocable());
+    // If the framework is no longer subscribed to the role, we can try to
+    // untrack the framework under the role.
+    if (framework->roles.count(role) == 0) {
+      tryUntrackFrameworkUnderRole(*framework, role);
     }
   }
 }
+
 
 } // namespace internal {
 } // namespace allocator {

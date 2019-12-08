@@ -18,11 +18,12 @@
 The task plugin.
 """
 
-import cli.http as http
-
 from cli.exceptions import CLIException
+from cli.mesos import get_tasks
 from cli.plugins import PluginBase
 from cli.util import Table
+
+from cli.mesos import TaskIO
 
 PLUGIN_NAME = "task"
 PLUGIN_CLASS = "Task"
@@ -38,13 +39,65 @@ class Task(PluginBase):
     """
 
     COMMANDS = {
+        "attach": {
+            "arguments": ['<task-id>'],
+            "flags": {
+                "--no-stdin": "do not attach a stdin [default: False]"
+            },
+            "short_help": "Attach the CLI to the stdio of a running task",
+            "long_help": """
+                Attach the CLI to the stdio of a running task
+                To detach type the sequence CTRL-p CTRL-q."""
+        },
+        "exec": {
+            "arguments": ['<task-id>', '<command>', '[<args>...]'],
+            "flags": {
+                "-i --interactive" : "interactive [default: False]",
+                "-t --tty": "tty [default: False]"
+            },
+            "short_help": "Execute commands in a task's container",
+            "long_help": "Execute commands in a task's container"
+        },
         "list": {
             "arguments": [],
-            "flags": {},
-            "short_help": "List all active tasks in a Mesos cluster",
-            "long_help": "List all active tasks in a Mesos cluster"
+            "flags": {
+                "-a --all": "list all tasks, not only running [default: False]"
+            },
+            "short_help": "List all running tasks in a Mesos cluster",
+            "long_help": "List all running tasks in a Mesos cluster"
         }
     }
+
+    def attach(self, argv):
+        """
+        Attach the stdin/stdout/stderr of the CLI to the
+        STDIN/STDOUT/STDERR of a running task.
+        """
+        try:
+            master = self.config.master()
+        except Exception as exception:
+            raise CLIException("Unable to get leading master address: {error}"
+                               .format(error=exception))
+
+        task_io = TaskIO(master, argv["<task-id>"])
+        return task_io.attach(argv["--no-stdin"])
+
+
+    def exec(self, argv):
+        """
+        Launch a process inside a task's container.
+        """
+        try:
+            master = self.config.master()
+        except Exception as exception:
+            raise CLIException("Unable to get leading master address: {error}"
+                               .format(error=exception))
+
+        task_io = TaskIO(master, argv["<task-id>"])
+        return task_io.exec(argv["<command>"],
+                            argv["<args>"],
+                            argv["--interactive"],
+                            argv["--tty"])
 
     def list(self, argv):
         """
@@ -58,24 +111,32 @@ class Task(PluginBase):
                                .format(error=exception))
 
         try:
-            tasks = http.get_json(master, "tasks")["tasks"]
+            tasks = get_tasks(master)
         except Exception as exception:
-            raise CLIException("Could not open '/tasks'"
-                               " endpoint at '{addr}': {error}"
-                               .format(addr=master, error=exception))
+            raise CLIException("Unable to get tasks from leading"
+                               " master '{master}': {error}"
+                               .format(master=master, error=exception))
 
-        if len(tasks) == 0:
-            print "There are no tasks running in the cluster."
+        if not tasks:
+            print("There are no tasks running in the cluster.")
             return
 
         try:
-            table = Table(["Task ID", "Framework ID", "Executor ID"])
+            table = Table(["ID", "State", "Framework ID", "Executor ID"])
             for task in tasks:
+                task_state = "UNKNOWN"
+                if task["statuses"]:
+                    task_state = task["statuses"][-1]["state"]
+
+                if not argv["--all"] and task_state != "TASK_RUNNING":
+                    continue
+
                 table.add_row([task["id"],
+                               task_state,
                                task["framework_id"],
                                task["executor_id"]])
         except Exception as exception:
             raise CLIException("Unable to build table of tasks: {error}"
                                .format(error=exception))
 
-        print str(table)
+        print(str(table))

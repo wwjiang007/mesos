@@ -20,6 +20,7 @@
 #include <process/owned.hpp>
 #include <process/subprocess.hpp>
 
+#include <stout/archiver.hpp>
 #include <stout/json.hpp>
 #include <stout/net.hpp>
 #include <stout/option.hpp>
@@ -80,9 +81,18 @@ static Try<bool> extract(
       strings::endsWith(sourcePath, ".tbz2") ||
       strings::endsWith(sourcePath, ".tar.bz2") ||
       strings::endsWith(sourcePath, ".txz") ||
-      strings::endsWith(sourcePath, ".tar.xz")) {
-    command = {"tar", "-C", destinationDirectory, "-xf", sourcePath};
+      strings::endsWith(sourcePath, ".tar.xz") ||
+      strings::endsWith(sourcePath, ".zip")) {
+    Try<Nothing> result = archiver::extract(sourcePath, destinationDirectory);
+    if (result.isError()) {
+      return Error(
+          "Failed to extract archive '" + sourcePath +
+          "' to '" + destinationDirectory + "': " + result.error());
+    }
+    return true;
   } else if (strings::endsWith(sourcePath, ".gz")) {
+    // Unfortunately, libarchive can't extract bare files, so leave this to
+    // the 'gunzip' program, if it exists.
     string pathWithoutExtension = sourcePath.substr(0, sourcePath.length() - 3);
     string filename = Path(pathWithoutExtension).basename();
     string destinationPath = path::join(destinationDirectory, filename);
@@ -90,20 +100,6 @@ static Try<bool> extract(
     command = {"gunzip", "-d", "-c"};
     in = Subprocess::PATH(sourcePath);
     out = Subprocess::PATH(destinationPath);
-  } else if (strings::endsWith(sourcePath, ".zip")) {
-#ifdef __WINDOWS__
-    command = {"powershell",
-               "-NoProfile",
-               "-Command",
-               "Expand-Archive",
-               "-Force",
-               "-Path",
-               sourcePath,
-               "-DestinationPath",
-               destinationDirectory};
-#else
-    command = {"unzip", "-o", "-d", destinationDirectory, sourcePath};
-#endif // __WINDOWS__
   } else {
     return false;
   }
@@ -226,8 +222,6 @@ static Try<string> download(
   // Trim leading whitespace for 'sourceUri'.
   const string sourceUri = strings::trim(_sourceUri, strings::PREFIX);
 
-  LOG(INFO) << "Fetching URI '" << sourceUri << "'";
-
   Try<Nothing> validation = Fetcher::validateUri(sourceUri);
   if (validation.isError()) {
     return Error(validation.error());
@@ -293,7 +287,8 @@ static Try<string> fetchBypassingCache(
     const Option<string>& frameworksHome,
     const Option<Duration>& stallTimeout)
 {
-  LOG(INFO) << "Fetching directly into the sandbox directory";
+  LOG(INFO) << "Fetching '" << uri.value()
+            << "' directly into the sandbox directory";
 
   // TODO(mrbrowning): Factor out duplicated processing of "output_file" field
   // here and in fetchFromCache into a separate helper function.
@@ -305,7 +300,8 @@ static Try<string> fetchBypassingCache(
 
       if (result.isError()) {
         return Error(
-            "Unable to create subdirectory " + dirname + " in sandbox");
+            "Unable to create subdirectory " + dirname +
+            " in sandbox: " + result.error());
       }
     }
   }
@@ -350,7 +346,7 @@ static Try<string> fetchFromCache(
     const string& cacheDirectory,
     const string& sandboxDirectory)
 {
-  LOG(INFO) << "Fetching from cache";
+  LOG(INFO) << "Fetching URI '" << item.uri().value() << "' from cache";
 
   if (item.uri().has_output_file()) {
     string dirname = Path(item.uri().output_file()).dirname();
@@ -360,7 +356,8 @@ static Try<string> fetchFromCache(
 
       if (result.isError()) {
         return Error(
-          "Unable to create subdirectory " + dirname + "in sandbox");
+          "Unable to create subdirectory " + dirname +
+          " in sandbox: " + result.error());
       }
     }
   }
@@ -430,16 +427,19 @@ static Try<string> fetchThroughCache(
     << "Fetcher cache directory was expected to exist but was not found";
 
   if (item.action() == FetcherInfo::Item::DOWNLOAD_AND_CACHE) {
-    LOG(INFO) << "Downloading into cache";
+    const string cachePath =
+      path::join(cacheDirectory.get(), item.cache_filename());
 
-    Try<string> downloaded = download(
-        item.uri().value(),
-        path::join(cacheDirectory.get(), item.cache_filename()),
-        frameworksHome,
-        stallTimeout);
+    if (!os::exists(cachePath)) {
+      Try<string> downloaded = download(
+          item.uri().value(),
+          cachePath,
+          frameworksHome,
+          stallTimeout);
 
-    if (downloaded.isError()) {
-      return Error(downloaded.error());
+      if (downloaded.isError()) {
+        return Error(downloaded.error());
+      }
     }
   }
 

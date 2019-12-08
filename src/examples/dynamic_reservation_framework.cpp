@@ -79,25 +79,25 @@ public:
     taskResources = taskResources.pushReservation(reservationInfo);
   }
 
-  virtual ~DynamicReservationScheduler() {}
+  ~DynamicReservationScheduler() override {}
 
-  virtual void registered(SchedulerDriver*,
+  void registered(SchedulerDriver*,
                           const FrameworkID&,
-                          const MasterInfo&)
+                          const MasterInfo&) override
   {
     LOG(INFO) << "Registered!";
   }
 
-  virtual void reregistered(SchedulerDriver*, const MasterInfo& masterInfo) {}
+  void reregistered(SchedulerDriver*, const MasterInfo& masterInfo) override {}
 
-  virtual void disconnected(SchedulerDriver* driver) {}
+  void disconnected(SchedulerDriver* driver) override {}
 
-  virtual void resourceOffers(SchedulerDriver* driver,
-                              const vector<Offer>& offers)
+  void resourceOffers(SchedulerDriver* driver,
+                              const vector<Offer>& offers) override
   {
     foreach (const Offer& offer, offers) {
-      LOG(INFO) << "Received offer " << offer.id() << " with "
-                << offer.resources();
+      LOG(INFO) << "Received offer " << offer.id() << " from agent "
+                << offer.slave_id() << " with " << offer.resources();
 
       // If the framework got this offer for the first time, the state is
       // `State::INIT`; framework will reserve it (sending RESERVE operation
@@ -115,7 +115,7 @@ public:
       const State state = states[offer.slave_id()];
 
       Filters filters;
-      filters.set_refuse_seconds(0);
+      filters.set_refuse_seconds(Weeks(2).secs());
 
       switch (state) {
         case State::INIT: {
@@ -150,7 +150,9 @@ public:
           Resources resources = offer.resources();
           Resources reserved = resources.reserved(role);
 
-          CHECK(reserved.contains(taskResources));
+          CHECK(reserved.contains(taskResources))
+            << "Reserved " << reserved << " does not contain taskResources "
+            << taskResources << " states " << stringify(states);
 
           // If all tasks were launched, unreserve those resources.
           if (tasksLaunched == totalTasks) {
@@ -211,10 +213,10 @@ public:
     }
   }
 
-  virtual void offerRescinded(SchedulerDriver* driver,
-                              const OfferID& offerId) {}
+  void offerRescinded(SchedulerDriver* driver,
+                              const OfferID& offerId) override {}
 
-  virtual void statusUpdate(SchedulerDriver* driver, const TaskStatus& status)
+  void statusUpdate(SchedulerDriver* driver, const TaskStatus& status) override
   {
     const string& taskId = status.task_id().value();
 
@@ -245,19 +247,19 @@ public:
     }
   }
 
-  virtual void frameworkMessage(SchedulerDriver* driver,
+  void frameworkMessage(SchedulerDriver* driver,
                                 const ExecutorID& executorId,
                                 const SlaveID& slaveId,
-                                const string& data) {}
+                                const string& data) override {}
 
-  virtual void slaveLost(SchedulerDriver* driver, const SlaveID& slaveId) {}
+  void slaveLost(SchedulerDriver* driver, const SlaveID& slaveId) override {}
 
-  virtual void executorLost(SchedulerDriver* driver,
+  void executorLost(SchedulerDriver* driver,
                             const ExecutorID& executorId,
                             const SlaveID& slaveId,
-                            int status) {}
+                            int status) override {}
 
-  virtual void error(SchedulerDriver* driver, const string& message)
+  void error(SchedulerDriver* driver, const string& message) override
   {
     LOG(ERROR) << message;
   }

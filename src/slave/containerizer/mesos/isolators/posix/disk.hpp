@@ -24,6 +24,7 @@
 #include <stout/bytes.hpp>
 #include <stout/duration.hpp>
 #include <stout/hashmap.hpp>
+#include <stout/hashset.hpp>
 
 #include "slave/flags.hpp"
 
@@ -75,35 +76,35 @@ class PosixDiskIsolatorProcess : public MesosIsolatorProcess
 public:
   static Try<mesos::slave::Isolator*> create(const Flags& flags);
 
-  virtual ~PosixDiskIsolatorProcess();
+  ~PosixDiskIsolatorProcess() override;
 
-  virtual bool supportsNesting();
-  virtual bool supportsStandalone();
+  bool supportsNesting() override;
+  bool supportsStandalone() override;
 
-  virtual process::Future<Nothing> recover(
-      const std::list<mesos::slave::ContainerState>& states,
-      const hashset<ContainerID>& orphans);
+  process::Future<Nothing> recover(
+      const std::vector<mesos::slave::ContainerState>& states,
+      const hashset<ContainerID>& orphans) override;
 
-  virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
-      const mesos::slave::ContainerConfig& containerConfig);
+      const mesos::slave::ContainerConfig& containerConfig) override;
 
-  virtual process::Future<Nothing> isolate(
+  process::Future<Nothing> isolate(
       const ContainerID& containerId,
-      pid_t pid);
+      pid_t pid) override;
 
-  virtual process::Future<mesos::slave::ContainerLimitation> watch(
-      const ContainerID& containerId);
+  process::Future<mesos::slave::ContainerLimitation> watch(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<Nothing> update(
+  process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources);
+      const Resources& resources) override;
 
-  virtual process::Future<ResourceStatistics> usage(
-      const ContainerID& containerId);
+  process::Future<ResourceStatistics> usage(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<Nothing> cleanup(
-      const ContainerID& containerId);
+  process::Future<Nothing> cleanup(
+      const ContainerID& containerId) override;
 
 private:
   PosixDiskIsolatorProcess(const Flags& flags);
@@ -122,11 +123,17 @@ private:
 
   struct Info
   {
-    explicit Info(const std::string& _directory) : directory(_directory) {}
+    explicit Info(const std::string& _directory)
+      : directories({_directory}), sandbox(_directory) {}
 
-    // We save executor working directory here so that we know where
-    // to collect disk usage for disk resources without DiskInfo.
-    const std::string directory;
+    Bytes ephemeralUsage() const;
+
+    // Save the executor ephemeral storage (sandbox and rootfs)
+    // directories so that we know where to collect disk usage
+    // for disk resources without DiskInfo.
+    hashset<std::string> directories;
+
+    std::string sandbox;
 
     process::Promise<mesos::slave::ContainerLimitation> limitation;
 

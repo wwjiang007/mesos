@@ -1,4 +1,5 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -24,7 +25,7 @@ from collections import defaultdict
 import sys
 
 if len(sys.argv) < 2:
-    print "Usage: ./mesos-split.py <filename>..."
+    print("Usage: ./mesos-split.py <filename>...")
 
 BASE_PROJECT = "mesos"
 
@@ -46,7 +47,7 @@ def find_project(filename):
     # Find longest prefix match.
     found_path_len = 0
     found_project = BASE_PROJECT
-    for project, path in SUBPROJECTS.iteritems():
+    for project, path in SUBPROJECTS.items():
         if filename.startswith(path) and len(path) > found_path_len:
             found_path_len = len(path)
             found_project = project
@@ -57,19 +58,17 @@ def find_project(filename):
 def main():
     """
     Expects a list of filenames on the command line.
-
-    See `support/hooks/pre-commit` for the canonical usage of this method.
     """
     touched_projects = defaultdict(list)
     for filename in sys.argv[1:]:
         touched_projects[find_project(filename)].append(filename)
 
     if len(touched_projects) > 1:
-        print ERROR
-        for project in touched_projects.iterkeys():
-            print "%s:" % project
+        print(ERROR)
+        for project in touched_projects.keys():
+            print("%s:" % project)
             for filename in touched_projects[project]:
-                print "  %s" % filename
+                print("  %s" % filename)
         sys.exit(1)
 
     sys.exit(0)

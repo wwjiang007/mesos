@@ -28,6 +28,8 @@
 
 #include "slave/containerizer/mesos/containerizer.hpp"
 
+#include "slave/volume_gid_manager/volume_gid_manager.hpp"
+
 #ifdef __linux__
 #include "tests/containerizer/docker_archive.hpp"
 #endif
@@ -41,10 +43,23 @@ using process::Owned;
 using mesos::internal::slave::Containerizer;
 using mesos::internal::slave::Fetcher;
 using mesos::internal::slave::MesosContainerizer;
+using mesos::internal::slave::VolumeGidManager;
 
 using mesos::internal::slave::state::SlaveState;
 
 using mesos::slave::ContainerTermination;
+
+#ifdef __linux__
+namespace process {
+
+void reinitialize(
+    const Option<string>& delegate,
+    const Option<string>& readonlyAuthenticationRealm,
+    const Option<string>& readwriteAuthenticationRealm);
+
+} // namespace process {
+#endif // __linux__
+
 
 namespace mesos {
 namespace internal {
@@ -107,6 +122,59 @@ TEST_F(VolumeSandboxPathIsolatorTest, ROOT_SelfType)
   EXPECT_WEXITSTATUS_EQ(0, wait->get().status());
 
   EXPECT_SOME_EQ("abc\n", os::read(path::join(directory, "tmp", "file")));
+}
+
+
+// This test verifies that a container launched with a rootfs cannot
+// write to a read-only SANDBOX_PATH volume with SELF type.
+TEST_F(VolumeSandboxPathIsolatorTest, ROOT_SelfTypeReadOnly)
+{
+  string registry = path::join(sandbox.get(), "registry");
+  AWAIT_READY(DockerArchive::create(registry, "test_image"));
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "filesystem/linux,volume/sandbox_path,docker/runtime";
+  flags.docker_registry = registry;
+  flags.docker_store_dir = path::join(sandbox.get(), "store");
+  flags.image_providers = "docker";
+
+  Fetcher fetcher(flags);
+
+  Try<MesosContainerizer*> create =
+    MesosContainerizer::create(flags, true, &fetcher);
+
+  ASSERT_SOME(create);
+
+  Owned<MesosContainerizer> containerizer(create.get());
+
+  ContainerID containerId;
+  containerId.set_value(id::UUID::random().toString());
+
+  ExecutorInfo executor = createExecutorInfo(
+      "test_executor",
+      "echo abc > /tmp/file");
+
+  executor.mutable_container()->CopyFrom(createContainerInfo(
+      "test_image",
+      {createVolumeSandboxPath("/tmp", "tmp", Volume::RO)}));
+
+  string directory = path::join(flags.work_dir, "sandbox");
+  ASSERT_SOME(os::mkdir(directory));
+
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
+      containerId,
+      createContainerConfig(None(), executor, directory),
+      map<string, string>(),
+      None());
+
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
+
+  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+
+  AWAIT_READY(wait);
+  ASSERT_SOME(wait.get());
+  ASSERT_TRUE(wait->get().has_status());
+  EXPECT_WEXITSTATUS_NE(0, wait->get().status());
 }
 #endif // __linux__
 
@@ -203,14 +271,13 @@ TEST_F(VolumeSandboxPathIsolatorTest, SharedParentTypeVolume)
   ASSERT_TRUE(wait.get()->has_status());
   EXPECT_WEXITSTATUS_EQ(0, wait.get()->status());
 
-  wait = containerizer->wait(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
-  containerizer->destroy(containerId);
-
-  AWAIT_READY(wait);
-  ASSERT_SOME(wait.get());
-  ASSERT_TRUE(wait.get()->has_status());
-  EXPECT_WTERMSIG_EQ(SIGKILL, wait.get()->status());
+  AWAIT_READY(termination);
+  ASSERT_SOME(termination.get());
+  ASSERT_TRUE(termination.get()->has_status());
+  EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
 }
 
 
@@ -219,7 +286,8 @@ TEST_F(VolumeSandboxPathIsolatorTest, SharedParentTypeVolume)
 // simulate the scenario that the framework user is non-root while
 // the agent process is root, to make sure that non-root user can
 // still have the permission to write to the volume as expected.
-TEST_F(VolumeSandboxPathIsolatorTest, ROOT_SelfTypeOwnership)
+TEST_F(VolumeSandboxPathIsolatorTest,
+       ROOT_UNPRIVILEGED_USER_SelfTypeOwnership)
 {
   string registry = path::join(sandbox.get(), "registry");
   AWAIT_READY(DockerArchive::create(registry, "test_image"));
@@ -255,11 +323,14 @@ TEST_F(VolumeSandboxPathIsolatorTest, ROOT_SelfTypeOwnership)
 
   // Simulate the executor sandbox ownership as the user
   // from FrameworkInfo.
-  ASSERT_SOME(os::chown("nobody", directory));
+  Option<string> user = os::getenv("SUDO_USER");
+  ASSERT_SOME(user);
+
+  ASSERT_SOME(os::chown(user.get(), directory));
 
   Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      createContainerConfig(None(), executor, directory, "nobody"),
+      createContainerConfig(None(), executor, directory, user.get()),
       map<string, string>(),
       None());
 
@@ -281,7 +352,8 @@ TEST_F(VolumeSandboxPathIsolatorTest, ROOT_SelfTypeOwnership)
 // simulate the scenario that the framework user is non-root while
 // the agent process is root, to make sure that non-root user can
 // still have the permission to write to the volume as expected.
-TEST_F(VolumeSandboxPathIsolatorTest, ROOT_ParentTypeOwnership)
+TEST_F(VolumeSandboxPathIsolatorTest,
+       ROOT_UNPRIVILEGED_USER_ParentTypeOwnership)
 {
   slave::Flags flags = CreateSlaveFlags();
   flags.isolation = "volume/sandbox_path";
@@ -312,11 +384,14 @@ TEST_F(VolumeSandboxPathIsolatorTest, ROOT_ParentTypeOwnership)
 
   // Simulate the executor sandbox ownership as the user
   // from FrameworkInfo.
-  ASSERT_SOME(os::chown("nobody", directory.get()));
+  Option<string> user = os::getenv("SUDO_USER");
+  ASSERT_SOME(user);
+
+  ASSERT_SOME(os::chown(user.get(), directory.get()));
 
   Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      createContainerConfig(None(), executor, directory.get(), "nobody"),
+      createContainerConfig(None(), executor, directory.get(), user.get()),
       map<string, string>(),
       None());
 
@@ -346,7 +421,7 @@ TEST_F(VolumeSandboxPathIsolatorTest, ROOT_ParentTypeOwnership)
           createCommandInfo("echo 'hello' > parent/file"),
           containerInfo,
           None(),
-          "nobody"),
+          user.get()),
       map<string, string>(),
       None());
 
@@ -360,15 +435,160 @@ TEST_F(VolumeSandboxPathIsolatorTest, ROOT_ParentTypeOwnership)
   ASSERT_TRUE(wait.get()->has_status());
   EXPECT_WEXITSTATUS_EQ(0, wait.get()->status());
 
-  wait = containerizer->wait(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
-  containerizer->destroy(containerId);
+  AWAIT_READY(termination);
+  ASSERT_SOME(termination.get());
+  ASSERT_TRUE(termination.get()->has_status());
+  EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
+}
+
+
+#ifdef __linux__
+// This test verifies that a nested container launched with a
+// non-root user has the permission to write to a PARENT type
+// SANDBOX_PATH volume while its parent container (i.e., the
+// executor container) is launched with a different user (root).
+TEST_F(VolumeSandboxPathIsolatorTest,
+       ROOT_UNPRIVILEGED_USER_ParentTypeDifferentUser)
+{
+  // Reinitialize libprocess to ensure volume gid manager's metrics
+  // can be added in each iteration of this test (i.e., run this test
+  // repeatedly with the `--gtest_repeat` option).
+  process::reinitialize(None(), None(), None());
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "filesystem/linux,volume/sandbox_path";
+  flags.volume_gid_range = "[10000-20000]";
+
+  Fetcher fetcher(flags);
+
+  Try<VolumeGidManager*> volumeGidManager = VolumeGidManager::create(flags);
+  ASSERT_SOME(volumeGidManager);
+
+  Try<MesosContainerizer*> create = MesosContainerizer::create(
+      flags,
+      true,
+      &fetcher,
+      nullptr,
+      nullptr,
+      None(),
+      volumeGidManager.get());
+
+  ASSERT_SOME(create);
+
+  Owned<MesosContainerizer> containerizer(create.get());
+
+  SlaveState state;
+  state.id = SlaveID();
+
+  AWAIT_READY(containerizer->recover(state));
+
+  ContainerID containerId;
+  containerId.set_value(id::UUID::random().toString());
+
+  ExecutorInfo executor = createExecutorInfo("executor", "sleep 99", "cpus:1");
+
+  Try<string> directory = environment->mkdtemp();
+  ASSERT_SOME(directory);
+
+  // By default this directory is created with the mode 0700,
+  // here we change it to 0711 to make sure the non-root user
+  // used to launch the nested container can enter it.
+  ASSERT_SOME(os::chmod(directory.get(), 0711));
+
+  // Launch the executor. Since this is a ROOT test, the agent will
+  // run as root, and by default executor will run as the same user
+  // as the agent, so it will run as root as well.
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
+      containerId,
+      createContainerConfig(None(), executor, directory.get()),
+      map<string, string>(),
+      None());
+
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
+
+  ContainerID nestedContainerId;
+  nestedContainerId.mutable_parent()->CopyFrom(containerId);
+  nestedContainerId.set_value(id::UUID::random().toString());
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::MESOS);
+
+  Volume* volume = containerInfo.add_volumes();
+  volume->set_mode(Volume::RW);
+  volume->set_container_path("parent");
+
+  Volume::Source* source = volume->mutable_source();
+  source->set_type(Volume::Source::SANDBOX_PATH);
+
+  Volume::Source::SandboxPath* sandboxPath = source->mutable_sandbox_path();
+  sandboxPath->set_type(Volume::Source::SandboxPath::PARENT);
+  sandboxPath->set_path("shared");
+
+  Option<string> user = os::getenv("SUDO_USER");
+  ASSERT_SOME(user);
+
+  // Launch the nested container with a non-root user.
+  launch = containerizer->launch(
+      nestedContainerId,
+      createContainerConfig(
+          createCommandInfo("echo 'hello' > parent/file"),
+          containerInfo,
+          None(),
+          user.get()),
+      map<string, string>(),
+      None());
+
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
+
+  Future<Option<ContainerTermination>> wait =
+    containerizer->wait(nestedContainerId);
 
   AWAIT_READY(wait);
   ASSERT_SOME(wait.get());
   ASSERT_TRUE(wait.get()->has_status());
-  EXPECT_WTERMSIG_EQ(SIGKILL, wait.get()->status());
+  EXPECT_WEXITSTATUS_EQ(0, wait.get()->status());
+
+  // One gid should have been allocated to the volume.
+  JSON::Object metrics = Metrics();
+  EXPECT_EQ(
+      metrics.at<JSON::Number>("volume_gid_manager/volume_gids_total")
+        ->as<int>() - 1,
+      metrics.at<JSON::Number>("volume_gid_manager/volume_gids_free")
+        ->as<int>());
+
+  string volumePath = path::join(directory.get(), "shared");
+
+  // The owner group of the volume should be changed to the gid allocated
+  // to it, i.e., the first gid in the agent flag `--volume_gid_range`.
+  struct stat s;
+  EXPECT_EQ(0, ::stat(volumePath.c_str(), &s));
+  EXPECT_EQ(10000u, s.st_gid);
+
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
+
+  AWAIT_READY(termination);
+  ASSERT_SOME(termination.get());
+  ASSERT_TRUE(termination.get()->has_status());
+  EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
+
+  // The gid allocated to the volume should have been deallocated.
+  metrics = Metrics();
+  EXPECT_EQ(
+      metrics.at<JSON::Number>("volume_gid_manager/volume_gids_total")
+        ->as<int>(),
+      metrics.at<JSON::Number>("volume_gid_manager/volume_gids_free")
+        ->as<int>());
+
+  // The owner group of the volume should be changed back to
+  // the original one, i.e., root.
+  EXPECT_EQ(0, ::stat(volumePath.c_str(), &s));
+  EXPECT_EQ(0u, s.st_gid);
 }
+#endif // __linux__
 
 } // namespace tests {
 } // namespace internal {

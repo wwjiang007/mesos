@@ -14,10 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "slave/containerizer/mesos/paths.hpp"
+
 #include "slave/containerizer/mesos/isolators/volume/secret.hpp"
 
-#include <list>
+#include <sys/mount.h>
+
 #include <string>
+#include <vector>
 
 #include <mesos/secret/resolver.hpp>
 
@@ -31,6 +35,7 @@
 #include <stout/strings.hpp>
 
 #include <stout/os/mkdir.hpp>
+#include <stout/os/rmdir.hpp>
 #include <stout/os/touch.hpp>
 #include <stout/os/write.hpp>
 
@@ -38,14 +43,22 @@
 #include "linux/ns.hpp"
 #endif // __linux__
 
+#include "common/protobuf_utils.hpp"
 #include "common/validation.hpp"
 
-using std::list;
 using std::string;
+using std::vector;
 
 using process::Failure;
 using process::Future;
 using process::Owned;
+
+using mesos::internal::protobuf::slave::containerMkdirOperation;
+using mesos::internal::protobuf::slave::containerMountOperation;
+using mesos::internal::protobuf::slave::containerRenameOperation;
+using mesos::internal::protobuf::slave::createContainerMount;
+
+using mesos::internal::slave::containerizer::paths::SECRET_DIRECTORY;
 
 using mesos::slave::ContainerClass;
 using mesos::slave::ContainerConfig;
@@ -53,12 +66,10 @@ using mesos::slave::ContainerLaunchInfo;
 using mesos::slave::ContainerState;
 using mesos::slave::Isolator;
 
+
 namespace mesos {
 namespace internal {
 namespace slave {
-
-constexpr char SECRET_DIR[] = ".secret";
-
 
 Try<Isolator*> VolumeSecretIsolatorProcess::create(
     const Flags& flags,
@@ -69,7 +80,8 @@ Try<Isolator*> VolumeSecretIsolatorProcess::create(
     return Error("Volume secret isolation requires filesystem/linux isolator.");
   }
 
-  const string hostSecretTmpDir = path::join(flags.runtime_dir, SECRET_DIR);
+  const string hostSecretTmpDir =
+    path::join(flags.runtime_dir, SECRET_DIRECTORY);
 
   Try<Nothing> mkdir = os::mkdir(hostSecretTmpDir);
   if (mkdir.isError()) {
@@ -119,33 +131,38 @@ Future<Option<ContainerLaunchInfo>> VolumeSecretIsolatorProcess::prepare(
     return None();
   }
 
+  const string containerDir = path::join(
+      flags.runtime_dir,
+      SECRET_DIRECTORY,
+      stringify(containerId));
+
+  Try<Nothing> mkdir = os::mkdir(containerDir);
+  if (mkdir.isError()) {
+    return Failure(
+        "Failed to create container directory at '" +
+        containerDir + "': " + mkdir.error());
+  }
+
   ContainerLaunchInfo launchInfo;
   launchInfo.add_clone_namespaces(CLONE_NEWNS);
 
   const string sandboxSecretRootDir =
     path::join(containerConfig.directory(),
-               SECRET_DIR + string("-") + stringify(id::UUID::random()));
+               SECRET_DIRECTORY + string("-") + stringify(id::UUID::random()));
 
   // TODO(Kapil): Add some UUID suffix to the secret-root dir to avoid conflicts
   // with user container_path.
-  Try<Nothing> mkdir = os::mkdir(sandboxSecretRootDir);
+  mkdir = os::mkdir(sandboxSecretRootDir);
   if (mkdir.isError()) {
     return Failure("Failed to create sandbox secret root directory at '" +
                    sandboxSecretRootDir + "': " + mkdir.error());
   }
 
   // Mount ramfs in the container.
-  CommandInfo* command = launchInfo.add_pre_exec_commands();
-  command->set_shell(false);
-  command->set_value("mount");
-  command->add_arguments("mount");
-  command->add_arguments("-n");
-  command->add_arguments("-t");
-  command->add_arguments("ramfs");
-  command->add_arguments("ramfs");
-  command->add_arguments(sandboxSecretRootDir);
+  *launchInfo.add_file_operations() = containerMountOperation(
+      createContainerMount("ramfs", sandboxSecretRootDir, "ramfs", 0));
 
-  list<Future<Nothing>> futures;
+  vector<Future<Nothing>> futures;
   foreach (const Volume& volume, containerInfo.volumes()) {
     if (!volume.has_source() ||
         !volume.source().has_type() ||
@@ -236,7 +253,7 @@ Future<Option<ContainerLaunchInfo>> VolumeSecretIsolatorProcess::prepare(
     }
 
     const string hostSecretPath =
-      path::join(flags.runtime_dir, SECRET_DIR, stringify(id::UUID::random()));
+      path::join(containerDir, stringify(id::UUID::random()));
 
     const string sandboxSecretPath =
       path::join(sandboxSecretRootDir,
@@ -250,31 +267,20 @@ Future<Option<ContainerLaunchInfo>> VolumeSecretIsolatorProcess::prepare(
     }
 
     // Create directory tree inside sandbox secret root dir.
-    command = launchInfo.add_pre_exec_commands();
-    command->set_shell(false);
-    command->set_value("mkdir");
-    command->add_arguments("mkdir");
-    command->add_arguments("-p");
-    command->add_arguments(Path(sandboxSecretPath).dirname());
+    *launchInfo.add_file_operations() = containerMkdirOperation(
+        Path(sandboxSecretPath).dirname(), true /* recursive */);
 
     // Move secret from hostSecretPath to sandboxSecretPath.
-    command = launchInfo.add_pre_exec_commands();
-    command->set_shell(false);
-    command->set_value("mv");
-    command->add_arguments("mv");
-    command->add_arguments("-f");
-    command->add_arguments(hostSecretPath);
-    command->add_arguments(sandboxSecretPath);
+    *launchInfo.add_file_operations() = containerRenameOperation(
+        hostSecretPath, sandboxSecretPath);
+
+    const unsigned long flags =
+      volume.mode() == Volume::RO ? (MS_BIND | MS_REC | MS_RDONLY)
+                                  : (MS_BIND | MS_REC);
 
     // Bind mount sandboxSecretPath to targetContainerPath
-    command = launchInfo.add_pre_exec_commands();
-    command->set_shell(false);
-    command->set_value("mount");
-    command->add_arguments("mount");
-    command->add_arguments("-n");
-    command->add_arguments("--rbind");
-    command->add_arguments(sandboxSecretPath);
-    command->add_arguments(targetContainerPath);
+    *launchInfo.add_file_operations() = containerMountOperation(
+        createContainerMount(sandboxSecretPath, targetContainerPath, flags));
 
     Future<Nothing> future = secretResolver->resolve(secret)
       .then([hostSecretPath](const Secret::Value& value) -> Future<Nothing> {
@@ -291,9 +297,33 @@ Future<Option<ContainerLaunchInfo>> VolumeSecretIsolatorProcess::prepare(
   }
 
   return collect(futures)
-    .then([launchInfo]() -> Future<Option<ContainerLaunchInfo>> {
+    .then([launchInfo, containerId](
+        const vector<Nothing>& results) -> Future<Option<ContainerLaunchInfo>> {
+      LOG(INFO) << results.size() << " secrets have been resolved for "
+                << "container " << containerId;
       return launchInfo;
     });
+}
+
+
+Future<Nothing> VolumeSecretIsolatorProcess::cleanup(
+    const ContainerID& containerId)
+{
+  const string containerDir = path::join(
+      flags.runtime_dir,
+      SECRET_DIRECTORY,
+      stringify(containerId));
+
+  if (os::exists(containerDir)) {
+    Try<Nothing> rmdir = os::rmdir(containerDir);
+    if (rmdir.isError()) {
+      return Failure(
+          "Failed to remove the container directory '" +
+          containerDir + "': " + rmdir.error());
+    }
+  }
+
+  return Nothing();
 }
 
 } // namespace slave {

@@ -230,12 +230,9 @@ TEST_F(RmdirTest, FailToRemoveNestedInvalidPath)
 #ifndef __WINDOWS__
 // This test verifies that `rmdir` can remove a directory with a
 // device file.
-// TODO(hausdorff): Port this test to Windows. It is not clear that `rdev` and
-// `mknod` will implement the functionality expressed in this test, and as the
-// need for these capabilities arise elsewhere in the codebase, we should
-// rethink abstractions we need here, and subsequently, what this test should
-// look like. This is `#ifdef`'d rather than `DISABLED_` because `rdev` doesn't
-// exist on Windows.
+//
+// NOTE: Enable this test if `os::rdev` and `os::mknod` are
+// implemented on Windows. 'os::rdev` calls `::lstat` and `::stat`.
 TEST_F(RmdirTest, RemoveDirectoryWithDeviceFile)
 {
 #ifdef __FreeBSD__
@@ -385,14 +382,13 @@ TEST_F(RmdirTest, RemoveDirectoryButPreserveRoot)
 }
 
 
-#ifdef __linux__
 // This test fixture verifies that `rmdir` behaves correctly
 // with option `continueOnError` and makes sure the undeletable
 // files from tests are cleaned up during teardown.
 class RmdirContinueOnErrorTest : public RmdirTest
 {
 public:
-  virtual void TearDown()
+  void TearDown() override
   {
     if (mountPoint.isSome()) {
       if (os::system("umount -f -l " + mountPoint.get()) != 0) {
@@ -459,4 +455,3 @@ TEST_F(RmdirContinueOnErrorTest, RemoveWithContinueOnError)
   EXPECT_TRUE(os::exists(mountPoint_));
   EXPECT_FALSE(os::exists(regularFile));
 }
-#endif // __linux__

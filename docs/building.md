@@ -11,12 +11,12 @@ There are different ways you can get Mesos:
 
 1\. Download the latest stable release from [Apache](http://mesos.apache.org/downloads/) (***Recommended***)
 
-    $ wget http://www.apache.org/dist/mesos/1.4.1/mesos-1.4.1.tar.gz
-    $ tar -zxf mesos-1.4.1.tar.gz
+    $ wget http://www.apache.org/dist/mesos/1.9.0/mesos-1.9.0.tar.gz
+    $ tar -zxf mesos-1.9.0.tar.gz
 
-2\. Clone the Mesos git [repository](https://git-wip-us.apache.org/repos/asf/mesos.git) (***Advanced Users Only***)
+2\. Clone the Mesos git [repository](https://gitbox.apache.org/repos/asf/mesos.git) (***Advanced Users Only***)
 
-    $ git clone https://git-wip-us.apache.org/repos/asf/mesos.git
+    $ git clone https://gitbox.apache.org/repos/asf/mesos.git
 
 *NOTE: If you have problems running the above commands, you may need to first run through the ***System Requirements*** section below to install the `wget`, `tar`, and `git` utilities for your system.*
 
@@ -72,6 +72,8 @@ Following are the instructions for stock Ubuntu 16.04. If you are using a differ
 
 Following are the instructions for Mac OS X El Capitan. When building Mesos with the Apple-provided toolchain, the Command Line Tools from XCode >= 8.0 are required; XCode 8 requires Mac OS X 10.11.5 or newer.
 
+    # Install Python 3: https://www.python.org/downloads/
+
     # Install Command Line Tools. The Command Line Tools from XCode >= 8.0 are required.
     $ xcode-select --install
 
@@ -82,7 +84,7 @@ Following are the instructions for Mac OS X El Capitan. When building Mesos with
     $ brew install Caskroom/cask/java
 
     # Install libraries.
-    $ brew install wget git autoconf automake libtool subversion maven
+    $ brew install wget git autoconf automake libtool subversion maven xz
 
     # Install Python dependencies.
     $ sudo easy_install pip
@@ -155,6 +157,8 @@ Following are the instructions for stock CentOS 6.6. If you are using a differen
     $ sudo yum groupinstall -y "Development Tools"
 
     # Install 'devtoolset-2-toolchain' which includes GCC 4.8.2 and related packages.
+    # Installing 'devtoolset-3' might be a better choice since `perf` might
+    # conflict with the version of `elfutils` included in devtoolset-2.
     $ sudo yum install -y devtoolset-2-toolchain
 
     # Install other Mesos dependencies.

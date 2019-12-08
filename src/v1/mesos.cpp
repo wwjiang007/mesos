@@ -79,9 +79,13 @@ bool operator==(const CommandInfo& left, const CommandInfo& right)
 
 bool operator==(const CommandInfo::URI& left, const CommandInfo::URI& right)
 {
+  // NOTE: We purposefully do not compare the value of the `cache` field
+  // because a URI downloaded from source or from the fetcher cache should
+  // be considered identical.
   return left.value() == right.value() &&
     left.executable() == right.executable() &&
-    left.extract() == right.extract();
+    left.extract() == right.extract() &&
+    left.output_file() == right.output_file();
 }
 
 
@@ -139,6 +143,12 @@ bool operator==(
     Resources(left.resources()) == Resources(right.resources()) &&
     left.has_container() == right.has_container() &&
     (!left.has_container() || left.container() == right.container());
+}
+
+
+bool operator==(const DrainInfo& left, const DrainInfo& right)
+{
+  return google::protobuf::util::MessageDifferencer::Equals(left, right);
 }
 
 
@@ -657,6 +667,36 @@ ostream& operator<<(ostream& stream, const TaskStatus& status)
   if (status.has_healthy()) {
     stream << " in health state "
            << (status.healthy() ? "healthy" : "unhealthy");
+  }
+
+  return stream;
+}
+
+
+ostream& operator<<(ostream& stream, const OperationStatus& status)
+{
+  stream << status.state();
+
+  if (status.has_uuid()) {
+    stream << " (Status UUID: "
+           << stringify(id::UUID::fromBytes(status.uuid().value()).get())
+           << ")";
+  }
+
+  if (status.has_message()) {
+    stream << " Message: '" << status.message() << "'";
+  }
+
+  if (status.has_operation_id()) {
+    stream << " for operation '" << status.operation_id() << "'";
+  }
+
+  if (status.has_agent_id()) {
+    stream << " on agent: " << status.agent_id() << "";
+  }
+
+  if (status.has_resource_provider_id()) {
+    stream << " on resource provider: " << status.resource_provider_id() << "";
   }
 
   return stream;

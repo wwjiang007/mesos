@@ -55,6 +55,7 @@ namespace paths {
 // File names.
 const char BOOT_ID_FILE[] = "boot_id";
 const char SLAVE_INFO_FILE[] = "slave.info";
+const char DRAIN_CONFIG_FILE[] = "drain.config";
 const char FRAMEWORK_PID_FILE[] = "framework.pid";
 const char FRAMEWORK_INFO_FILE[] = "framework.info";
 const char LIBPROCESS_PID_FILE[] = "libprocess.pid";
@@ -64,10 +65,13 @@ const char HTTP_MARKER_FILE[] = "http.marker";
 const char FORKED_PID_FILE[] = "forked.pid";
 const char TASK_INFO_FILE[] = "task.info";
 const char TASK_UPDATES_FILE[] = "task.updates";
+const char RESOURCE_STATE_FILE[] = "resources_and_operations.state";
+const char RESOURCE_STATE_TARGET_FILE[] = "resources_and_operations.target";
 const char RESOURCES_INFO_FILE[] = "resources.info";
 const char RESOURCES_TARGET_FILE[] = "resources.target";
 const char RESOURCE_PROVIDER_STATE_FILE[] = "resource_provider.state";
 const char OPERATION_UPDATES_FILE[] = "operation.updates";
+const char VOLUME_GIDS_FILE[] = "volume_gids";
 
 
 const char CONTAINERS_DIR[] = "containers";
@@ -556,11 +560,28 @@ Try<list<string>> getOperationPaths(
 }
 
 
+Try<list<string>> getSlaveOperationPaths(
+    const string& metaDir,
+    const SlaveID& slaveId)
+{
+  return getOperationPaths(getSlavePath(metaDir, slaveId));
+}
+
+
 string getOperationPath(
     const string& rootDir,
     const id::UUID& operationUuid)
 {
   return path::join(rootDir, OPERATIONS_DIR, operationUuid.toString());
+}
+
+
+string getSlaveOperationPath(
+    const string& metaDir,
+    const SlaveID& slaveId,
+    const id::UUID& operationUuid)
+{
+  return getOperationPath(getSlavePath(metaDir, slaveId), operationUuid);
 }
 
 
@@ -591,6 +612,15 @@ Try<id::UUID> parseOperationPath(
 }
 
 
+Try<id::UUID> parseSlaveOperationPath(
+    const string& metaDir,
+    const SlaveID& slaveId,
+    const string& dir)
+{
+  return parseOperationPath(getSlavePath(metaDir, slaveId), dir);
+}
+
+
 string getOperationUpdatesPath(
     const string& rootDir,
     const id::UUID& operationUuid)
@@ -598,6 +628,27 @@ string getOperationUpdatesPath(
   return path::join(
       getOperationPath(rootDir, operationUuid),
       OPERATION_UPDATES_FILE);
+}
+
+
+string getSlaveOperationUpdatesPath(
+    const string& metaDir,
+    const SlaveID& slaveId,
+    const id::UUID& operationUuid)
+{
+  return getOperationUpdatesPath(getSlavePath(metaDir, slaveId), operationUuid);
+}
+
+
+string getResourceStatePath(const string& rootDir)
+{
+  return path::join(rootDir, "resources", RESOURCE_STATE_FILE);
+}
+
+
+string getResourceStateTargetPath(const string& rootDir)
+{
+  return path::join(rootDir, "resources", RESOURCE_STATE_TARGET_FILE);
 }
 
 
@@ -612,6 +663,21 @@ string getResourcesTargetPath(
     const string& rootDir)
 {
   return path::join(rootDir, "resources", RESOURCES_TARGET_FILE);
+}
+
+
+string getDrainConfigPath(
+    const string& metaDir,
+    const SlaveID& slaveId)
+{
+  return path::join(getSlavePath(metaDir, slaveId), DRAIN_CONFIG_FILE);
+}
+
+
+Try<list<string>> getPersistentVolumePaths(
+    const std::string& workDir)
+{
+  return fs::list(path::join(workDir, "volumes", "roles", "*", "*"));
 }
 
 
@@ -722,7 +788,13 @@ string getPersistentVolumePath(
 }
 
 
-string createExecutorDirectory(
+string getVolumeGidsPath(const string& rootDir)
+{
+  return path::join(rootDir, "volume_gid_manager", VOLUME_GIDS_FILE);
+}
+
+
+Try<string> createExecutorDirectory(
     const string& rootDir,
     const SlaveID& slaveId,
     const FrameworkID& frameworkId,
@@ -749,9 +821,11 @@ string createExecutorDirectory(
   }
 
   Try<Nothing> mkdir = createSandboxDirectory(directory, user);
-
-  CHECK_SOME(mkdir)
-    << "Failed to create executor directory '" << directory << "'";
+  if (mkdir.isError()) {
+    return Error(
+        "Failed to create executor directory '" + directory + "': " +
+        mkdir.error());
+  }
 
   // Remove the previous "latest" symlink.
   const string latest =
@@ -764,10 +838,11 @@ string createExecutorDirectory(
 
   // Symlink the new executor directory to "latest".
   Try<Nothing> symlink = ::fs::symlink(directory, latest);
-
-  CHECK_SOME(symlink)
-    << "Failed to symlink directory '" << directory
-    << "' to '" << latest << "'";
+  if (symlink.isError()) {
+    return Error(
+        "Failed to symlink '" + directory + "' to '" + latest + "': " +
+        symlink.error());
+  }
 
   return directory;
 }
@@ -789,7 +864,7 @@ Try<Nothing> createSandboxDirectory(
   // Since this is a sandbox directory containing private task data,
   // we want to ensure that it is not accessible to "others".
   Try<Nothing> chmod = os::chmod(directory, 0750);
-  if (mkdir.isError()) {
+  if (chmod.isError()) {
     return Error("Failed to chmod directory: " + chmod.error());
   }
 

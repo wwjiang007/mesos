@@ -72,8 +72,10 @@ static constexpr char TEST_DIR_NAME[] = "test_dir";
 
 class DockerTest : public MesosTest
 {
-  virtual void SetUp()
+  void SetUp() override
   {
+    MesosTest::SetUp();
+
     Future<Nothing> pull = pullDockerImage(DOCKER_TEST_IMAGE);
 
     LOG_FIRST_N(WARNING, 1) << "Downloading " << string(DOCKER_TEST_IMAGE)
@@ -84,7 +86,7 @@ class DockerTest : public MesosTest
     AWAIT_READY_FOR(pull, Minutes(10));
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     Try<Owned<Docker>> docker = Docker::create(
         tests::flags.docker,
@@ -93,7 +95,7 @@ class DockerTest : public MesosTest
 
     ASSERT_SOME(docker);
 
-    Future<list<Docker::Container>> containers =
+    Future<vector<Docker::Container>> containers =
       docker.get()->ps(true, NAME_PREFIX);
 
     AWAIT_READY(containers);
@@ -102,6 +104,8 @@ class DockerTest : public MesosTest
     foreach (const Docker::Container& container, containers.get()) {
       AWAIT_READY_FOR(docker.get()->rm(container.id, true), Seconds(30));
     }
+
+    MesosTest::TearDown();
   }
 
 protected:
@@ -147,8 +151,10 @@ TEST_F(DockerTest, ROOT_DOCKER_interface)
       false).get();
 
   // Verify that we do not see the container.
-  Future<list<Docker::Container>> containers = docker->ps(true, containerName);
+  Future<vector<Docker::Container>> containers =
+    docker->ps(true, containerName);
   AWAIT_READY(containers);
+
   foreach (const Docker::Container& container, containers.get()) {
     EXPECT_NE("/" + containerName, container.name);
   }
@@ -165,7 +171,7 @@ TEST_F(DockerTest, ROOT_DOCKER_interface)
   containerInfo.mutable_docker()->CopyFrom(dockerInfo);
 
   CommandInfo commandInfo;
-  commandInfo.set_value(DOCKER_SLEEP_CMD(120));
+  commandInfo.set_value(SLEEP_COMMAND(120));
 
   Try<Docker::RunOptions> runOptions = Docker::RunOptions::create(
       containerInfo,
@@ -326,7 +332,7 @@ TEST_F(DockerTest, ROOT_DOCKER_kill)
   containerInfo.mutable_docker()->CopyFrom(dockerInfo);
 
   CommandInfo commandInfo;
-  commandInfo.set_value(DOCKER_SLEEP_CMD(120));
+  commandInfo.set_value(SLEEP_COMMAND(120));
 
   Try<Docker::RunOptions> runOptions = Docker::RunOptions::create(
       containerInfo,
@@ -359,7 +365,7 @@ TEST_F(DockerTest, ROOT_DOCKER_kill)
 
   // Now, the container should not appear in the result of ps().
   // But it should appear in the result of ps(true).
-  Future<list<Docker::Container>> containers = docker->ps();
+  Future<vector<Docker::Container>> containers = docker->ps();
   AWAIT_READY(containers);
 
   auto nameEq = [&containerName](const Docker::Container& container) {

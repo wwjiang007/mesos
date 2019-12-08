@@ -18,9 +18,10 @@
 Set of classes and helper functions for building unit tests for the Mesos CLI.
 """
 
+import io
 import os
+import pty
 import shutil
-import StringIO
 import subprocess
 import sys
 import tempfile
@@ -28,7 +29,11 @@ import unittest
 
 import parse
 
-import cli.http as http
+from tenacity import retry
+from tenacity import stop_after_delay
+from tenacity import wait_fixed
+
+from cli import http
 
 from cli.tests.constants import TEST_AGENT_IP
 from cli.tests.constants import TEST_AGENT_PORT
@@ -49,7 +54,7 @@ class CLITestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        print "\n{class_name}".format(class_name=cls.__name__)
+        print("\n{class_name}".format(class_name=cls.__name__))
 
     @staticmethod
     def default_mesos_build_dir():
@@ -68,17 +73,16 @@ class CLITestCase(unittest.TestCase):
 
         if os.path.isdir(build_dir):
             return build_dir
-        else:
-            raise CLIException("The Mesos build directory"
-                               " does not exist: {path}"
-                               .format(path=build_dir))
+        raise CLIException("The Mesos build directory"
+                           " does not exist: {path}"
+                           .format(path=build_dir))
 
 # This value is set to the correct path when running tests/main.py. We
 # set it here to make sure that CLITestCase has a MESOS_BUILD_DIR member.
 CLITestCase.MESOS_BUILD_DIR = ""
 
 
-class Executable(object):
+class Executable():
     """
     This class defines the base class for launching an executable for
     the CLI unit tests. It will be subclassed by (at least) a
@@ -92,7 +96,7 @@ class Executable(object):
         self.proc = None
 
     def __del__(self):
-        if hasattr(self, "proc"):
+        if hasattr(self, "proc") and self.proc is not None:
             self.kill()
 
     def launch(self):
@@ -103,9 +107,13 @@ class Executable(object):
             raise CLIException("{name} already launched"
                                .format(name=self.name.capitalize()))
 
+        if not os.path.exists(self.executable):
+            raise CLIException("{name} executable not found"
+                               .format(name=self.name.capitalize()))
+
         try:
             flags = ["--{key}={value}".format(key=key, value=value)
-                     for key, value in self.flags.iteritems()]
+                     for key, value in dict(self.flags).items()]
 
             if self.shell:
                 cmd = ["/bin/sh", self.executable] + flags
@@ -137,6 +145,8 @@ class Executable(object):
             return
 
         try:
+            self.proc.stdin.close()
+            self.proc.stdout.close()
             self.proc.kill()
             self.proc.wait()
             self.proc = None
@@ -158,8 +168,6 @@ class Master(Executable):
         if Master.count > 0:
             raise CLIException("Creating more than one master"
                                " is currently not possible")
-
-        Master.count += 1
 
         if flags is None:
             flags = {}
@@ -183,9 +191,24 @@ class Master(Executable):
     def __del__(self):
         super(Master, self).__del__()
 
-        if hasattr(self, "flags"):
+        if hasattr(self, "flags") and hasattr(self.flags, "work_dir"):
             shutil.rmtree(self.flags["work_dir"])
 
+    # pylint: disable=arguments-differ
+    def launch(self):
+        """
+        After starting the master, we need to make sure its
+        reference count is increased.
+        """
+        super(Master, self).launch()
+        Master.count += 1
+
+    def kill(self):
+        """
+        After killing the master, we need to make sure its
+        reference count is decreased.
+        """
+        super(Master, self).kill()
         Master.count -= 1
 
 
@@ -202,8 +225,6 @@ class Agent(Executable):
         if Agent.count > 0:
             raise CLIException("Creating more than one agent"
                                " is currently not possible")
-
-        Agent.count += 1
 
         if flags is None:
             flags = {}
@@ -236,19 +257,20 @@ class Agent(Executable):
     def __del__(self):
         super(Agent, self).__del__()
 
-        if hasattr(self, "flags"):
+        if hasattr(self, "flags") and hasattr(self.flags, "work_dir"):
             shutil.rmtree(self.flags["work_dir"])
+        if hasattr(self, "flags") and hasattr(self.flags, "runtime_dir"):
             shutil.rmtree(self.flags["runtime_dir"])
-
-        Agent.count -= 1
 
     # pylint: disable=arguments-differ
     def launch(self, timeout=TIMEOUT):
         """
-        After starting the agent, we need to make sure it has
+        After starting the agent, we first need to make sure its
+        reference count is increased and then check that it has
         successfully registered with the master before proceeding.
         """
         super(Agent, self).launch()
+        Agent.count += 1
 
         try:
             # pylint: disable=missing-docstring
@@ -260,7 +282,6 @@ class Agent(Executable):
             stdout = ""
             if self.proc.poll():
                 stdout = "\n{output}".format(output=self.proc.stdout.read())
-                self.proc = None
 
             raise CLIException("Could not get '/slaves' endpoint as JSON with"
                                " only 1 agent in it: {error}{stdout}"
@@ -274,19 +295,20 @@ class Agent(Executable):
         """
         super(Agent, self).kill()
 
-        if self.proc is None:
-            return
-
         try:
             # pylint: disable=missing-docstring
-            def no_slaves(data):
-                return len(data["slaves"]) == 0
+            def one_inactive_slave(data):
+                slaves = data["slaves"]
+                return len(slaves) == 1 and not slaves[0]["active"]
 
-            http.get_json(self.flags["master"], "slaves", no_slaves, timeout)
+            http.get_json(
+                self.flags["master"], "slaves", one_inactive_slave, timeout)
         except Exception as exception:
             raise CLIException("Could not get '/slaves' endpoint as"
                                " JSON with 0 agents in it: {error}"
                                .format(error=exception))
+
+        Agent.count -= 1
 
 
 class Task(Executable):
@@ -308,12 +330,11 @@ class Task(Executable):
                 port=TEST_MASTER_PORT)
         if "name" not in flags:
             flags["name"] = "task-{id}".format(id=Task.count)
-            Task.count += 1
         if "command" not in flags:
             raise CLIException("No command supplied when creating task")
 
         self.flags = flags
-        self.name = "task"
+        self.name = flags["name"]
         self.executable = os.path.join(
             CLITestCase.MESOS_BUILD_DIR,
             "src",
@@ -361,6 +382,7 @@ class Task(Executable):
         has actually been added to the agent before proceeding.
         """
         super(Task, self).launch()
+        Task.count += 1
 
         try:
             # pylint: disable=missing-docstring
@@ -389,9 +411,6 @@ class Task(Executable):
         """
         super(Task, self).kill()
 
-        if self.proc is None:
-            return
-
         try:
             # pylint: disable=missing-docstring
             def container_does_not_exist(data):
@@ -405,6 +424,8 @@ class Task(Executable):
                                .format(name=self.flags["name"],
                                        error=exception))
 
+        Task.count -= 1
+
 
 def capture_output(command, argv, extra_args=None):
     """
@@ -414,7 +435,7 @@ def capture_output(command, argv, extra_args=None):
         extra_args = {}
 
     stdout = sys.stdout
-    sys.stdout = StringIO.StringIO()
+    sys.stdout = io.StringIO()
 
     try:
         command(argv, **extra_args)
@@ -429,3 +450,73 @@ def capture_output(command, argv, extra_args=None):
     sys.stdout = stdout
 
     return output
+
+
+def exec_command(command, env=None, stdin=None, timeout=None):
+    """
+    Execute command.
+    """
+    process = subprocess.Popen(
+        command,
+        stdin=stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        universal_newlines=True)
+
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exception:
+        # The child process is not killed if the timeout expires, so in order
+        # to cleanup properly a well-behaved application should kill the child
+        # process and finish communication.
+        # https://docs.python.org/3.5/library/subprocess.html
+        process.kill()
+        stdout, stderr = process.communicate()
+        raise CLIException("Timeout expired: {error}".format(error=exception))
+
+    return (process.returncode, stdout, stderr)
+
+
+def popen_tty(cmd, shell=True):
+    """
+    Open a process with stdin connected to a pseudo-tty.
+
+    :param cmd: command to run
+    :type cmd: str
+    :returns: (Popen, master) tuple, where master is the master side
+       of the of the tty-pair.  It is the responsibility of the caller
+       to close the master fd, and to perform any cleanup (including
+       waiting for completion) of the Popen object.
+    :rtype: (Popen, int)
+    """
+    master, slave = pty.openpty()
+    # pylint: disable=subprocess-popen-preexec-fn
+    proc = subprocess.Popen(cmd,
+                            stdin=slave,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            preexec_fn=os.setsid,
+                            close_fds=True,
+                            shell=shell)
+    os.close(slave)
+
+    return (proc, master)
+
+
+def wait_for_task(master, name, state, delay=1):
+    """
+    Wait for a task with a certain name to be in a given state.
+    """
+    @retry(wait=wait_fixed(0.2), stop=stop_after_delay(delay))
+    def _wait_for_task():
+        tasks = http.get_json(master.addr, "tasks")["tasks"]
+        for task in tasks:
+            if task["name"] == name and task["state"] == state:
+                return task
+        raise Exception()
+
+    try:
+        return _wait_for_task()
+    except Exception:
+        raise CLIException("Timeout waiting for task expired")

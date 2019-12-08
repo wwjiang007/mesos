@@ -122,7 +122,9 @@ protected:
     os::unsetenv("LIBPROCESS_SSL_CERT_FILE");
     os::unsetenv("LIBPROCESS_SSL_KEY_FILE");
     os::unsetenv("LIBPROCESS_SSL_VERIFY_CERT");
+    os::unsetenv("LIBPROCESS_SSL_VERIFY_SERVER_CERT");
     os::unsetenv("LIBPROCESS_SSL_REQUIRE_CERT");
+    os::unsetenv("LIBPROCESS_SSL_REQUIRE_CLIENT_CERT");
     os::unsetenv("LIBPROCESS_SSL_VERIFY_DEPTH");
     os::unsetenv("LIBPROCESS_SSL_CA_DIR");
     os::unsetenv("LIBPROCESS_SSL_CA_FILE");
@@ -131,6 +133,7 @@ protected:
     os::unsetenv("LIBPROCESS_SSL_ENABLE_TLS_V1_0");
     os::unsetenv("LIBPROCESS_SSL_ENABLE_TLS_V1_1");
     os::unsetenv("LIBPROCESS_SSL_ENABLE_TLS_V1_2");
+    os::unsetenv("LIBPROCESS_SSL_ENABLE_TLS_V1_3");
 
     // Copy the given map into the clean slate.
     foreachpair (
@@ -269,13 +272,12 @@ protected:
  * SSLTest::launch_client that factor out common behavior used in
  * tests.
  */
-class SSLTest : public SSLTemporaryDirectoryTest,
-                public ::testing::WithParamInterface<const char*>
+class SSLTest : public SSLTemporaryDirectoryTest
 {
 protected:
   SSLTest() : data("Hello World!") {}
 
-  virtual void SetUp()
+  void SetUp() override
   {
     SSLTemporaryDirectoryTest::SetUp();
     generate_keys_and_certs();
@@ -333,26 +335,30 @@ protected:
    *     SSL client subprocess with.
    * @param use_ssl_socket Whether the SSL client will try to connect
    *     using an SSL socket or a POLL socket.
+   * @param hostname The hostname to use for TLS certificate validation.
+   *     It is passed separately because some tests want to provide the
+   *     "wrong" hostname to test error conditions.
    *
    * @return Subprocess if successful otherwise an Error.
    */
   Try<process::Subprocess> launch_client(
       const std::map<std::string, std::string>& environment,
-      const process::network::inet::Socket& server,
+      const Option<std::string>& hostname,
+      const net::IP& ip,
+      uint16_t port,
       bool use_ssl_socket)
   {
-    const Try<process::network::inet::Address> address = server.address();
-    if (address.isError()) {
-      return Error(address.error());
-    }
-
     // Set up arguments to be passed to the 'client-ssl' binary.
-    const std::vector<std::string> argv = {
+    std::vector<std::string> argv = {
       "ssl-client",
       "--use_ssl=" + stringify(use_ssl_socket),
-      "--server=" + stringify(address->ip),
-      "--port=" + stringify(address->port),
+      "--server=" + stringify(ip),
+      "--port=" + stringify(port),
       "--data=" + data};
+
+    if (hostname.isSome()) {
+      argv.push_back("--server_hostname=" + hostname.get());
+    }
 
     Result<std::string> path = os::realpath(BUILD_DIR);
     if (!path.isSome()) {
@@ -373,6 +379,37 @@ protected:
         process::Subprocess::FD(STDERR_FILENO),
         nullptr,
         full_environment);
+  }
+
+  /**
+   * Launches a test SSL client as a subprocess connecting to the
+   * server. This is a convenience overload for `launch_client()`
+   * that uses the IP address from the passed Socket as the server
+   * hostname.
+   *
+   * @param environment The SSL environment variables to launch the
+   *     SSL client subprocess with.
+   * @param use_ssl_socket Whether the SSL client will try to connect
+   *     using an SSL socket or a POLL socket.
+   *
+   * @return Subprocess if successful otherwise an Error.
+   */
+  Try<process::Subprocess> launch_client(
+      const std::map<std::string, std::string>& environment,
+      const process::network::inet::Socket& server,
+      bool use_ssl_socket)
+  {
+      const Try<process::network::inet::Address> address = server.address();
+      if (address.isError()) {
+        return Error(address.error());
+      }
+
+      return launch_client(
+          environment,
+          None(),
+          address->ip,
+          address->port,
+          use_ssl_socket);
   }
 
   static constexpr size_t BACKLOG = 5;

@@ -73,6 +73,7 @@
 #include <process/id.hpp>
 #include <process/io.hpp>
 #include <process/logging.hpp>
+#include <process/loop.hpp>
 #include <process/mime.hpp>
 #include <process/owned.hpp>
 #include <process/process.hpp>
@@ -148,6 +149,10 @@ using process::network::inet::Address;
 using process::network::inet::Socket;
 
 using process::network::internal::SocketImpl;
+
+#ifdef USE_SSL_SOCKET
+using process::network::openssl::create_tls_client_config;
+#endif
 
 using std::deque;
 using std::find;
@@ -327,7 +332,7 @@ private:
         handler(_handler) {}
 
   protected:
-    virtual void initialize()
+    void initialize() override
     {
       route("/", help, &RouteProcess::handle);
     }
@@ -368,13 +373,15 @@ public:
       const Socket& socket,
       Request* request);
 
+  // Returns whether the event was delivered to the destination's
+  // queue. This function takes ownership over `event` and will
+  // delete it if it was not delivered.
   bool deliver(
-      ProcessBase* receiver,
+      ProcessBase* destination,
       Event* event,
       ProcessBase* sender = nullptr);
-
   bool deliver(
-      const UPID& to,
+      const UPID& destination,
       Event* event,
       ProcessBase* sender = nullptr);
 
@@ -402,7 +409,7 @@ public:
   void settle();
 
   // The /__processes__ route.
-  Future<Response> __processes__(const Request&);
+  Future<Response> __processes__(const Request& request);
 
   void install(Filter* f)
   {
@@ -423,6 +430,8 @@ public:
   }
 
 private:
+  bool _deliver(ProcessBase* destination, Event* event, ProcessBase* sender);
+
   // Delegate process name to receive root HTTP requests.
   const Option<string> delegate;
 
@@ -789,63 +798,61 @@ static Future<MessageEvent*> parse(const Request& request)
 
 namespace internal {
 
-void decode_recv(
-    const Future<size_t>& length,
-    char* data,
-    size_t size,
-    Socket socket,
-    StreamingRequestDecoder* decoder)
+void receive(Socket socket)
 {
-  if (length.isDiscarded() || length.isFailed()) {
-    if (length.isFailed()) {
-      VLOG(1) << "Decode failure: " << length.failure();
+  StreamingRequestDecoder* decoder = new StreamingRequestDecoder();
+
+  const size_t size = 80 * 1024;
+  char* data = new char[size];
+
+  Future<Nothing> recv_loop = process::loop(
+      None(),
+      [=] {
+        return socket.recv(data, size);
+      },
+      [=](size_t length) -> Future<ControlFlow<Nothing>> {
+        if (length == 0) {
+          return Break(); // EOF.
+        }
+
+        // Decode as much of the data as possible into HTTP requests.
+        const deque<Request*> requests = decoder->decode(data, length);
+
+        if (requests.empty() && decoder->failed()) {
+          return Failure("Decoder error");
+        }
+
+        if (!requests.empty()) {
+          // Get the peer address to augment the requests.
+          Try<Address> address = socket.peer();
+
+          if (address.isError()) {
+            return Failure("Failed to get peer address: " + address.error());
+          }
+
+          foreach (Request* request, requests) {
+            request->client = address.get();
+            process_manager->handle(socket, request);
+          }
+        }
+
+        return Continue();
+      });
+
+  recv_loop.onAny([=](const Future<Nothing> f) {
+    if (f.isFailed()) {
+      Try<Address> peer = socket.peer();
+
+      LOG(WARNING)
+        << "Failed to recv on socket " << socket.get() << " to peer '"
+        << (peer.isSome() ? stringify(peer.get()) : "unknown")
+        << "': " << f.failure();
     }
 
     socket_manager->close(socket);
     delete[] data;
     delete decoder;
-    return;
-  }
-
-  if (length.get() == 0) {
-    socket_manager->close(socket);
-    delete[] data;
-    delete decoder;
-    return;
-  }
-
-  // Decode as much of the data as possible into HTTP requests.
-  const deque<Request*> requests = decoder->decode(data, length.get());
-
-  if (requests.empty() && decoder->failed()) {
-     VLOG(1) << "Decoder error while receiving";
-     socket_manager->close(socket);
-     delete[] data;
-     delete decoder;
-     return;
-  }
-
-  if (!requests.empty()) {
-    // Get the peer address to augment the requests.
-    Try<Address> address = socket.peer();
-
-    if (address.isError()) {
-      VLOG(1) << "Failed to get peer address while receiving: "
-              << address.error();
-      socket_manager->close(socket);
-      delete[] data;
-      delete decoder;
-      return;
-    }
-
-    foreach (Request* request, requests) {
-      request->client = address.get();
-      process_manager->handle(socket, request);
-    }
-  }
-
-  socket.recv(data, size)
-    .onAny(lambda::bind(&decode_recv, lambda::_1, data, size, socket, decoder));
+  });
 }
 
 } // namespace internal {
@@ -908,19 +915,8 @@ void on_accept(const Future<Socket>& socket)
     // Inform the socket manager for proper bookkeeping.
     socket_manager->accepted(socket.get());
 
-    const size_t size = 80 * 1024;
-    char* data = new char[size];
-
-    StreamingRequestDecoder* decoder = new StreamingRequestDecoder();
-
-    socket->recv(data, size)
-      .onAny(lambda::bind(
-          &internal::decode_recv,
-          lambda::_1,
-          data,
-          size,
-          socket.get(),
-          decoder));
+    // Start the receive loop for the socket.
+    receive(socket.get());
   }
 
   // NOTE: `__s__` may be cleaned up during `process::finalize`.
@@ -1428,13 +1424,16 @@ void ignore_recv_data(
     char* data,
     size_t size)
 {
-  if (length.isDiscarded() || length.isFailed()) {
-    socket_manager->close(socket);
-    delete[] data;
-    return;
-  }
+  if (!length.isReady() || length.get() == 0) {
+    if (length.isFailed()) {
+      Try<Address> peer = socket.peer();
 
-  if (length.get() == 0) {
+      LOG(WARNING)
+        << "Failed to recv on socket " << socket.get() << " to peer '"
+        << (peer.isSome() ? stringify(peer.get()) : "unknown")
+        << "': " << length.failure();
+    }
+
     socket_manager->close(socket);
     delete[] data;
     return;
@@ -1448,6 +1447,25 @@ void ignore_recv_data(
 // Forward declaration.
 void send(Encoder* encoder, Socket socket);
 
+// A helper to securely select the correct overload of `connect()`
+// for a generic socket.
+Future<Nothing> connectSocket(
+    Socket& socket,
+    const Address& address,
+    const Option<string>& servername)
+{
+  switch (socket.kind()) {
+    case SocketImpl::Kind::POLL:
+      return socket.connect(address);
+#ifdef USE_SSL_SOCKET
+    case SocketImpl::Kind::SSL:
+      return socket.connect(
+          address, create_tls_client_config(servername));
+#endif
+  }
+
+  UNREACHABLE();
+}
 
 } // namespace internal {
 
@@ -1600,7 +1618,7 @@ void SocketManager::link(
           // for the linkee. At this point, we have not passed ownership of
           // this socket to the `SocketManager`, so there is only one possible
           // linkee to notify.
-          process->enqueue(new ExitedEvent(to));
+          process_manager->deliver(process, new ExitedEvent(to));
           return;
         }
         socket = create.get();
@@ -1633,7 +1651,7 @@ void SocketManager::link(
           // for the linkee. At this point, we have not passed ownership of
           // this socket to the `SocketManager`, so there is only one possible
           // linkee to notify.
-          process->enqueue(new ExitedEvent(to));
+          process_manager->deliver(process, new ExitedEvent(to));
           return;
         }
 
@@ -1654,8 +1672,13 @@ void SocketManager::link(
         // socket from the mapping of linkees and linkers.
         Try<Nothing, SocketError> shutdown = existing.shutdown();
         if (shutdown.isError()) {
-          VLOG(1) << "Failed to shutdown old link: "
-                  << shutdown.error().message;
+          Try<Address> peer = existing.peer();
+
+          LOG(WARNING)
+            << "Failed to shutdown old link to " << to
+            << " using socket " << existing.get() << " to peer '"
+            << (peer.isSome() ? stringify(peer.get()) : "unknown")
+            << "': " << shutdown.error().message;
         }
 
         connect = true;
@@ -1671,7 +1694,7 @@ void SocketManager::link(
 
   if (connect) {
     CHECK_SOME(socket);
-    socket->connect(to.address)
+    internal::connectSocket(*socket, to.address, to.host)
       .onAny(lambda::bind(
           &SocketManager::link_connect,
           this,
@@ -1753,71 +1776,81 @@ void SocketManager::unproxy(const Socket& socket)
 
 namespace internal {
 
-void _send(
-    const Future<size_t>& result,
-    Socket socket,
-    Encoder* encoder,
-    size_t size);
-
+Future<Nothing> _send(Encoder* encoder, Socket socket);
 
 void send(Encoder* encoder, Socket socket)
 {
-  switch (encoder->kind()) {
-    case Encoder::DATA: {
-      size_t size;
-      const char* data = static_cast<DataEncoder*>(encoder)->next(&size);
-      socket.send(data, size)
-        .onAny(lambda::bind(
-            &internal::_send,
-            lambda::_1,
-            socket,
-            encoder,
-            size));
-      break;
-    }
-    case Encoder::FILE: {
-      off_t offset;
-      size_t size;
-      int_fd fd = static_cast<FileEncoder*>(encoder)->next(&offset, &size);
-      socket.sendfile(fd, offset, size)
-        .onAny(lambda::bind(
-            &internal::_send,
-            lambda::_1,
-            socket,
-            encoder,
-            size));
-      break;
-    }
-  }
+  _send(encoder, socket)
+    .then([socket] {
+      // Continue sending until this socket has no more
+      // queued outgoing messages.
+      return process::loop(
+          None(),
+          [=] { return socket_manager->next(socket); },
+          [=](Encoder* encoder) -> Future<ControlFlow<Nothing>> {
+            if (encoder == nullptr) {
+              return Break();
+            }
+
+            return _send(encoder, socket)
+              .then([]() -> ControlFlow<Nothing> { return Continue(); });
+        });
+    });
 }
 
 
-void _send(
-    const Future<size_t>& length,
-    Socket socket,
-    Encoder* encoder,
-    size_t size)
+Future<Nothing> _send(Encoder* encoder, Socket socket)
 {
-  if (length.isDiscarded() || length.isFailed()) {
-    socket_manager->close(socket);
-    delete encoder;
-  } else {
-    // Update the encoder with the amount sent.
-    encoder->backup(size - length.get());
+  // Loop until all of the data in the provided encoder is sent.
+  return process::loop(
+      None(),
+      [=] {
+        size_t size;
+        Future<size_t> send;
 
-    // See if there is any more of the message to send.
-    if (encoder->remaining() == 0) {
-      delete encoder;
+        switch (encoder->kind()) {
+          case Encoder::DATA: {
+            const char* data =
+              static_cast<DataEncoder*>(encoder)->next(&size);
+            send = socket.send(data, size);
+            break;
+          }
+          case Encoder::FILE: {
+            off_t offset;
+            int_fd fd =
+              static_cast<FileEncoder*>(encoder)->next(&offset, &size);
+            send = socket.sendfile(fd, offset, size);
+            break;
+          }
+        }
 
-      // Check for more stuff to send on socket.
-      Encoder* next = socket_manager->next(socket);
-      if (next != nullptr) {
-        send(next, socket);
-      }
-    } else {
-      send(encoder, socket);
-    }
-  }
+        return send
+          .then([=](size_t sent) {
+            // Update the encoder with the amount sent.
+            encoder->backup(size - sent);
+            return Nothing();
+          })
+          .recover([=](const Future<Nothing>& f) {
+            if (f.isFailed()) {
+              Try<Address> peer = socket.peer();
+
+              LOG(WARNING)
+                << "Failed to send on socket " << socket.get() << " to peer '"
+                << (peer.isSome() ? stringify(peer.get()) : "unknown")
+                << "': " << f.failure();
+            }
+            socket_manager->close(socket);
+            delete encoder;
+            return f; // Break the loop by propagating the "failure".
+          });
+      },
+      [=](Nothing) -> ControlFlow<Nothing> {
+        if (encoder->remaining() == 0) {
+          delete encoder;
+          return Break();
+        }
+        return Continue();
+      });
 }
 
 } // namespace internal {
@@ -2023,7 +2056,7 @@ void SocketManager::send(Message&& message, const SocketImpl::Kind& kind)
 
   if (connect) {
     CHECK_SOME(socket);
-    socket->connect(address)
+    internal::connectSocket(*socket, address, message.to.host)
       .onAny(lambda::bind(
             // TODO(benh): with C++14 we can use lambda instead of
             // `std::bind` and capture `message` with a `std::move`.
@@ -2105,11 +2138,12 @@ Encoder* SocketManager::next(int_fd s)
           // socket is already closed so it by itself doesn't necessarily
           // suggest anything wrong.
           if (shutdown.isError()) {
-            LOG(INFO) << "Failed to shutdown socket with fd " << socket.get()
-                      << ", address " << (socket.address().isSome()
-                                            ? stringify(socket.address().get())
-                                            : "N/A")
-                      << ": " << shutdown.error().message;
+            Try<Address> peer = socket.peer();
+
+            LOG(WARNING)
+              << "Failed to shutdown socket " << socket.get() << " to peer '"
+              << (peer.isSome() ? stringify(peer.get()) : "unknown")
+              << "': " << shutdown.error().message;
           }
         }
       }
@@ -2201,11 +2235,12 @@ void SocketManager::close(int_fd s)
 #else // __WINDOWS__
           shutdown.error().code != ENOTCONN) {
 #endif // __WINDOWS__
-        LOG(ERROR) << "Failed to shutdown socket with fd " << socket.get()
-                   << ", address " << (socket.address().isSome()
-                                         ? stringify(socket.address().get())
-                                         : "N/A")
-                   << ": " << shutdown.error().message;
+        Try<Address> peer = socket.peer();
+
+        LOG(WARNING)
+          << "Failed to shutdown socket " << socket.get() << " to peer '"
+          << (peer.isSome() ? stringify(peer.get()) : "unknown")
+          << "': " << shutdown.error().message;
       }
     }
   }
@@ -2252,7 +2287,7 @@ void SocketManager::exited(const Address& address)
       CHECK(links.linkers.contains(linkee));
 
       foreach (ProcessBase* linker, links.linkers[linkee]) {
-        linker->enqueue(new ExitedEvent(linkee));
+        process_manager->deliver(linker, new ExitedEvent(linkee));
 
         // Remove the linkee pid from the linker.
         CHECK(links.linkees.contains(linker));
@@ -2319,7 +2354,7 @@ void SocketManager::exited(ProcessBase* process)
     foreach (ProcessBase* linker, links.linkers[pid]) {
       CHECK(linker != process) << "Process linked with itself";
       Clock::update(linker, time);
-      linker->enqueue(new ExitedEvent(pid));
+      process_manager->deliver(linker, new ExitedEvent(pid));
 
       // Remove the linkee pid from the linker.
       CHECK(links.linkees.contains(linker));
@@ -2421,7 +2456,7 @@ void ProcessManager::finalize()
       }
 
       // Grab the `UPID` for the next process we'll terminate.
-      pid = processes.values().front()->self();
+      pid = processes.begin()->second->self();
     }
 
     // Terminate this process but do not inject the message,
@@ -2758,7 +2793,48 @@ void ProcessManager::handle(
 
 
 bool ProcessManager::deliver(
-    ProcessBase* receiver,
+    ProcessBase* destination,
+    Event* event,
+    ProcessBase* sender)
+{
+  CHECK(event != nullptr);
+
+  if (_deliver(destination, event, sender)) {
+    return true;
+  }
+
+  delete event;
+  return false;
+}
+
+
+bool ProcessManager::deliver(
+    const UPID& destination,
+    Event* event,
+    ProcessBase* sender)
+{
+  CHECK(event != nullptr);
+
+  if (ProcessReference reference = use(destination)) {
+    if (_deliver(reference, event, sender)) {
+      return true;
+    }
+  } else {
+    VLOG(2) << "Dropping event for process " << destination;
+  }
+
+  // Note that we must delete the event without holding the
+  // process reference, since deletion of a dispatch event
+  // may invoke other code via destructors of objects bound
+  // into the dispatched function and therefore can lead to
+  // deadlock. An example of such a deadlock is in MESOS-9808.
+  delete event;
+  return false;
+}
+
+
+bool ProcessManager::_deliver(
+    ProcessBase* destination,
     Event* event,
     ProcessBase* sender)
 {
@@ -2772,30 +2848,10 @@ bool ProcessManager::deliver(
   // time).
   if (Clock::paused()) {
     Clock::update(
-        receiver, Clock::now(sender != nullptr ? sender : __process__));
+        destination, Clock::now(sender != nullptr ? sender : __process__));
   }
 
-  receiver->enqueue(event);
-
-  return true;
-}
-
-
-bool ProcessManager::deliver(
-    const UPID& to,
-    Event* event,
-    ProcessBase* sender)
-{
-  CHECK(event != nullptr);
-
-  if (ProcessReference receiver = use(to)) {
-    return deliver(receiver, event, sender);
-  }
-
-  VLOG(2) << "Dropping event for process " << to;
-
-  delete event;
-  return false;
+  return destination->enqueue(event);
 }
 
 
@@ -2981,7 +3037,7 @@ void ProcessManager::resume(ProcessBase* process)
       if (filter.load() != nullptr) {
         synchronized (filter_mutex) {
           Filter* f = filter.load();
-          if (f != nullptr && f->filter(event)) {
+          if (f != nullptr && f->filter(process->self(), event)) {
             delete event;
             continue; // Try and execute the next event.
           }
@@ -3133,7 +3189,7 @@ void ProcessManager::link(
     } else {
       // Since the pid isn't valid its process must have already died
       // (or hasn't been spawned yet) so send a process exit message.
-      process->enqueue(new ExitedEvent(to));
+      process_manager->deliver(process, new ExitedEvent(to));
     }
   }
 }
@@ -3150,11 +3206,11 @@ void ProcessManager::terminate(
           process, Clock::now(sender != nullptr ? sender : __process__));
     }
 
-    if (sender != nullptr) {
-      process->enqueue(new TerminateEvent(sender->self(), inject));
-    } else {
-      process->enqueue(new TerminateEvent(UPID(), inject));
-    }
+    process_manager->deliver(
+        process,
+        new TerminateEvent(
+            sender != nullptr ? sender->self() : UPID(),
+            inject));
   }
 }
 
@@ -3379,7 +3435,7 @@ void ProcessManager::settle()
 }
 
 
-Future<Response> ProcessManager::__processes__(const Request&)
+Future<Response> ProcessManager::__processes__(const Request& request)
 {
   synchronized (processes_mutex) {
     return collect(lambda::map(
@@ -3388,17 +3444,38 @@ Future<Response> ProcessManager::__processes__(const Request&)
           // high-priority set of events (i.e., mailbox).
           return dispatch(
               process->self(),
-              [process]() -> JSON::Object {
-                return *process;
-              });
+              [process]() -> Option<JSON::Object> {
+                return Option<JSON::Object>(*process);
+              })
+            // We must recover abandoned futures in case
+            // the process is terminated and the dispatch
+            // is dropped.
+            .recover([](const Future<Option<JSON::Object>>& f) {
+              return Option<JSON::Object>::none();
+            });
         },
         process_manager->processes.values()))
-      .then([](const std::list<JSON::Object>& objects) -> Response {
+      .then([request](
+          const std::vector<Option<JSON::Object>>& objects) -> Response {
         JSON::Array array;
-        foreach (const JSON::Object& object, objects) {
-          array.values.push_back(object);
+        foreach (const Option<JSON::Object>& object, objects) {
+          if (object.isSome()) {
+            array.values.push_back(*object);
+          }
         }
-        return OK(array);
+
+        Response response = OK(array);
+
+        // TODO(alexr): Generalize response logging in libprocess.
+        VLOG(1) << "HTTP " << request.method << " for " << request.url
+                << (request.client.isSome()
+                    ? " from " + stringify(request.client.get())
+                    : "")
+                << ": '" << response.status << "'"
+                << " after " << (process::Clock::now() - request.received).ms()
+                << Milliseconds::units();
+
+        return response;
       });
   }
 }
@@ -3471,7 +3548,7 @@ size_t ProcessBase::eventCount<TerminateEvent>()
 }
 
 
-void ProcessBase::enqueue(Event* event)
+bool ProcessBase::enqueue(Event* event)
 {
   CHECK_NOTNULL(event);
 
@@ -3484,15 +3561,27 @@ void ProcessBase::enqueue(Event* event)
     event->is<TerminateEvent>() &&
     event->as<TerminateEvent>().inject;
 
+  bool enqueued = false;
+
   switch (old) {
     case State::BOTTOM:
     case State::READY:
     case State::BLOCKED:
-      events->producer.enqueue(event);
+      enqueued = events->producer.enqueue(event);
       break;
     case State::TERMINATING:
-      delete event;
-      return;
+      break;
+  }
+
+  // NOTE: It's the responsibility of the caller to delete the
+  // undelivered event. This is by design since the destruction
+  // of a dispatch event may invoke other code. Therefore, if
+  // the caller is holding a `ProcessReference` to this process
+  // it must be cleared prior to deleting the dispatch event.
+  if (!enqueued) {
+    // TODO(bmahler): Log the type of event being dropped.
+    VLOG(2) << "Dropping event for TERMINATING process " << pid;
+    return false;
   }
 
   // We need to store terminate _AFTER_ we enqueue the event because
@@ -3518,6 +3607,8 @@ void ProcessBase::enqueue(Event* event)
       process_manager->enqueue(this);
     }
   }
+
+  return true;
 }
 
 
@@ -3614,9 +3705,9 @@ void ProcessBase::consume(HttpEvent&& event)
   // but if no handler is found and the path is nested, we shorten it and look
   // again. For example: if the request is for '/a/b/c' and no handler is found,
   // we will then check for '/a/b', and finally for '/a'.
-  while (Path(name).dirname() != name) {
+  while (Path(name, '/').dirname() != name) {
     if (handlers.http.count(name) == 0) {
-      name = Path(name).dirname();
+      name = Path(name, '/').dirname();
       continue;
     }
 
@@ -3669,7 +3760,7 @@ void ProcessBase::consume(HttpEvent&& event)
     }
 
     // Try and determine the Content-Type from an extension.
-    Option<string> extension = Path(response.path).extension();
+    Option<string> extension = Path(response.path, '/').extension();
 
     if (extension.isSome() && assets[name].types.count(extension.get()) > 0) {
       response.headers["Content-Type"] = assets[name].types[extension.get()];
@@ -3917,7 +4008,7 @@ public:
       duration(_duration),
       waited(_waited) {}
 
-  virtual void initialize()
+  void initialize() override
   {
     VLOG(3) << "Running waiter process for " << pid;
     link(pid);
@@ -3925,7 +4016,7 @@ public:
   }
 
 private:
-  virtual void exited(const UPID&)
+  void exited(const UPID&) override
   {
     VLOG(3) << "Waiter process waited for " << pid;
     *waited = true;
@@ -4035,7 +4126,7 @@ void dispatch(
 {
   process::initialize();
 
-  DispatchEvent* event = new DispatchEvent(pid, std::move(f), functionType);
+  DispatchEvent* event = new DispatchEvent(std::move(f), functionType);
   process_manager->deliver(pid, event, __process__);
 }
 

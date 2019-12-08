@@ -17,7 +17,7 @@
 #ifndef __PROVISIONER_HPP__
 #define __PROVISIONER_HPP__
 
-#include <list>
+#include <vector>
 
 #include <mesos/resources.hpp>
 
@@ -30,6 +30,7 @@
 #include <mesos/slave/isolator.hpp> // For ContainerState.
 
 #include <stout/nothing.hpp>
+#include <stout/path.hpp>
 #include <stout/try.hpp>
 
 #include <process/future.hpp>
@@ -61,6 +62,10 @@ struct ProvisionInfo
 {
   std::string rootfs;
 
+  // Ephemeral volumes are any additional paths the Provisioner backend
+  // may have created that should be counted towards the sandbox disk quota.
+  Option<std::vector<Path>> ephemeralVolumes;
+
   // Docker v1 image manifest.
   Option<::docker::spec::v1::ImageManifest> dockerManifest;
 
@@ -75,6 +80,14 @@ public:
   // Create the provisioner based on the specified flags.
   static Try<process::Owned<Provisioner>> create(
       const Flags& flags,
+      SecretResolver* secretResolver = nullptr);
+
+  // This allows the backend to be mocked for testing.
+  static Try<process::Owned<Provisioner>> create(
+      const Flags& flags,
+      const std::string& rootDir,
+      const std::string& defaultBackend,
+      const hashmap<std::string, process::Owned<Backend>>& backends,
       SecretResolver* secretResolver = nullptr);
 
   // Available only for testing.
@@ -151,9 +164,11 @@ private:
 
   process::Future<bool> _destroy(
       const ContainerID& containerId,
-      const std::list<process::Future<bool>>& destroys);
+      const std::vector<process::Future<bool>>& destroys);
 
-  process::Future<bool> __destroy(const ContainerID& containerId);
+  void __destroy(
+      const ContainerID& containerId,
+      const process::Future<std::vector<process::Future<bool>>>& futures);
 
   // Absolute path to the provisioner root directory. It can be
   // derived from '--work_dir' but we keep a separate copy here
@@ -181,6 +196,11 @@ private:
     // started in 1.5.
     Option<std::vector<std::string>> layers;
 
+    // We keep track of the future for 'backend->provision' so
+    // that destroy will only start calling 'backend->destroy'
+    // after 'backend->provision' has finished.
+    process::Future<ProvisionInfo> provisioning;
+
     process::Promise<bool> termination;
 
     // The container status in provisioner.
@@ -197,17 +217,14 @@ private:
     process::metrics::Counter remove_container_errors;
   } metrics;
 
-  // This `ReadWriteLock` instance is used to protect the critical
-  // section, which includes store directory and provision directory.
-  // Because `provision` and `destroy` are scoped by `containerId`,
-  // they are not expected to touch the same critical section
-  // simultaneously, so any `provision` and `destroy` can happen concurrently.
-  // This is guaranteed by Mesos containerizer, e.g., a `destroy` will always
-  // wait for a container's `provision` to finish, then do the cleanup.
+  // This `ReadWriteLock` instance is used to protect the critical section which
+  // is the layers in the store directory (i.e. `--docker_store_dir`/layers/).
+  // Any `provision` and `destroy` can happen concurrently since they are not
+  // expected to touch the critical section simultaneously.
   //
   // On the other hand, `pruneImages` needs to know all active layers from all
   // containers, therefore it must be exclusive to other `provision`, `destroy`
-  // and `pruneImages` so that we do not prune image layers which is used by an
+  // and `pruneImages` so that we do not prune image layers which are used by an
   // active `provision` or `destroy`.
   process::ReadWriteLock rwLock;
 };

@@ -176,15 +176,17 @@ mesos::internal::master::Flags::Flags()
       "machines are accepted. Path can be of the form\n"
       "`file:///path/to/file` or `/path/to/file`.\n");
 
-  add(&Flags::user_sorter,
-      "user_sorter",
-      "Policy to use for allocating resources between users. May be one of:\n"
-      "  dominant_resource_fairness (drf)",
+  add(&Flags::role_sorter,
+      "role_sorter",
+      flags::DeprecatedName("user_sorter"),
+      "Policy to use for allocating resources between roles when\n"
+      "allocating up to quota guarantees as well as when allocating\n"
+      "up to quota limits. May be one of: [drf, random]",
       "drf");
 
   add(&Flags::framework_sorter,
       "framework_sorter",
-      "Policy to use for allocating resources between a given user's\n"
+      "Policy to use for allocating resources between a given role's\n"
       "frameworks. Options are the same as for `--user_sorter`.",
       "drf");
 
@@ -228,6 +230,16 @@ mesos::internal::master::Flags::Flags()
       "If `true`, only authenticated agents are allowed to register.\n"
       "If `false`, unauthenticated agents are also allowed to register.",
       false);
+
+  // TODO(bmahler): Ideally, we remove this v0-style authentication
+  // in favor of just using HTTP authentication at the libprocess
+  // layer.
+  add(&Flags::authentication_v0_timeout,
+      "authentication_v0_timeout",
+      "The timeout within which an authentication is expected\n"
+      "to complete against a v0 framework or agent. This does not\n"
+      "apply to the v0 or v1 HTTP APIs.",
+      DEFAULT_AUTHENTICATION_V0_TIMEOUT);
 
   // TODO(zhitao): Remove deprecated `--authenticate_http` flag name after
   // the deprecation cycle which started with Mesos 1.0.
@@ -474,6 +486,25 @@ mesos::internal::master::Flags::Flags()
       "  https://issues.apache.org/jira/browse/MESOS-7576",
       true);
 
+  add(&Flags::min_allocatable_resources,
+      "min_allocatable_resources",
+      "One or more sets of resource quantities that define the minimum\n"
+      "allocatable resources for the allocator. The allocator will only offer\n"
+      "resources that meets the quantity requirement of at least one of the\n"
+      "specified sets. For `SCALAR` type resources, its quantity is its\n"
+      "scalar value. For `RANGES` and `SET` type, their quantities are the\n"
+      "number of different instances in the range or set. For example,\n"
+      "`range:[1-5]` has a quantity of 5 and `set:{a,b}` has a quantity of 2.\n"
+      "The resources in each set should be delimited by semicolons (acting as\n"
+      "logical AND), and each set should be delimited by the pipe character\n"
+      "(acting as logical OR).\n"
+      "(Example: `disk:1|cpus:1;mem:32;ports:1` configures the allocator to\n"
+      "only offer resources if they contain a disk resource of at least\n"
+      "1 megabyte, or if they at least contain 1 cpu, 32 megabytes of memory\n"
+      "and 1 port.)\n",
+      "cpus:" + stringify(MIN_CPUS) +
+        "|mem:" + stringify((double)MIN_MEM.bytes() / Bytes::MEGABYTES));
+
   add(&Flags::hooks,
       "hooks",
       "A comma-separated list of hook modules to be\n"
@@ -546,6 +577,17 @@ mesos::internal::master::Flags::Flags()
       "\n"
       "Currently there is no support for multiple HTTP framework\n"
       "authenticators.");
+
+  add(&Flags::max_operator_event_stream_subscribers,
+      "max_operator_event_stream_subscribers",
+      "Maximum number of simultaneous subscribers to the master's operator\n"
+      "event stream. If new connections bring the total number of subscribers\n"
+      "over this value, older connections will be closed by the master.\n"
+      "\n"
+      "This flag should generally not be changed unless the operator is\n"
+      "mitigating known problems with their network setup, such as\n"
+      "clients/proxies that do not close connections to the master.",
+      DEFAULT_MAX_OPERATOR_EVENT_STREAM_SUBSCRIBERS);
 
   add(&Flags::max_completed_frameworks,
       "max_completed_frameworks",
@@ -657,6 +699,14 @@ mesos::internal::master::Flags::Flags()
       "require_agent_domain",
       "If true, only agents with a configured domain can register.\n",
       false);
+
+  add(&Flags::publish_per_framework_metrics,
+      "publish_per_framework_metrics",
+      "If true, an extensive set of metrics for each active framework will\n"
+      "be published. These metrics are useful for understanding cluster\n"
+      "behavior, but can be overwhelming for very large numbers of\n"
+      "frameworks.",
+      true);
 
   add(&Flags::domain,
       "domain",

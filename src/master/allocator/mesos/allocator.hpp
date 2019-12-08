@@ -44,10 +44,10 @@ public:
   // Factory to allow for typed tests.
   static Try<mesos::allocator::Allocator*> create();
 
-  ~MesosAllocator();
+  ~MesosAllocator() override;
 
   void initialize(
-      const Duration& allocationInterval,
+      const mesos::allocator::Options& options,
       const lambda::function<
           void(const FrameworkID&,
                const hashmap<std::string, hashmap<SlaveID, Resources>>&)>&
@@ -55,36 +55,32 @@ public:
       const lambda::function<
           void(const FrameworkID&,
                const hashmap<SlaveID, UnavailableResources>&)>&
-        inverseOfferCallback,
-      const Option<std::set<std::string>>&
-        fairnessExcludeResourceNames = None(),
-      bool filterGpuResources = true,
-      const Option<DomainInfo>& domain = None());
+        inverseOfferCallback) override;
 
   void recover(
       const int expectedAgentCount,
-      const hashmap<std::string, Quota>& quotas);
+      const hashmap<std::string, Quota>& quotas) override;
 
   void addFramework(
       const FrameworkID& frameworkId,
       const FrameworkInfo& frameworkInfo,
       const hashmap<SlaveID, Resources>& used,
       bool active,
-      const std::set<std::string>& suppressedRoles);
+      const std::set<std::string>& suppressedRoles) override;
 
   void removeFramework(
-      const FrameworkID& frameworkId);
+      const FrameworkID& frameworkId) override;
 
   void activateFramework(
-      const FrameworkID& frameworkId);
+      const FrameworkID& frameworkId) override;
 
   void deactivateFramework(
-      const FrameworkID& frameworkId);
+      const FrameworkID& frameworkId) override;
 
   void updateFramework(
       const FrameworkID& frameworkId,
       const FrameworkInfo& frameworkInfo,
-      const std::set<std::string>& suppressedRoles);
+      const std::set<std::string>& suppressedRoles) override;
 
   void addSlave(
       const SlaveID& slaveId,
@@ -92,84 +88,90 @@ public:
       const std::vector<SlaveInfo::Capability>& capabilities,
       const Option<Unavailability>& unavailability,
       const Resources& total,
-      const hashmap<FrameworkID, Resources>& used);
+      const hashmap<FrameworkID, Resources>& used) override;
 
   void removeSlave(
-      const SlaveID& slaveId);
+      const SlaveID& slaveId) override;
 
   void updateSlave(
       const SlaveID& slave,
       const SlaveInfo& slaveInfo,
       const Option<Resources>& total = None(),
-      const Option<std::vector<SlaveInfo::Capability>>& capabilities = None());
+      const Option<std::vector<SlaveInfo::Capability>>& capabilities = None())
+    override;
 
   void addResourceProvider(
       const SlaveID& slave,
       const Resources& total,
-      const hashmap<FrameworkID, Resources>& used);
+      const hashmap<FrameworkID, Resources>& used) override;
 
   void activateSlave(
-      const SlaveID& slaveId);
+      const SlaveID& slaveId) override;
 
   void deactivateSlave(
-      const SlaveID& slaveId);
+      const SlaveID& slaveId) override;
 
   void updateWhitelist(
-      const Option<hashset<std::string>>& whitelist);
+      const Option<hashset<std::string>>& whitelist) override;
 
   void requestResources(
       const FrameworkID& frameworkId,
-      const std::vector<Request>& requests);
+      const std::vector<Request>& requests) override;
 
   void updateAllocation(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& offeredResources,
-      const std::vector<ResourceConversion>& conversions);
+      const std::vector<ResourceConversion>& conversions) override;
 
   process::Future<Nothing> updateAvailable(
       const SlaveID& slaveId,
-      const std::vector<Offer::Operation>& operations);
+      const std::vector<Offer::Operation>& operations) override;
 
   void updateUnavailability(
       const SlaveID& slaveId,
-      const Option<Unavailability>& unavailability);
+      const Option<Unavailability>& unavailability) override;
 
   void updateInverseOffer(
       const SlaveID& slaveId,
       const FrameworkID& frameworkId,
       const Option<UnavailableResources>& unavailableResources,
       const Option<mesos::allocator::InverseOfferStatus>& status,
-      const Option<Filters>& filters);
+      const Option<Filters>& filters) override;
 
   process::Future<
       hashmap<SlaveID,
               hashmap<FrameworkID, mesos::allocator::InverseOfferStatus>>>
-    getInverseOfferStatuses();
+    getInverseOfferStatuses() override;
+
+  void transitionOfferedToAllocated(
+     const SlaveID& slaveId, const Resources& resources) override;
 
   void recoverResources(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& resources,
-      const Option<Filters>& filters);
+      const Option<Filters>& filters,
+      bool isAllocated) override;
 
   void suppressOffers(
       const FrameworkID& frameworkId,
-      const std::set<std::string>& roles);
+      const std::set<std::string>& roles) override;
 
   void reviveOffers(
       const FrameworkID& frameworkId,
-      const std::set<std::string>& roles);
+      const std::set<std::string>& roles) override;
 
-  void setQuota(
+  void updateQuota(
       const std::string& role,
-      const Quota& quota);
-
-  void removeQuota(
-      const std::string& role);
+      const Quota& quota) override;
 
   void updateWeights(
-      const std::vector<WeightInfo>& weightInfos);
+      const std::vector<WeightInfo>& weightInfos) override;
+
+  void pause() override;
+
+  void resume() override;
 
 private:
   MesosAllocator();
@@ -186,14 +188,14 @@ class MesosAllocatorProcess : public process::Process<MesosAllocatorProcess>
 public:
   MesosAllocatorProcess() {}
 
-  virtual ~MesosAllocatorProcess() {}
+  ~MesosAllocatorProcess() override {}
 
   // Explicitly unhide 'initialize' to silence a compiler warning
   // from clang, since we overload below.
   using process::ProcessBase::initialize;
 
   virtual void initialize(
-      const Duration& allocationInterval,
+      const mesos::allocator::Options& options,
       const lambda::function<
           void(const FrameworkID&,
                const hashmap<std::string, hashmap<SlaveID, Resources>>&)>&
@@ -201,11 +203,7 @@ public:
       const lambda::function<
           void(const FrameworkID&,
                const hashmap<SlaveID, UnavailableResources>&)>&
-        inverseOfferCallback,
-      const Option<std::set<std::string>>&
-        fairnessExcludeResourceNames = None(),
-      bool filterGpuResources = true,
-      const Option<DomainInfo>& domain = None()) = 0;
+        inverseOfferCallback) = 0;
 
   virtual void recover(
       const int expectedAgentCount,
@@ -294,11 +292,15 @@ public:
               hashmap<FrameworkID, mesos::allocator::InverseOfferStatus>>>
     getInverseOfferStatuses() = 0;
 
+  virtual void transitionOfferedToAllocated(
+      const SlaveID& slaveId, const Resources& resources) = 0;
+
   virtual void recoverResources(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& resources,
-      const Option<Filters>& filters) = 0;
+      const Option<Filters>& filters,
+      bool isAllocated) = 0;
 
   virtual void suppressOffers(
       const FrameworkID& frameworkId,
@@ -308,15 +310,16 @@ public:
       const FrameworkID& frameworkId,
       const std::set<std::string>& roles) = 0;
 
-  virtual void setQuota(
+  virtual void updateQuota(
       const std::string& role,
       const Quota& quota) = 0;
 
-  virtual void removeQuota(
-      const std::string& role) = 0;
-
   virtual void updateWeights(
       const std::vector<WeightInfo>& weightInfos) = 0;
+
+  virtual void pause() = 0;
+
+  virtual void resume() = 0;
 };
 
 
@@ -349,7 +352,7 @@ MesosAllocator<AllocatorProcess>::~MesosAllocator()
 
 template <typename AllocatorProcess>
 inline void MesosAllocator<AllocatorProcess>::initialize(
-    const Duration& allocationInterval,
+    const mesos::allocator::Options& options,
     const lambda::function<
         void(const FrameworkID&,
              const hashmap<std::string, hashmap<SlaveID, Resources>>&)>&
@@ -357,20 +360,14 @@ inline void MesosAllocator<AllocatorProcess>::initialize(
     const lambda::function<
         void(const FrameworkID&,
               const hashmap<SlaveID, UnavailableResources>&)>&
-      inverseOfferCallback,
-    const Option<std::set<std::string>>& fairnessExcludeResourceNames,
-    bool filterGpuResources,
-    const Option<DomainInfo>& domain)
+      inverseOfferCallback)
 {
   process::dispatch(
       process,
       &MesosAllocatorProcess::initialize,
-      allocationInterval,
+      options,
       offerCallback,
-      inverseOfferCallback,
-      fairnessExcludeResourceNames,
-      filterGpuResources,
-      domain);
+      inverseOfferCallback);
 }
 
 
@@ -637,13 +634,26 @@ inline process::Future<
       &MesosAllocatorProcess::getInverseOfferStatuses);
 }
 
+template <typename AllocatorProcess>
+inline void MesosAllocator<AllocatorProcess>::transitionOfferedToAllocated(
+    const SlaveID& slaveId,
+    const Resources& resources)
+{
+  process::dispatch(
+      process,
+      &MesosAllocatorProcess::transitionOfferedToAllocated,
+      slaveId,
+      resources);
+}
+
 
 template <typename AllocatorProcess>
 inline void MesosAllocator<AllocatorProcess>::recoverResources(
     const FrameworkID& frameworkId,
     const SlaveID& slaveId,
     const Resources& resources,
-    const Option<Filters>& filters)
+    const Option<Filters>& filters,
+    bool isAllocated)
 {
   process::dispatch(
       process,
@@ -651,7 +661,8 @@ inline void MesosAllocator<AllocatorProcess>::recoverResources(
       frameworkId,
       slaveId,
       resources,
-      filters);
+      filters,
+      isAllocated);
 }
 
 
@@ -682,26 +693,15 @@ inline void MesosAllocator<AllocatorProcess>::reviveOffers(
 
 
 template <typename AllocatorProcess>
-inline void MesosAllocator<AllocatorProcess>::setQuota(
+inline void MesosAllocator<AllocatorProcess>::updateQuota(
     const std::string& role,
     const Quota& quota)
 {
   process::dispatch(
       process,
-      &MesosAllocatorProcess::setQuota,
+      &MesosAllocatorProcess::updateQuota,
       role,
       quota);
-}
-
-
-template <typename AllocatorProcess>
-inline void MesosAllocator<AllocatorProcess>::removeQuota(
-    const std::string& role)
-{
-  process::dispatch(
-      process,
-      &MesosAllocatorProcess::removeQuota,
-      role);
 }
 
 
@@ -714,6 +714,21 @@ inline void MesosAllocator<AllocatorProcess>::updateWeights(
       &MesosAllocatorProcess::updateWeights,
       weightInfos);
 }
+
+
+template <typename AllocatorProcess>
+inline void MesosAllocator<AllocatorProcess>::pause()
+{
+  process::dispatch(process, &MesosAllocatorProcess::pause);
+}
+
+
+template <typename AllocatorProcess>
+inline void MesosAllocator<AllocatorProcess>::resume()
+{
+  process::dispatch(process, &MesosAllocatorProcess::resume);
+}
+
 
 } // namespace allocator {
 } // namespace master {

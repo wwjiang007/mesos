@@ -43,6 +43,7 @@
 #include <stout/os/environment.hpp>
 #include <stout/os/fcntl.hpp>
 #include <stout/os/killtree.hpp>
+#include <stout/os/pipe.hpp>
 
 #ifdef __linux__
 #include "linux/systemd.hpp"
@@ -55,9 +56,11 @@
 using namespace mesos;
 using namespace process;
 
+using std::array;
 using std::map;
 using std::string;
 
+using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLogger;
 using mesos::slave::ContainerIO;
 
@@ -75,9 +78,8 @@ public:
   // "stdout" and "stderr" files in the sandbox.  The subprocesses will rotate
   // the files according to the configured maximum size and number of files.
   Future<ContainerIO> prepare(
-      const ExecutorInfo& executorInfo,
-      const string& sandboxDirectory,
-      const Option<string>& user)
+      const ContainerID& containerId,
+      const ContainerConfig& containerConfig)
   {
     // Prepare the environment for the container logger subprocess.
     // We inherit agent environment variables except for those
@@ -104,7 +106,7 @@ public:
       stringify(flags.libprocess_num_worker_threads);
 
     // Copy the global rotation flags.
-    // These will act as the defaults in case the executor environment
+    // These will act as the defaults in case the container's environment
     // overrides a subset of them.
     LoggerFlags overriddenFlags;
     overriddenFlags.max_stdout_size = flags.max_stdout_size;
@@ -113,30 +115,29 @@ public:
     overriddenFlags.logrotate_stderr_options = flags.logrotate_stderr_options;
 
     // Check for overrides of the rotation settings in the
-    // `ExecutorInfo`s environment variables.
-    if (executorInfo.has_command() &&
-        executorInfo.command().has_environment()) {
+    // `CommandInfo`s environment variables.
+    if (containerConfig.command_info().has_environment()) {
       // Search the environment for prefixed environment variables.
       // We un-prefix those variables before parsing the flag values.
-      map<string, string> executorEnvironment;
+      map<string, string> containerEnvironment;
       foreach (const Environment::Variable variable,
-               executorInfo.command().environment().variables()) {
+               containerConfig.command_info().environment().variables()) {
         if (strings::startsWith(
               variable.name(), flags.environment_variable_prefix)) {
           string unprefixed = strings::lower(strings::remove(
               variable.name(),
               flags.environment_variable_prefix,
               strings::PREFIX));
-          executorEnvironment[unprefixed] = variable.value();
+          containerEnvironment[unprefixed] = variable.value();
         }
       }
 
       // We will error out if there are unknown flags with the same prefix.
-      Try<flags::Warnings> load = overriddenFlags.load(executorEnvironment);
+      Try<flags::Warnings> load = overriddenFlags.load(containerEnvironment);
 
       if (load.isError()) {
         return Failure(
-            "Failed to load executor logger settings: " + load.error());
+            "Failed to load container logger settings: " + load.error());
       }
 
       // Log any flag warnings.
@@ -151,32 +152,24 @@ public:
     // of the pipe and will be solely responsible for closing that end.
     // The ownership of the write-end will be passed to the caller
     // of this function.
-    int pipefd[2];
-    if (::pipe(pipefd) == -1) {
-      return Failure(ErrnoError("Failed to create pipe").message);
+    Try<array<int, 2>> pipefd = os::pipe();
+    if (pipefd.isError()) {
+      return Failure("Failed to create pipe: " + pipefd.error());
     }
 
     Subprocess::IO::InputFileDescriptors outfds;
-    outfds.read = pipefd[0];
-    outfds.write = pipefd[1];
-
-    // NOTE: We need to `cloexec` this FD so that it will be closed when
-    // the child subprocess is spawned and so that the FD will not be
-    // inherited by the second child for stderr.
-    Try<Nothing> cloexec = os::cloexec(outfds.write.get());
-    if (cloexec.isError()) {
-      os::close(outfds.read);
-      os::close(outfds.write.get());
-      return Failure("Failed to cloexec: " + cloexec.error());
-    }
+    outfds.read = pipefd->at(0);
+    outfds.write = pipefd->at(1);
 
     // Spawn a process to handle stdout.
     mesos::internal::logger::rotate::Flags outFlags;
     outFlags.max_size = overriddenFlags.max_stdout_size;
     outFlags.logrotate_options = overriddenFlags.logrotate_stdout_options;
-    outFlags.log_filename = path::join(sandboxDirectory, "stdout");
+    outFlags.log_filename = path::join(containerConfig.directory(), "stdout");
     outFlags.logrotate_path = flags.logrotate_path;
-    outFlags.user = user;
+    outFlags.user = containerConfig.has_user()
+      ? Option<string>(containerConfig.user())
+      : Option<string>::none();
 
     // If we are on systemd, then extend the life of the process as we
     // do with the executor. Any grandchildren's lives will also be
@@ -207,34 +200,26 @@ public:
 
     // NOTE: We manually construct a pipe here to properly express
     // ownership of the FDs.  See the NOTE above.
-    if (::pipe(pipefd) == -1) {
+    pipefd = os::pipe();
+    if (pipefd.isError()) {
       os::close(outfds.write.get());
       os::killtree(outProcess->pid(), SIGKILL);
-      return Failure(ErrnoError("Failed to create pipe").message);
+      return Failure("Failed to create pipe: " + pipefd.error());
     }
 
     Subprocess::IO::InputFileDescriptors errfds;
-    errfds.read = pipefd[0];
-    errfds.write = pipefd[1];
-
-    // NOTE: We need to `cloexec` this FD so that it will be closed when
-    // the child subprocess is spawned.
-    cloexec = os::cloexec(errfds.write.get());
-    if (cloexec.isError()) {
-      os::close(outfds.write.get());
-      os::close(errfds.read);
-      os::close(errfds.write.get());
-      os::killtree(outProcess->pid(), SIGKILL);
-      return Failure("Failed to cloexec: " + cloexec.error());
-    }
+    errfds.read = pipefd->at(0);
+    errfds.write = pipefd->at(1);
 
     // Spawn a process to handle stderr.
     mesos::internal::logger::rotate::Flags errFlags;
     errFlags.max_size = overriddenFlags.max_stderr_size;
     errFlags.logrotate_options = overriddenFlags.logrotate_stderr_options;
-    errFlags.log_filename = path::join(sandboxDirectory, "stderr");
+    errFlags.log_filename = path::join(containerConfig.directory(), "stderr");
     errFlags.logrotate_path = flags.logrotate_path;
-    errFlags.user = user;
+    errFlags.user = containerConfig.has_user()
+      ? Option<string>(containerConfig.user())
+      : Option<string>::none();
 
     Try<Subprocess> errProcess = subprocess(
         path::join(flags.launcher_dir, mesos::internal::logger::rotate::NAME),
@@ -289,16 +274,14 @@ Try<Nothing> LogrotateContainerLogger::initialize()
 
 
 Future<ContainerIO> LogrotateContainerLogger::prepare(
-    const ExecutorInfo& executorInfo,
-    const string& sandboxDirectory,
-    const Option<string>& user)
+    const ContainerID& containerId,
+    const ContainerConfig& containerConfig)
 {
   return dispatch(
       process.get(),
       &LogrotateContainerLoggerProcess::prepare,
-      executorInfo,
-      sandboxDirectory,
-      user);
+      containerId,
+      containerConfig);
 }
 
 } // namespace logger {

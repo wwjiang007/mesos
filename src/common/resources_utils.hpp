@@ -22,6 +22,7 @@
 #include <google/protobuf/repeated_field.h>
 
 #include <mesos/mesos.hpp>
+#include <mesos/resource_quantities.hpp>
 #include <mesos/resources.hpp>
 
 #include <mesos/v1/mesos.hpp>
@@ -50,7 +51,7 @@ Try<Resources> applyCheckpointedResources(
 
 
 // Returns the resource provider ID associated with the given
-// operation. Returns None() if the operation is for agent default
+// operation. Returns None if the operation is for agent default
 // resources. We assume the given operation is validated. Therefore,
 // the specified operation should not contain resources from more than
 // one resource provider.
@@ -58,12 +59,11 @@ Result<ResourceProviderID> getResourceProviderId(
     const Offer::Operation& operation);
 
 
-// Returns the ID of the resource provider affected by a resource
-// conversion. Returns None() if the conversion is on agent default
-// resources. We assume a single conversion only being applied on
-// resources from a single resource provider.
+// Returns the resource provider ID associated with the given resources, None if
+// the given resources are agent default resources, or Error if the given
+// resources are from more than one resource providers.
 Result<ResourceProviderID> getResourceProviderId(
-    const ResourceConversion& conversion);
+    const Resources& resources);
 
 
 // Returns the resource conversions from the given offer operation.
@@ -215,6 +215,33 @@ Try<Nothing> downgradeResources(std::vector<Resource>* resources);
 
 
 Try<Nothing> downgradeResources(google::protobuf::Message* message);
+
+
+// These two functions shrink resources down to the target scalar resource
+// quantities or limits respectively. Target can only be specified for
+// scalar resources. Otherwise a `CHECK` error will occur.
+//
+// The primary difference between these two shrink functions is about resources
+// that have no quantity/limit specified in the `target`:
+//
+// - If the target is `ResourceQuantities`, due to its absent-means-zero
+//   semantic, such resources will the dropped i.e. shrink down to zero.
+//
+// - If the target is `ResourceLimits`, due to its absent-means-infinite
+//   semantic, such resources will be kept as-is in the result since it
+//   is already below the (infinite) limit.
+//
+// Note that some resources are indivisible (e.g. MOUNT volume) and
+// may be excluded in entirety in order to achieve the target size
+// (this may lead to the result size being smaller than the target size).
+//
+// Note also that there may be more than one result that satisfies
+// the target sizes (e.g. need to exclude 1 of 2 disks); this function
+// will make a random choice in these cases.
+Resources shrinkResources(
+    const Resources& resources, ResourceQuantities target);
+Resources shrinkResources(
+    const Resources& resources, ResourceLimits target);
 
 
 } // namespace mesos {

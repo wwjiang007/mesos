@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -26,28 +26,30 @@ play off of 'curl'.
 
 import json
 import sys
-import urllib2
+import urllib.request
+import urllib.error
+import urllib.parse
 
 
 def main():
     """Expects at least one argument on the command line."""
     if len(sys.argv) < 2:
-        print >> sys.stderr, "USAGE: {} URL [KEY...]".format(sys.argv[0])
+        print("USAGE: {} URL [KEY...]".format(sys.argv[0]), file=sys.stderr)
         sys.exit(1)
 
     url = sys.argv[1]
 
-    data = json.loads(urllib2.urlopen(url).read())
+    data = json.loads(urllib.request.urlopen(url).read())
 
     for arg in sys.argv[2:]:
         try:
             temp = data[arg]
             data = temp
         except KeyError:
-            print >> sys.stderr, "'" + arg + "' was not found"
+            print("'" + arg + "' was not found", file=sys.stderr)
             sys.exit(1)
 
-    print data.encode("utf-8")
+    print(data.encode("utf-8"))
 
 if __name__ == '__main__':
     main()

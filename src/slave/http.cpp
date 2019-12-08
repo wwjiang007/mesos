@@ -14,7 +14,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <list>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -58,16 +57,22 @@
 #include <stout/strings.hpp>
 #include <stout/unreachable.hpp>
 
+#include "common/authorization.hpp"
 #include "common/build.hpp"
+#include "common/future_tracker.hpp"
 #include "common/http.hpp"
 #include "common/recordio.hpp"
 #include "common/resources_utils.hpp"
+#include "common/validation.hpp"
 
 #include "internal/devolve.hpp"
 
 #include "mesos/mesos.hpp"
 #include "mesos/resources.hpp"
 
+#include "resource_provider/local.hpp"
+
+#include "slave/constants.hpp"
 #include "slave/http.hpp"
 #include "slave/slave.hpp"
 #include "slave/validation.hpp"
@@ -85,6 +90,7 @@ using mesos::authorization::VIEW_FLAGS;
 using mesos::authorization::VIEW_FRAMEWORK;
 using mesos::authorization::VIEW_TASK;
 using mesos::authorization::VIEW_EXECUTOR;
+using mesos::authorization::VIEW_RESOURCE_PROVIDER;
 using mesos::authorization::VIEW_ROLE;
 using mesos::authorization::SET_LOG_LEVEL;
 using mesos::authorization::ATTACH_CONTAINER_INPUT;
@@ -100,6 +106,7 @@ using mesos::authorization::KILL_STANDALONE_CONTAINER;
 using mesos::authorization::REMOVE_NESTED_CONTAINER;
 using mesos::authorization::REMOVE_STANDALONE_CONTAINER;
 using mesos::authorization::MODIFY_RESOURCE_PROVIDER_CONFIG;
+using mesos::authorization::MARK_RESOURCE_PROVIDER_GONE;
 using mesos::authorization::PRUNE_IMAGES;
 
 using mesos::internal::recordio::Reader;
@@ -159,7 +166,7 @@ static void json(JSON::ObjectWriter* writer, const TaskInfo& task)
   writer->field("id", task.task_id().value());
   writer->field("name", task.name());
   writer->field("slave_id", task.slave_id().value());
-  writer->field("resources", Resources(task.resources()));
+  writer->field("resources", task.resources());
 
   // Tasks are not allowed to mix resources allocated to
   // different roles, see MESOS-6636.
@@ -174,13 +181,6 @@ static void json(JSON::ObjectWriter* writer, const TaskInfo& task)
   if (task.has_discovery()) {
     writer->field("discovery", JSON::Protobuf(task.discovery()));
   }
-}
-
-static void json(
-    JSON::StringWriter* writer,
-    const SlaveInfo::Capability& capability)
-{
-  writer->append(SlaveInfo::Capability::Type_Name(capability.type()));
 }
 
 namespace internal {
@@ -467,6 +467,8 @@ Future<Response> Http::api(
 
   Option<ContentType> messageAcceptType;
   if (streamingMediaType(acceptType)) {
+    // Note that `acceptsMediaType()` returns true if the given headers
+    // field does not exist, i.e. by default we return JSON here.
     if (request.acceptsMediaType(MESSAGE_ACCEPT, APPLICATION_JSON)) {
       messageAcceptType = ContentType::JSON;
     } else if (request.acceptsMediaType(MESSAGE_ACCEPT, APPLICATION_PROTOBUF)) {
@@ -496,8 +498,8 @@ Future<Response> Http::api(
     CHECK_SOME(mediaTypes.messageContent);
 
     Owned<Reader<mesos::agent::Call>> reader(new Reader<mesos::agent::Call>(
-        Decoder<mesos::agent::Call>(lambda::bind(
-            deserializer, lambda::_1, mediaTypes.messageContent.get())),
+        lambda::bind(
+            deserializer, lambda::_1, mediaTypes.messageContent.get()),
         request.reader.get()));
 
     return reader->read()
@@ -542,13 +544,20 @@ Future<Response> Http::_api(
   if (streamingMediaType(mediaTypes.content) &&
       call.type() != mesos::agent::Call::ATTACH_CONTAINER_INPUT) {
     return UnsupportedMediaType(
-        "Streaming 'Content-Type' " + stringify(mediaTypes.content) + " is not "
-        "supported for " + stringify(call.type()) + " call");
+        "Streaming 'Content-Type' " + stringify(mediaTypes.content) + " is "
+        "not supported for " + stringify(call.type()) + " call");
   } else if (!streamingMediaType(mediaTypes.content) &&
              call.type() == mesos::agent::Call::ATTACH_CONTAINER_INPUT) {
     return UnsupportedMediaType(
         string("Expecting 'Content-Type' to be ") + APPLICATION_RECORDIO +
         " for " + stringify(call.type()) + " call");
+  }
+
+  if (streamingMediaType(mediaTypes.accept) &&
+      call.type() != mesos::agent::Call::ATTACH_CONTAINER_OUTPUT &&
+      call.type() != mesos::agent::Call::LAUNCH_NESTED_CONTAINER_SESSION) {
+    return NotAcceptable("Streaming response is not supported for " +
+        stringify(call.type()) + " call");
   }
 
   // Each handler must log separately to add context
@@ -648,6 +657,9 @@ Future<Response> Http::_api(
 
     case mesos::agent::Call::REMOVE_RESOURCE_PROVIDER_CONFIG:
       return removeResourceProviderConfig(call, principal);
+
+    case mesos::agent::Call::MARK_RESOURCE_PROVIDER_GONE:
+      return markResourceProviderGone(call, principal);
 
     case mesos::agent::Call::PRUNE_IMAGES:
       return pruneImages(call, mediaTypes.accept, principal);
@@ -759,7 +771,7 @@ Future<Response> Http::executor(
 
   const executor::Call call = devolve(v1Call);
 
-  Option<Error> error = validation::executor::call::validate(call);
+  Option<Error> error = common::validation::validateExecutorCall(call);
 
   if (error.isSome()) {
     return BadRequest("Failed to validate Executor::Call: " + error->message);
@@ -779,6 +791,12 @@ Future<Response> Http::executor(
           string("Expecting 'Accept' to allow ") +
           "'" + APPLICATION_PROTOBUF + "' or '" + APPLICATION_JSON + "'");
     }
+  } else if (call.type() == executor::Call::HEARTBEAT) {
+    // We return early here before doing any validation because currently
+    // this proto may contain dummy values for framework and executor IDs
+    // (which is safe).
+    // See: TODO inside `heartbeat()` in src/executor/executor.cpp.
+    return Accepted();
   } else {
     if (slave->state == Slave::RECOVERING) {
       return ServiceUnavailable("Agent has not finished recovery");
@@ -825,7 +843,9 @@ Future<Response> Http::executor(
       ok.type = Response::PIPE;
       ok.reader = pipe.reader();
 
-      HttpConnection http {pipe.writer(), acceptType};
+      StreamingHttpConnection<v1::executor::Event> http(
+          pipe.writer(), acceptType);
+
       slave->subscribe(http, call.subscribe(), framework, executor);
 
       return ok;
@@ -849,6 +869,11 @@ Future<Response> Http::executor(
           call.message().data());
 
       return Accepted();
+    }
+
+    case executor::Call::HEARTBEAT: {
+      // This should be handled before hitting this switch statement.
+      UNREACHABLE();
     }
 
     case executor::Call::UNKNOWN: {
@@ -1038,7 +1063,7 @@ Future<Response> Http::getMetrics(
   }
 
   return process::metrics::snapshot(timeout)
-      .then([acceptType](const hashmap<string, double>& metrics) -> Response {
+      .then([acceptType](const map<string, double>& metrics) -> Response {
           mesos::agent::Response response;
         response.set_type(mesos::agent::Response::GET_METRICS);
         mesos::agent::Response::GetMetrics* _getMetrics =
@@ -1196,6 +1221,7 @@ string Http::STATE_HELP() {
         "         \"containerizers\" : \"mesos\",",
         "         \"docker_socket\" : \"/var/run/docker.sock\",",
         "         \"gc_delay\" : \"1weeks\",",
+        "         \"gc_non_executor_container_sandboxes\" : \"false\",",
         "         \"docker_remove_delay\" : \"6hrs\",",
         "         \"port\" : \"5051\",",
         "         \"systemd_runtime_directory\" : \"/run/systemd/system\",",
@@ -1218,7 +1244,6 @@ string Http::STATE_HELP() {
         "         \"docker_kill_orphans\" : \"true\",",
         "         \"switch_user\" : \"true\",",
         "         \"logging_level\" : \"INFO\",",
-        "         \"hadoop_home\" : \"\",",
         "         \"strict\" : \"true\",",
         "         \"executor_registration_timeout\" : \"1mins\",",
         "         \"recovery_timeout\" : \"15mins\",",
@@ -1264,9 +1289,14 @@ Future<Response> Http::state(
   }
 
   return ObjectApprovers::create(
-      slave->authorizer,
-      principal,
-      {VIEW_FRAMEWORK, VIEW_TASK, VIEW_EXECUTOR, VIEW_FLAGS, VIEW_ROLE})
+             slave->authorizer,
+             principal,
+             {VIEW_FRAMEWORK,
+              VIEW_TASK,
+              VIEW_EXECUTOR,
+              VIEW_FLAGS,
+              VIEW_ROLE,
+              VIEW_RESOURCE_PROVIDER})
     .then(defer(
         slave->self(),
         [this, request](const Owned<ObjectApprovers>& approvers) -> Response {
@@ -1301,6 +1331,19 @@ Future<Response> Http::state(
 
             if (slave->info.has_domain()) {
               writer->field("domain", slave->info.domain());
+            }
+
+            if (slave->drainConfig.isSome()) {
+              writer->field(
+                  "drain_config",
+                  JSON::Protobuf(slave->drainConfig.get()));
+
+              if (slave->estimatedDrainStartTime.isSome()) {
+                writer->field(
+                    "estimated_drain_start_time_seconds",
+                    static_cast<int64_t>(
+                        slave->estimatedDrainStartTime->secs()));
+              }
             }
 
             const Resources& totalResources = slave->totalResources;
@@ -1371,6 +1414,29 @@ Future<Response> Http::state(
             writer->field(
                 "unreserved_resources_allocated",
                 allocatedResources.unreserved());
+
+            writer->field(
+                "resource_providers",
+                [this, &approvers](JSON::ArrayWriter* writer) {
+                  if (!approvers->approved<VIEW_RESOURCE_PROVIDER>()) {
+                    return;
+                  }
+
+                  foreachvalue (
+                      ResourceProvider* resourceProvider,
+                      slave->resourceProviders) {
+                    agent::Response::GetResourceProviders::ResourceProvider
+                      provider;
+
+                    *provider.mutable_resource_provider_info() =
+                      resourceProvider->info;
+
+                    *provider.mutable_total_resources() =
+                      resourceProvider->totalResources;
+
+                    writer->element(JSON::Protobuf(provider));
+                  }
+                });
 
             writer->field("attributes", Attributes(slave->info.attributes()));
 
@@ -1583,19 +1649,49 @@ Future<Response> Http::getOperations(
 
   LOG(INFO) << "Processing GET_OPERATIONS call";
 
-  // TODO(nfnt): Authorize this call (MESOS-8473).
+  return ObjectApprovers::create(slave->authorizer, principal, {VIEW_ROLE})
+    .then(defer(
+        slave->self(),
+        [=](const Owned<ObjectApprovers>& approvers) -> Response {
+          // We consider a principal to be authorized to view an operation if it
+          // is authorized to view the resources the operation is performed on.
+          auto approved = [&approvers](const Operation& operation) {
+            Try<Resources> consumedResources =
+              protobuf::getConsumedResources(operation.info());
 
-  agent::Response response;
-  response.set_type(mesos::agent::Response::GET_OPERATIONS);
+            if (consumedResources.isError()) {
+              LOG(WARNING)
+                << "Could not approve operation " << operation.uuid()
+                << " since its consumed resources could not be determined: "
+                << consumedResources.error();
 
-  agent::Response::GetOperations* operations =
-    response.mutable_get_operations();
+              return false;
+            }
 
-  foreachvalue (Operation* operation, slave->operations) {
-    operations->add_operations()->CopyFrom(*operation);
-  }
+            foreach (const Resource& resource, consumedResources.get()) {
+              if (!approvers->approved<VIEW_ROLE>(resource)) {
+                return false;
+              }
+            }
 
-  return OK(serialize(acceptType, evolve(response)), stringify(acceptType));
+            return true;
+          };
+
+          agent::Response response;
+          response.set_type(mesos::agent::Response::GET_OPERATIONS);
+
+          agent::Response::GetOperations* operations =
+            response.mutable_get_operations();
+
+          foreachvalue (Operation* operation, slave->operations) {
+            if (approved(*operation)) {
+              operations->add_operations()->CopyFrom(*operation);
+            }
+          }
+
+          return OK(
+              serialize(acceptType, evolve(response)), stringify(acceptType));
+        }));
 }
 
 
@@ -1761,6 +1857,17 @@ Future<Response> Http::getAgent(
 
   response.mutable_get_agent()->mutable_slave_info()->CopyFrom(slave->info);
 
+  if (slave->drainConfig.isSome()) {
+    response.mutable_get_agent()->mutable_drain_config()->CopyFrom(
+        slave->drainConfig.get());
+
+    if (slave->estimatedDrainStartTime.isSome()) {
+      response.mutable_get_agent()
+        ->mutable_estimated_drain_start_time()
+        ->set_nanoseconds(Seconds(slave->estimatedDrainStartTime->secs()).ns());
+    }
+  }
+
   return OK(serialize(acceptType, evolve(response)),
             stringify(acceptType));
 }
@@ -1775,27 +1882,36 @@ Future<Response> Http::getResourceProviders(
 
   LOG(INFO) << "Processing GET_RESOURCE_PROVIDERS call";
 
-  // TODO(nfnt): Authorize this call (MESOS-8314).
+  return ObjectApprovers::create(
+      slave->authorizer, principal, {VIEW_RESOURCE_PROVIDER})
+    .then(defer(
+        slave->self(),
+        [this, acceptType](
+            const Owned<ObjectApprovers>& approvers) -> Response {
+          agent::Response response;
+          response.set_type(mesos::agent::Response::GET_RESOURCE_PROVIDERS);
 
-  agent::Response response;
-  response.set_type(mesos::agent::Response::GET_RESOURCE_PROVIDERS);
+          agent::Response::GetResourceProviders* resourceProviders =
+            response.mutable_get_resource_providers();
 
-  agent::Response::GetResourceProviders* resourceProviders =
-    response.mutable_get_resource_providers();
+          foreachvalue (
+              ResourceProvider* resourceProvider, slave->resourceProviders) {
+            if (!approvers->approved<VIEW_RESOURCE_PROVIDER>()) {
+              continue;
+            }
+            agent::Response::GetResourceProviders::ResourceProvider* provider =
+              resourceProviders->add_resource_providers();
 
-  foreachvalue (ResourceProvider* resourceProvider,
-                slave->resourceProviders) {
-    agent::Response::GetResourceProviders::ResourceProvider* provider =
-      resourceProviders->add_resource_providers();
+            provider->mutable_resource_provider_info()->CopyFrom(
+                resourceProvider->info);
 
-    provider->mutable_resource_provider_info()
-      ->CopyFrom(resourceProvider->info);
+            provider->mutable_total_resources()->CopyFrom(
+                resourceProvider->totalResources);
+          }
 
-    provider->mutable_total_resources()->CopyFrom(
-        resourceProvider->totalResources);
-  }
-
-  return OK(serialize(acceptType, evolve(response)), stringify(acceptType));
+          return OK(
+              serialize(acceptType, evolve(response)), stringify(acceptType));
+        }));
 }
 
 
@@ -2043,21 +2159,11 @@ Future<Response> Http::getContainers(
               call.get_containers().show_nested(),
               call.get_containers().show_standalone());
         }))
-    .then([acceptType](const Future<JSON::Array>& result) -> Response {
-      if (!result.isReady()) {
-        LOG(WARNING) << "Could not collect container status and statistics: "
-                     << (result.isFailed()
-                          ? result.failure()
-                          : "Discarded");
-        return result.isFailed()
-          ? InternalServerError(result.failure())
-          : InternalServerError();
-      }
-
+    .then([acceptType](const JSON::Array& result) -> Response {
       return OK(
           serialize(
               acceptType,
-              evolve<v1::agent::Response::GET_CONTAINERS>(result.get())),
+              evolve<v1::agent::Response::GET_CONTAINERS>(result)),
           stringify(acceptType));
     });
 }
@@ -2084,20 +2190,8 @@ Future<Response> Http::_containers(
               false,
               false);
         }))
-    .then([request](const Future<JSON::Array>& result) -> Response {
-      if (!result.isReady()) {
-        LOG(WARNING) << "Could not collect container status and statistics: "
-                     << (result.isFailed()
-                         ? result.failure()
-                         : "Discarded");
-
-        return result.isFailed()
-            ? InternalServerError(result.failure())
-            : InternalServerError();
-      }
-
-      return process::http::OK(
-          result.get(), request.url.query.get("jsonp"));
+    .then([request](const JSON::Array& result) -> Response {
+      return process::http::OK(result, request.url.query.get("jsonp"));
     });
 }
 
@@ -2110,9 +2204,9 @@ Future<JSON::Array> Http::__containers(
 {
   return slave->containerizer->containers()
     .then(defer(slave->self(), [=](const hashset<ContainerID> containerIds) {
-      Owned<list<JSON::Object>> metadata(new list<JSON::Object>());
-      list<Future<ContainerStatus>> statusFutures;
-      list<Future<ResourceStatistics>> statsFutures;
+      Owned<vector<JSON::Object>> metadata(new vector<JSON::Object>());
+      vector<Future<ContainerStatus>> statusFutures;
+      vector<Future<ResourceStatistics>> statsFutures;
 
       hashset<ContainerID> executorContainerIds;
       hashset<ContainerID> authorizedExecutorContainerIds;
@@ -2191,7 +2285,7 @@ Future<JSON::Array> Http::__containers(
         }
 
         if (isRootContainerStandalone &&
-            !approvers->approved<VIEW_STANDALONE_CONTAINER>()) {
+            !approvers->approved<VIEW_STANDALONE_CONTAINER>(rootContainerId)) {
           continue;
         }
 
@@ -2210,13 +2304,13 @@ Future<JSON::Array> Http::__containers(
 
       return await(await(statusFutures), await(statsFutures)).then(
           [metadata](const tuple<
-              Future<list<Future<ContainerStatus>>>,
-              Future<list<Future<ResourceStatistics>>>>& t)
+              Future<vector<Future<ContainerStatus>>>,
+              Future<vector<Future<ResourceStatistics>>>>& t)
               -> Future<JSON::Array> {
-            const list<Future<ContainerStatus>>& status =
+            const vector<Future<ContainerStatus>>& status =
               std::get<0>(t).get();
 
-            const list<Future<ResourceStatistics>>& stats =
+            const vector<Future<ResourceStatistics>>& stats =
               std::get<1>(t).get();
 
             CHECK_EQ(status.size(), stats.size());
@@ -2271,6 +2365,100 @@ Future<JSON::Array> Http::__containers(
 }
 
 
+string Http::CONTAINERIZER_DEBUG_HELP()
+{
+  return HELP(
+      TLDR(
+          "Retrieve debug information for the Mesos containerizer."),
+      DESCRIPTION(
+          "Returns a list of pending operations related to Mesos",
+          "containerizer. This endpoint can help investigating",
+          "container stuck issues.",
+          "",
+          "**Note**: There is no fixed schema for a pending operation.",
+          "Thereby, the output of this endpoint should not be used by",
+          "automated tools.",
+          "",
+          "Example (**Note**: this is not exhaustive):",
+          "",
+          "```",
+          "{",
+          "    \"pending\":[",
+          "        {",
+          "            \"operation\":\"network/cni::attach\",",
+          "            \"args\":{",
+          "                \"containerId\":\"container\"",
+          "            }",
+          "        }",
+          "    ]",
+          "}",
+          "```"),
+      AUTHENTICATION(true));
+}
+
+
+Future<Response> Http::containerizerDebug(
+    const Request& request,
+    const Option<Principal>& principal) const
+{
+  // TODO(a10gupta): Remove check for enabled
+  // authorization as part of MESOS-5346.
+  if (request.method != "GET" && slave->authorizer.isSome()) {
+    return MethodNotAllowed({"GET"}, request.method);
+  }
+
+  Try<string> endpoint = extractEndpoint(request.url);
+  if (endpoint.isError()) {
+    return Failure("Failed to extract endpoint: " + endpoint.error());
+  }
+
+  return authorizeEndpoint(
+      endpoint.get(),
+      request.method,
+      slave->authorizer,
+      principal)
+    .then(defer(
+        slave->self(),
+        [this, request](bool authorized) -> Future<Response> {
+          if (!authorized) {
+            return Forbidden();
+          }
+
+          return _containerizerDebug()
+           .then([request](const JSON::Object& result) -> Response {
+              return process::http::OK(result, request.url.query.get("jsonp"));
+           });
+        }));
+}
+
+
+Future<JSON::Object> Http::_containerizerDebug() const
+{
+  return slave->futureTracker->pendingFutures().then(
+      defer(slave->self(), [](const vector<FutureMetadata>& pending) {
+        JSON::Object result;
+
+        JSON::Array futures;
+        foreach (const FutureMetadata& metadata, pending) {
+          if (metadata.component != COMPONENT_NAME_CONTAINERIZER) {
+            continue;
+          }
+
+          JSON::Object args;
+          foreachpair (const string& key, const string& value, metadata.args) {
+            args.values[key] = JSON::String(value);
+          }
+
+          futures.values.emplace_back(JSON::Object{
+              {"operation", JSON::String(metadata.operation)}, {"args", args}});
+        }
+        result.values["pending"] = std::move(futures);
+
+        return result;
+      }));
+}
+
+
 Future<Response> Http::pruneImages(
     const agent::Call& call,
     ContentType acceptType,
@@ -2300,23 +2488,7 @@ Future<Response> Http::pruneImages(
           }
 
           return slave->containerizer->pruneImages(excludedImages)
-            .then([](const Future<Nothing>& result) -> Response {
-                if (!result.isReady()) {
-                  // TODO(zhitao): Because `containerizer::pruneImages` returns
-                  // a `Nothing` now, we cannot distinguish between actual
-                  // failure or the case that operator should drain the agent.
-                  // Consider returning more information.
-                  LOG(WARNING)
-                      << "Failed to prune images: "
-                      << (result.isFailed() ? result.failure() : "discarded");
-
-                  return result.isFailed()
-                      ? InternalServerError(result.failure())
-                      : InternalServerError();
-                }
-
-                return OK();
-              });
+            .then([]() -> Response { return OK(); });
         }));
 }
 
@@ -2482,11 +2654,9 @@ Future<Response> Http::_launchContainer(
     const Option<Resources>& resources,
     const Option<ContainerInfo>& containerInfo,
     const Option<ContainerClass>& containerClass,
-    ContentType acceptType,
+    ContentType,
     const Owned<ObjectApprovers>& approvers) const
 {
-  Option<string> user;
-
   // Attempt to get the executor associated with this ContainerID.
   // We only expect to get the executor when launching a nested container
   // under a container launched via a scheduler. In other cases, we are
@@ -2504,24 +2674,14 @@ Future<Response> Http::_launchContainer(
             executor->info, framework->info, commandInfo, containerId)) {
       return Forbidden();
     }
-
-    // By default, we use the executor's user.
-    // The CommandInfo can override it, if specified.
-    user = executor->user;
   }
 
   ContainerConfig containerConfig;
   containerConfig.mutable_command_info()->CopyFrom(commandInfo);
 
 #ifndef __WINDOWS__
-  if (slave->flags.switch_user) {
-    if (commandInfo.has_user()) {
-      user = commandInfo.user();
-    }
-
-    if (user.isSome()) {
-      containerConfig.set_user(user.get());
-    }
+  if (slave->flags.switch_user && commandInfo.has_user()) {
+    containerConfig.set_user(commandInfo.user());
   }
 #endif // __WINDOWS__
 
@@ -3014,15 +3174,7 @@ Future<Response> Http::_removeContainer(
   Future<Nothing> remove = slave->containerizer->remove(containerId);
 
   return remove
-    .then([=](const Future<Nothing>& result) -> Response {
-      if (result.isFailed()) {
-        LOG(ERROR) << "Failed to remove container " << containerId
-                   << ": " << result.failure();
-        return InternalServerError(result.failure());
-      }
-
-      return OK();
-    });
+    .then([=]() -> Response { return OK(); });
 }
 
 
@@ -3039,10 +3191,8 @@ Future<Response> Http::_attachContainerInput(
 
   CHECK_SOME(mediaTypes.messageContent);
   auto encoder = [mediaTypes](const mesos::agent::Call& call) {
-    ::recordio::Encoder<mesos::agent::Call> encoder(lambda::bind(
-        serialize, mediaTypes.messageContent.get(), lambda::_1));
-
-    return encoder.encode(call);
+    string record = serialize(mediaTypes.messageContent.get(), call);
+    return ::recordio::encode(record);
   };
 
   // Write the first record. We had extracted it from the `decoder`
@@ -3054,8 +3204,8 @@ Future<Response> Http::_attachContainerInput(
       std::move(decoder), encoder, writer);
 
   return slave->containerizer->attach(containerId)
-    .then([mediaTypes, reader, writer, transform](
-        Connection connection) mutable {
+    .then(defer(slave->self(), [=](
+        Connection connection) mutable -> Future<Response> {
       Request request;
       request.method = "POST";
       request.type = Request::PIPE;
@@ -3082,6 +3232,43 @@ Future<Response> Http::_attachContainerInput(
 
           writer.close();
          });
+
+      // This is a non Keep-Alive request which means the connection
+      // will be closed when the response is received. Since the
+      // 'Connection' is reference-counted, we must maintain a copy
+      // until the disconnection occurs.
+      connection.disconnected()
+        .onAny([connection]() {});
+
+      return connection.send(request)
+        .onAny(defer(
+            slave->self(),
+            [=](const Future<Response>&) {
+              // After we have received a response for `ATTACH_CONTAINER_INPUT`
+              // call, we need to send an acknowledgment to the IOSwitchboard,
+              // so that the IOSwitchboard process can terminate itself. This is
+              // a workaround for the problem with dropping outstanding HTTP
+              // responses due to a lack of graceful shutdown in libprocess.
+              acknowledgeContainerInputResponse(containerId)
+                .onFailed([containerId](const string& failure) {
+                  LOG(ERROR) << "Failed to send an acknowledgment to the"
+                             << " IOSwitchboard for container '"
+                             << containerId << "': " << failure;
+              });
+            }));
+    }));
+}
+
+
+Future<Response> Http::acknowledgeContainerInputResponse(
+    const ContainerID& containerId) const {
+  return slave->containerizer->attach(containerId)
+    .then([](Connection connection) {
+      Request request;
+      request.method = "POST";
+      request.type = Request::BODY;
+      request.url.domain = "";
+      request.url.path = "/acknowledge_container_input_response";
 
       // This is a non Keep-Alive request which means the connection
       // will be closed when the response is received. Since the
@@ -3156,10 +3343,14 @@ Future<Response> Http::addResourceProviderConfig(
   CHECK_EQ(mesos::agent::Call::ADD_RESOURCE_PROVIDER_CONFIG, call.type());
   CHECK(call.has_add_resource_provider_config());
 
+  const ResourceProviderInfo& info = call.add_resource_provider_config().info();
+
+  LOG(INFO)
+    << "Processing ADD_RESOURCE_PROVIDER_CONFIG call with"
+    << " type '" << info.type() << "' and name '" << info.name() << "'";
+
   return ObjectApprovers::create(
-      slave->authorizer,
-      principal,
-      {MODIFY_RESOURCE_PROVIDER_CONFIG})
+             slave->authorizer, principal, {MODIFY_RESOURCE_PROVIDER_CONFIG})
     .then(defer(
         slave->self(),
         [=](const Owned<ObjectApprovers>& approvers) -> Future<Response> {
@@ -3167,29 +3358,24 @@ Future<Response> Http::addResourceProviderConfig(
             return Forbidden();
           }
 
-          const ResourceProviderInfo& info =
-              call.add_resource_provider_config().info();
-
-          LOG(INFO)
-              << "Processing ADD_RESOURCE_PROVIDER_CONFIG call with type '"
-              << info.type() << "' and name '" << info.name() << "'";
+          Option<Error> error = LocalResourceProvider::validate(info);
+          if (error.isSome()) {
+            return BadRequest(
+                "Failed to validate resource provider config with type '" +
+                info.type() + "' and name '" + info.name() + "': " +
+                error->message);
+          }
 
           return slave->localResourceProviderDaemon->add(info)
-            .then([](bool added) -> Response {
+            .then([info](bool added) -> Response {
               if (!added) {
-                return Conflict();
+                return Conflict(
+                    "Resource provider with type '" + info.type() +
+                    "' and name '" + info.name() + "' already exists");
               }
 
               return OK();
-            })
-            .repair([info](const Future<Response>& future) {
-                LOG(ERROR)
-                    << "Failed to add resource provider config with type '"
-                    << info.type() << "' and name '" << info.name() << "': "
-                    << future.failure();
-
-                return InternalServerError(future.failure());
-              });
+            });
         }));
 }
 
@@ -3201,6 +3387,13 @@ Future<Response> Http::updateResourceProviderConfig(
   CHECK_EQ(mesos::agent::Call::UPDATE_RESOURCE_PROVIDER_CONFIG, call.type());
   CHECK(call.has_update_resource_provider_config());
 
+  const ResourceProviderInfo& info =
+    call.update_resource_provider_config().info();
+
+  LOG(INFO)
+    << "Processing UPDATE_RESOURCE_PROVIDER_CONFIG call with"
+    << " type '" << info.type() << "' and name '" << info.name() << "'";
+
   return ObjectApprovers::create(
       slave->authorizer,
       principal,
@@ -3212,29 +3405,24 @@ Future<Response> Http::updateResourceProviderConfig(
             return Forbidden();
           }
 
-          const ResourceProviderInfo& info =
-              call.update_resource_provider_config().info();
-
-          LOG(INFO)
-              << "Processing UPDATE_RESOURCE_PROVIDER_CONFIG call with type '"
-              << info.type() << "' and name '" << info.name() << "'";
+          Option<Error> error = LocalResourceProvider::validate(info);
+          if (error.isSome()) {
+            return BadRequest(
+                "Failed to validate resource provider config with type '" +
+                info.type() + "' and name '" + info.name() + "': " +
+                error->message);
+          }
 
           return slave->localResourceProviderDaemon->update(info)
-            .then([](bool updated) -> Response {
+            .then([info](bool updated) -> Response {
               if (!updated) {
-                return NotFound();
+                return Conflict(
+                    "Resource provider with type '" + info.type() +
+                    "' and name '" + info.name() + "' does not exist");
               }
 
               return OK();
-            })
-            .repair([info](const Future<Response>& future) {
-                LOG(ERROR)
-                    << "Failed to update resource provider config with type '"
-                    << info.type() << "' and name '" << info.name() << "': "
-                    << future.failure();
-
-                return InternalServerError(future.failure());
-              });
+            });
         }));
 }
 
@@ -3246,6 +3434,13 @@ Future<Response> Http::removeResourceProviderConfig(
   CHECK_EQ(mesos::agent::Call::REMOVE_RESOURCE_PROVIDER_CONFIG, call.type());
   CHECK(call.has_remove_resource_provider_config());
 
+  const string& type = call.remove_resource_provider_config().type();
+  const string& name = call.remove_resource_provider_config().name();
+
+  LOG(INFO)
+    << "Processing REMOVE_RESOURCE_PROVIDER_CONFIG call with"
+    << " type '" << type << "' and name '" << name << "'";
+
   return ObjectApprovers::create(
       slave->authorizer,
       principal,
@@ -3257,29 +3452,42 @@ Future<Response> Http::removeResourceProviderConfig(
             return Forbidden();
           }
 
-          const string& type = call.remove_resource_provider_config().type();
-          const string& name = call.remove_resource_provider_config().name();
-
-          LOG(INFO)
-              << "Processing REMOVE_RESOURCE_PROVIDER_CONFIG call with type '"
-              << type << "' and name '" << name << "'";
-
           return slave->localResourceProviderDaemon->remove(type, name)
-            .then([]() -> Response {
-              // Config removal is always successful due to idempotency.
-              return OK();
-            })
-            .repair([type, name](const Future<Response>& future) {
-              LOG(ERROR)
-                  << "Failed to remove resource provider config with type '"
-                  << type << "' and name '" << name << "': "
-                  << future.failure();
-
-              return InternalServerError(future.failure());
-            });
+            .then([]() -> Response { return OK(); });
       }));
 }
 
+
+Future<Response> Http::markResourceProviderGone(
+    const mesos::agent::Call& call,
+    const Option<Principal>& principal) const
+{
+  CHECK_EQ(mesos::agent::Call::MARK_RESOURCE_PROVIDER_GONE, call.type());
+  CHECK(call.has_mark_resource_provider_gone());
+
+  const ResourceProviderID& resourceProviderId =
+    call.mark_resource_provider_gone().resource_provider_id();
+
+  LOG(INFO)
+    << "Processing MARK_RESOURCE_PROVIDER_GONE for resource provider "
+    << resourceProviderId;
+
+  return ObjectApprovers::create(
+      slave->authorizer, principal, {MARK_RESOURCE_PROVIDER_GONE})
+    .then(defer(
+        slave->self(),
+        [this, resourceProviderId](
+            const Owned<ObjectApprovers>& approvers) -> Future<Response> {
+          if (!approvers->approved<MARK_RESOURCE_PROVIDER_GONE>()) {
+            return Forbidden();
+          }
+
+          return slave->markResourceProviderGone(resourceProviderId)
+            .then([](const Future<Nothing>&) -> Future<Response> {
+              return OK();
+            });
+        }));
+}
 
 // Helper that reads data from `writer` and writes to `reader`.
 // Returns a failed future if there are any errors reading or writing.
@@ -3518,17 +3726,18 @@ Future<Response> Http::_attachContainerOutput(
           CHECK_SOME(response.reader);
           Pipe::Reader reader = response.reader.get();
 
-          auto deserializer = lambda::bind(
-              deserialize<ProcessIO>, messageContentType, lambda::_1);
-
           Owned<Reader<ProcessIO>> decoder(new Reader<ProcessIO>(
-              Decoder<ProcessIO>(deserializer), reader));
+              lambda::bind(
+                  deserialize<ProcessIO>,
+                  messageContentType,
+                  lambda::_1),
+              reader));
 
           auto encoder = [messageContentType](const ProcessIO& processIO) {
-            ::recordio::Encoder<v1::agent::ProcessIO> encoder (lambda::bind(
-                serialize, messageContentType, lambda::_1));
+            v1::agent::ProcessIO evolved = evolve(processIO);
+            string record = serialize(messageContentType, evolved);
 
-            return encoder.encode(evolve(processIO));
+            return ::recordio::encode(record);
           };
 
           recordio::transform<ProcessIO>(std::move(decoder), encoder, writer)

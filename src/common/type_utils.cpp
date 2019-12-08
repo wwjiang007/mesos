@@ -80,9 +80,13 @@ bool operator==(const CommandInfo& left, const CommandInfo& right)
 
 bool operator==(const CommandInfo::URI& left, const CommandInfo::URI& right)
 {
+  // NOTE: We purposefully do not compare the value of the `cache` field
+  // because a URI downloaded from source or from the fetcher cache should
+  // be considered identical.
   return left.value() == right.value() &&
     left.executable() == right.executable() &&
-    left.extract() == right.extract();
+    left.extract() == right.extract() &&
+    left.output_file() == right.output_file();
 }
 
 
@@ -396,6 +400,18 @@ bool operator!=(const ExecutorInfo& left, const ExecutorInfo& right)
 }
 
 
+bool operator==(const HealthCheck& left, const HealthCheck& right)
+{
+  return google::protobuf::util::MessageDifferencer::Equals(left, right);
+}
+
+
+bool operator==(const KillPolicy& left, const KillPolicy& right)
+{
+  return google::protobuf::util::MessageDifferencer::Equals(left, right);
+}
+
+
 bool operator==(const MasterInfo& left, const MasterInfo& right)
 {
   return left.id() == right.id() &&
@@ -488,6 +504,23 @@ bool operator==(const OperationStatus& left, const OperationStatus& right)
     return false;
   }
 
+  if (left.has_slave_id() != right.has_slave_id()) {
+    return false;
+  }
+
+  if (left.has_slave_id() && left.slave_id() != right.slave_id()) {
+    return false;
+  }
+
+  if (left.has_resource_provider_id() != right.has_resource_provider_id()) {
+    return false;
+  }
+
+  if (left.has_resource_provider_id() &&
+      left.resource_provider_id() != right.resource_provider_id()) {
+    return false;
+  }
+
   return true;
 }
 
@@ -554,7 +587,10 @@ bool operator==(const Task& left, const Task& right)
     left.status_update_uuid() == right.status_update_uuid() &&
     left.labels() == right.labels() &&
     left.discovery() == right.discovery() &&
-    left.user() == right.user();
+    left.user() == right.user() &&
+    left.container() == right.container() &&
+    left.health_check() == right.health_check() &&
+    left.kill_policy() == right.kill_policy();
 }
 
 
@@ -633,6 +669,18 @@ ostream& operator<<(ostream& stream, const CapabilityInfo& capabilityInfo)
 ostream& operator<<(ostream& stream, const DeviceWhitelist& deviceWhitelist)
 {
   return stream << JSON::protobuf(deviceWhitelist);
+}
+
+
+ostream& operator<<(ostream& stream, const DrainConfig& drainConfig)
+{
+  return stream << JSON::protobuf(drainConfig);
+}
+
+
+ostream& operator<<(ostream& stream, const DrainState& state)
+{
+  return stream << DrainState_Name(state);
 }
 
 
@@ -744,6 +792,35 @@ ostream& operator<<(ostream& stream, const OperationID& operationId)
 ostream& operator<<(ostream& stream, const OperationState& state)
 {
   return stream << OperationState_Name(state);
+}
+
+
+ostream& operator<<(ostream& stream, const Operation& operation)
+{
+  stream << operation.uuid() << " (";
+
+  stream << operation.info().type();
+
+  if (operation.has_framework_id()) {
+    stream << " for framework " << operation.framework_id();
+  }
+
+  if (operation.info().has_id()) {
+    stream << ", ID: " << operation.info().id();
+  }
+
+  const OperationStatus& latestStatus(operation.latest_status());
+
+  if (latestStatus.has_resource_provider_id()) {
+    stream << ", affecting resource provider "
+           << latestStatus.resource_provider_id();
+  }
+
+  stream << ", latest state: " << latestStatus.state();
+
+  stream << ")";
+
+  return stream;
 }
 
 

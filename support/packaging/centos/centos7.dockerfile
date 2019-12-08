@@ -11,9 +11,9 @@ RUN yum install -y              \
 
 # Add the Subversion repo.
 RUN echo -e '[WANdiscoSVN]\n\
-name=WANdisco SVN Repo 1.9\n\
+name=WANdisco SVN Repo 1.11\n\
 enabled=1\n\
-baseurl=http://opensource.wandisco.com/centos/7/svn-1.9/RPMS/\$basearch/\n\
+baseurl=http://opensource.wandisco.com/centos/7/svn-1.11/RPMS/\$basearch/\n\
 gpgcheck=1\n\
 gpgkey=http://opensource.wandisco.com/RPM-GPG-KEY-WANdisco' \
 >> /etc/yum.repos.d/wandisco-svn.repo
@@ -33,3 +33,12 @@ ADD mesos.spec /mesos.spec
 
 RUN yum makecache && \
     yum-builddep -y /mesos.spec
+
+ADD user-init.sh /user-init.sh
+
+ARG USER_NAME=root
+ARG USER_ID=0
+ARG GROUP_NAME=root
+ARG GROUP_ID=0
+
+RUN /user-init.sh $USER_NAME $USER_ID $GROUP_NAME $GROUP_ID

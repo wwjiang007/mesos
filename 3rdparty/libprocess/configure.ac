@@ -105,11 +105,6 @@ AC_ARG_ENABLE([debug],
                               option won't change them default: no]),
               [], [enable_debug=no])
 
-AC_ARG_ENABLE([grpc],
-              AS_HELP_STRING([--enable-grpc],
-                             [enable grpc support]),
-              [], [enable_grpc=no])
-
 AC_ARG_ENABLE([install],
               AS_HELP_STRING([--enable-install],
                              [install libprocess]),
@@ -217,7 +212,7 @@ AC_ARG_WITH([libev],
 AC_ARG_WITH([libevent],
             AS_HELP_STRING([--with-libevent=@<:@=DIR@:>@],
                            [specify where to locate the libevent library]),
-            [], [])
+            [without_bundled_libevent=yes], [])
 
 AC_ARG_WITH([picojson],
             AS_HELP_STRING([--with-picojson@<:@=DIR@:>@],
@@ -225,6 +220,13 @@ AC_ARG_WITH([picojson],
                            package in lieu of an installed version at a
                            location prefixed by the given path]),
             [without_bundled_picojson=yes], [])
+
+AC_ARG_WITH([rapidjson],
+            AS_HELP_STRING([--with-rapidjson@<:@=DIR@:>@],
+                           [excludes building and using the bundled rapidjson
+                           package in lieu of an installed version at a
+                           location prefixed by the given path]),
+            [without_bundled_rapidjson=yes], [])
 
 AC_ARG_WITH([protobuf],
             AS_HELP_STRING([--with-protobuf@<:@=DIR@:>@],
@@ -280,30 +282,12 @@ AM_CONDITIONAL([ENABLE_HARDENING], [test x"$enable_hardening" = "xyes"])
 
 AS_CASE($ax_cv_cxx_compiler_vendor,
   [clang], [
-    # Check if -Wno-unused-local-typedef is needed by checking a sample
-    # compilation which contains a local unused typedef.
-    # This is needed because Boost 1.53.0 fails to compile with upstream
-    # Clang 3.6 without -Wno-unused-local-typedef. Apple LLVM based on
-    # Clang 3.6 doesn't have the same behavior.
-    AC_LANG_PUSH([C++])
-    AC_COMPILE_IFELSE(
-    [AC_LANG_SOURCE([[
-      #pragma clang diagnostic error "-Wunused-local-typedef"
-
-      int foo()
-      {
-        typedef int return_type;
-        return 5;
-      }
-    ]])],
-    [warn_local_typedefs=no], [warn_local_typedefs=yes])
-    AC_LANG_POP([C++])
-
-    if test "x$warn_local_typedefs" = "xyes"; then
-      AC_MSG_NOTICE([Disabling warnings about unused local typedefs])
-      CXXFLAGS="${CXXFLAGS} -Wno-unused-local-typedef"
-    fi
-
+    # Upstream Clang 3.6 emits `-Wunused-local-typedef` warnings when compiling
+    # Boost so we suppress them here. Apple LLVM based on Clang 3.6 doesn't have
+    # the same behavior. See: https://reviews.apache.org/r/32749/
+    # NOTE(chhsiao): Clang 3.6.0 from the link below seems to compile Boost
+    # 1.53.0/1.65.0 just fine: http://releases.llvm.org/download.html#3.6.0
+    AX_APPEND_COMPILE_FLAGS([-Wno-unused-local-typedef], [CXXFLAGS], [-Werror])
   ], [gnu], [
     # Check for GCC version >= 4.8.
     AX_COMPARE_VERSION([$ax_cv_cxx_compiler_version], [ge], [4.8],
@@ -314,9 +298,8 @@ AS_CASE($ax_cv_cxx_compiler_vendor,
     fi
 
     AC_MSG_NOTICE([Setting up CXXFLAGS for g++ version >= 4.8])
-    # Boost 1.53.0 fails to compile with GCC 4.8 without
-    # -Wno-unused-local-typedefs, and automake does not recognize the
-    # flag.
+    # Boost fails to compile with GCC 4.8+ without `-Wno-unused-local-typedefs`,
+    # and automake does not recognize the flag.
     # TODO(brenden): Remove this when Boost has a resolution.
     CFLAGS="${CFLAGS} -Wno-unused-local-typedefs"
     CXXFLAGS="${CXXFLAGS} -Wno-unused-local-typedefs"
@@ -446,7 +429,7 @@ AM_CONDITIONAL([OPTIMIZE], [test x"$enable_optimize" = "xyes"])
 
 debug_flags="-g1"
 if test "x$enable_debug" = "xyes"; then
-  debug_flags="-g"
+  debug_flags="-g -fno-omit-frame-pointer"
 elif test "x$enable_optimize" = "xyes"; then
   debug_flags=""
 fi
@@ -576,7 +559,7 @@ you provided is correct if you're already doing this.
 ])
   fi
 else
-  with_bundled_boost=yes
+  with_bundled_concurrentqueue=yes
 fi
 
 AM_CONDITIONAL([WITH_BUNDLED_CONCURRENTQUEUE],
@@ -616,7 +599,7 @@ if test "x$without_bundled_elfio" = "xyes" || \
      CPPFLAGS="-I${with_elfio} $CPPFLAGS"
   fi
 
-  AC_CHECK_HEADERS([elfio/elfio.h], [],
+  AC_CHECK_HEADERS([elfio/elfio.hpp], [],
                    [AC_MSG_ERROR([Cannot find the ELFIO headers
 -------------------------------------------------------------------
 You have requested the use of a non-bundled ELFIO but no suitable
@@ -815,38 +798,21 @@ if test -n "`echo $with_libevent`"; then
 fi
 
 if test "x$enable_libevent" = "xyes"; then
-  AC_CHECK_HEADERS([event2/event.h],
-                   [AC_CHECK_LIB([event],
-                                 [event_base_new],
-                                 [],
-                                 [AC_MSG_ERROR([cannot find libevent
--------------------------------------------------------------------
-libevent version 2+ is required for libprocess to build.
--------------------------------------------------------------------
-                                 ])])],
-                   [AC_MSG_ERROR([cannot find libevent headers
--------------------------------------------------------------------
-libevent version 2+ headers are required for libprocess to build.
--------------------------------------------------------------------
-  ])])
-
-  AC_CHECK_HEADERS([event2/thread.h],
-                   [AC_CHECK_LIB([event_pthreads],
-                                 [evthread_use_pthreads],
-                                 [],
-                                 [AC_MSG_ERROR([cannot find libevent_pthreads
--------------------------------------------------------------------
-libevent_pthreads version 2+ is required for libprocess to build.
--------------------------------------------------------------------
-                                 ])])],
-                   [AC_MSG_ERROR([cannot find libevent_pthreads headers
--------------------------------------------------------------------
-libevent_pthreads version 2+ headers are required for libprocess to build.
--------------------------------------------------------------------
-  ])])
+  # Check if user has asked us to use a preinstalled libevent, or if they
+  # asked us to ignore all bundled libraries while compiling and
+  # linking.
+  if test "x$without_bundled_libevent" = "xyes" || \
+     test "x$enable_bundled" != "xyes"; then
+     MESOS_HAVE_LIBEVENT()
+  else
+    with_bundled_libevent=yes
+  fi
 fi
 
-AM_CONDITIONAL([ENABLE_LIBEVENT], [test x"$enable_libevent" = "xyes"])
+AM_CONDITIONAL([ENABLE_LIBEVENT],
+               [test x"$enable_libevent" = "xyes"])
+AM_CONDITIONAL([WITH_BUNDLED_LIBEVENT],
+               [test "x$with_bundled_libevent" = "xyes"])
 
 
 if test -n "`echo $with_picojson`"; then
@@ -880,6 +846,39 @@ else
 fi
 
 AM_CONDITIONAL([WITH_BUNDLED_PICOJSON], [test "x$with_bundled_picojson" = "xyes"])
+
+
+if test -n "`echo $with_rapidjson`"; then
+  CPPFLAGS="$CPPFLAGS -I${with_rapidjson}/include"
+fi
+
+# Check if user has asked us to use a preinstalled rapidjson, or if
+# they asked us to ignore all bundled libraries while compiling and
+# linking.
+if test "x$without_bundled_rapidjson" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Check if headers and library were located.
+  AC_CHECK_HEADERS([rapidjson/rapidjson.h], [found_rapidjson=yes])
+
+  if test "x$found_rapidjson" = "xyes"; then
+    with_bundled_rapidjson=no
+  else
+    AC_MSG_ERROR([cannot find rapidjson
+-------------------------------------------------------------------
+You have requested the use of a non-bundled rapidjson but no suitable
+rapidjson could be found.
+
+You may want specify the location of rapidjson by providing a prefix
+path via --with-rapidjson=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+  fi
+else
+  with_bundled_rapidjson=yes
+fi
+
+AM_CONDITIONAL([WITH_BUNDLED_RAPIDJSON], [test "x$with_bundled_rapidjson" = "xyes"])
 
 
 if test -n "`echo $with_protobuf`"; then
@@ -999,27 +998,17 @@ libcrypto is required for an SSL-enabled build.
   LIBS="-lssl -lcrypto $LIBS"
 
   if test "x$enable_libevent" = "xyes"; then
-    AC_CHECK_HEADERS([event2/bufferevent_ssl.h],
-                     [AC_CHECK_LIB([event_openssl],
-                                   [bufferevent_openssl_get_ssl],
-                                   [],
-                                   [AC_MSG_ERROR([cannot find libevent_openssl
--------------------------------------------------------------------
-libevent_openssl version 2+ is required for an SSL-enabled build.
--------------------------------------------------------------------
-                                   ])])],
-                     [AC_MSG_ERROR([cannot find libevent_openssl headers
--------------------------------------------------------------------
-libevent_openssl version 2+ headers are required for an SSL-enabled build.
--------------------------------------------------------------------
-    ])])
+    if test "x$with_bundled_libevent" != "xyes"; then
+      MESOS_HAVE_LIBEVENT_SSL()
+    fi
   else
     AC_MSG_ERROR([SSL is currently only supported with libevent])
   fi
   AC_DEFINE([USE_SSL_SOCKET], [1])
 fi
 
-AM_CONDITIONAL([ENABLE_SSL], [test x"$enable_ssl" = "xyes"])
+AM_CONDITIONAL([ENABLE_SSL],
+               [test x"$enable_ssl" = "xyes"])
 
 AC_SUBST([SSL_CPPFLAGS])
 AC_SUBST([SSL_LINKERFLAGS])
@@ -1148,48 +1137,51 @@ location of protobuf used by grpc by providing a prefix path via
   LDFLAGS="$LDFLAGS -L${with_grpc}/lib"
 fi
 
-if test "x$enable_grpc" = "xyes"; then
-  # Check if user has asked us to use a preinstalled grpc, or if they
-  # asked us to ignore all bundled libraries while compiling and linking.
-  if test "x$without_bundled_grpc" = "xyes" || \
-     test "x$enable_bundled" != "xyes"; then
-    # Use the system default prefix if not specified.
-    if test -n "`echo $with_grpc`"; then
-      GRPCPREFIX="${with_grpc}"
-    elif test "x$enable_bundled" != "xyes"; then
-      GRPCPREFIX="/usr"
+# Check if user has asked us to use a preinstalled grpc, or if they
+# asked us to ignore all bundled libraries while compiling and linking.
+if test "x$without_bundled_grpc" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Use the system default prefix if not specified.
+  if test -n "`echo $with_grpc`"; then
+    GRPCPREFIX="${with_grpc}"
+  elif test "x$enable_bundled" != "xyes"; then
+    GRPCPREFIX="/usr"
+  fi
+
+  if test "x$enable_ssl" = "xno"; then
+    GRPC_VARIANT="_unsecure"
+  fi
+
+  # Check if headers and library were located.
+  saved_LIBS="$LIBS"
+  LIBS="-lgrpc++$GRPC_VARIANT -lgrpc$GRPC_VARIANT -lgpr $LIBS"
+  AC_LANG_PUSH([C++])
+  AC_CHECK_HEADERS([grpcpp/grpcpp.h],
+                   [AC_LINK_IFELSE(
+                       [AC_LANG_PROGRAM([#include <grpcpp/grpcpp.h>],
+                                        [grpc::Version();])],
+                       [found_grpc=yes],
+                       [found_grpc=no])],
+                   [found_grpc=no])
+  AC_LANG_POP()
+  LIBS="$saved_LIBS"
+
+  if test "x$found_grpc" = "xyes"; then
+    with_bundled_grpc=no
+
+    AC_CHECK_TOOL([GRPC_CXX_PLUGIN_TEST],
+                  [grpc_cpp_plugin],
+                  [],
+                  [$GRPCPREFIX/bin])
+
+    if test -z "`echo $GRPC_CXX_PLUGIN_TEST`"; then
+      AC_MSG_ERROR([grpc_cpp_plugin not found in PATH])
     fi
 
-    # Check if headers and library were located.
-    saved_LIBS="$LIBS"
-    LIBS="-lgrpc++ -lgrpc -lgpr $LIBS"
-    AC_LANG_PUSH([C++])
-    AC_CHECK_HEADERS([grpcpp/grpcpp.h],
-                     [AC_LINK_IFELSE(
-                         [AC_LANG_PROGRAM([#include <grpcpp/grpcpp.h>],
-                                          [grpc::Version();])],
-                         [found_grpc=yes],
-                         [found_grpc=no])],
-                     [found_grpc=no])
-    AC_LANG_POP()
-    LIBS="$saved_LIBS"
+    GRPC_CXX_PLUGIN="$GRPCPREFIX/bin/grpc_cpp_plugin"
 
-    if test "x$found_grpc" = "xyes"; then
-      with_bundled_grpc=no
-
-      AC_CHECK_TOOL([GRPC_CXX_PLUGIN_TEST],
-                    [grpc_cpp_plugin],
-                    [],
-                    [$GRPCPREFIX/bin])
-
-      if test -z "`echo $GRPC_CXX_PLUGIN_TEST`"; then
-        AC_MSG_ERROR([grpc_cpp_plugin not found in PATH])
-      fi
-
-      GRPC_CXX_PLUGIN="$GRPCPREFIX/bin/grpc_cpp_plugin"
-
-    else
-      AC_MSG_ERROR([cannot find grpc
+  else
+    AC_MSG_ERROR([cannot find grpc
 -------------------------------------------------------------------
 You have requested the use of a non-bundled grpc but no suitable
 grpc could be found.
@@ -1198,22 +1190,12 @@ You may want specify the location of grpc by providing a prefix
 path via --with-grpc=DIR, or check that the path you provided is
 correct if you are already doing this.
 -------------------------------------------------------------------
-      ])
-    fi
-  else
-    if test "x$found_ssl" != "xyes"; then
-      AC_MSG_ERROR([cannot find libssl
--------------------------------------------------------------------
-libssl is required for gRPC to build.
--------------------------------------------------------------------
-      ])
-    fi
-
-    with_bundled_grpc=yes
+    ])
   fi
+else
+  with_bundled_grpc=yes
 fi
 
-AM_CONDITIONAL([ENABLE_GRPC], [test "x$enable_grpc" = "xyes"])
 AM_CONDITIONAL([WITH_BUNDLED_GRPC],
                [test "x$with_bundled_grpc" = "xyes"])
 

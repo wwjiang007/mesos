@@ -40,10 +40,16 @@
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
 
+#include <stout/os/chdir.hpp>
+#include <stout/os/close.hpp>
+#include <stout/os/dup.hpp>
+#include <stout/os/fcntl.hpp>
+#include <stout/os/signals.hpp>
+
 #ifdef __WINDOWS__
-#include "subprocess_windows.hpp"
+#include "windows/subprocess.hpp"
 #else
-#include "subprocess_posix.hpp"
+#include "posix/subprocess.hpp"
 #endif // __WINDOWS__
 
 using std::map;
@@ -70,8 +76,9 @@ Subprocess::ChildHook Subprocess::ChildHook::CHDIR(
     const std::string& working_directory)
 {
   return Subprocess::ChildHook([working_directory]() -> Try<Nothing> {
-    if (::chdir(working_directory.c_str()) == -1) {
-      return Error("Could not chdir");
+    const Try<Nothing> result = os::chdir(working_directory);
+    if (result.isError()) {
+      return Error(result.error());
     }
 
     return Nothing();
@@ -103,14 +110,6 @@ Subprocess::ChildHook Subprocess::ChildHook::DUP2(int oldFd, int newFd)
 {
   return Subprocess::ChildHook([oldFd, newFd]() -> Try<Nothing> {
     return os::dup2(oldFd, newFd);
-  });
-}
-
-
-Subprocess::ChildHook Subprocess::ChildHook::UNSET_CLOEXEC(int fd)
-{
-  return Subprocess::ChildHook([fd]() -> Try<Nothing> {
-    return os::unsetCloexec(fd);
   });
 }
 #endif // __WINDOWS__
@@ -324,7 +323,8 @@ Try<Subprocess> subprocess(
     const Option<lambda::function<
         pid_t(const lambda::function<int()>&)>>& _clone,
     const vector<Subprocess::ParentHook>& parent_hooks,
-    const vector<Subprocess::ChildHook>& child_hooks)
+    const vector<Subprocess::ChildHook>& child_hooks,
+    const vector<int_fd>& whitelist_fds)
 {
   // TODO(hausdorff): We should error out on Windows here if we are passing
   // parameters that aren't used.
@@ -406,7 +406,8 @@ Try<Subprocess> subprocess(
         child_hooks,
         stdinfds,
         stdoutfds,
-        stderrfds);
+        stderrfds,
+        whitelist_fds);
 
     if (pid.isError()) {
       return Error(pid.error());
@@ -423,7 +424,8 @@ Try<Subprocess> subprocess(
           parent_hooks,
           stdinfds,
           stdoutfds,
-          stderrfds);
+          stderrfds,
+          whitelist_fds);
 
     if (process_data.isError()) {
       // NOTE: `createChildProcess` either succeeds entirely or returns an
@@ -431,6 +433,9 @@ Try<Subprocess> subprocess(
       return Error(process_data.error());
     }
 
+    // NOTE: We specifically tie the lifetime of the child process to
+    // the `Subprocess` object by saving the handles here so that
+    // there is zero chance of the `pid` getting reused.
     process.data->process_data = process_data.get();
     process.data->pid = process_data->pid;
 #endif // __WINDOWS__

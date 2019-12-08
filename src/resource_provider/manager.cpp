@@ -18,6 +18,7 @@
 
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <glog/logging.h>
 
@@ -32,10 +33,12 @@
 #include <process/id.hpp>
 #include <process/process.hpp>
 
-#include <process/metrics/gauge.hpp>
+#include <process/metrics/counter.hpp>
 #include <process/metrics/metrics.hpp>
+#include <process/metrics/pull_gauge.hpp>
 
 #include <stout/hashmap.hpp>
+#include <stout/nothing.hpp>
 #include <stout/protobuf.hpp>
 #include <stout/uuid.hpp>
 
@@ -47,17 +50,23 @@
 #include "internal/devolve.hpp"
 #include "internal/evolve.hpp"
 
+#include "resource_provider/registry.hpp"
 #include "resource_provider/validation.hpp"
 
 namespace http = process::http;
 
-using std::list;
 using std::string;
+using std::vector;
 
 using mesos::internal::resource_provider::validation::call::validate;
 
+using mesos::resource_provider::AdmitResourceProvider;
 using mesos::resource_provider::Call;
 using mesos::resource_provider::Event;
+using mesos::resource_provider::Registrar;
+using mesos::resource_provider::RemoveResourceProvider;
+
+using mesos::resource_provider::registry::Registry;
 
 using process::Failure;
 using process::Future;
@@ -75,62 +84,41 @@ using process::wait;
 
 using process::http::Accepted;
 using process::http::BadRequest;
-using process::http::OK;
 using process::http::MethodNotAllowed;
 using process::http::NotAcceptable;
 using process::http::NotImplemented;
+using process::http::OK;
 using process::http::Pipe;
 using process::http::UnsupportedMediaType;
 
 using process::http::authentication::Principal;
 
-using process::metrics::Gauge;
+using process::metrics::Counter;
+using process::metrics::PullGauge;
 
 namespace mesos {
 namespace internal {
 
-// Represents the streaming HTTP connection to a resource provider.
-struct HttpConnection
+mesos::resource_provider::registry::ResourceProvider
+createRegistryResourceProvider(const ResourceProviderInfo& resourceProviderInfo)
 {
-  HttpConnection(const http::Pipe::Writer& _writer,
-                 ContentType _contentType,
-                 id::UUID _streamId)
-    : writer(_writer),
-      contentType(_contentType),
-      streamId(_streamId),
-      encoder(lambda::bind(serialize, contentType, lambda::_1)) {}
+  mesos::resource_provider::registry::ResourceProvider resourceProvider;
 
-  // Converts the message to an Event before sending.
-  template <typename Message>
-  bool send(const Message& message)
-  {
-    // We need to evolve the internal 'message' into a
-    // 'v1::resource_provider::Event'.
-    return writer.write(encoder.encode(evolve(message)));
-  }
+  CHECK(resourceProviderInfo.has_id());
+  resourceProvider.mutable_id()->CopyFrom(resourceProviderInfo.id());
 
-  bool close()
-  {
-    return writer.close();
-  }
+  resourceProvider.set_name(resourceProviderInfo.name());
+  resourceProvider.set_type(resourceProviderInfo.type());
 
-  Future<Nothing> closed() const
-  {
-    return writer.readerClosed();
-  }
-
-  http::Pipe::Writer writer;
-  ContentType contentType;
-  id::UUID streamId;
-  ::recordio::Encoder<v1::resource_provider::Event> encoder;
-};
+  return resourceProvider;
+}
 
 
 struct ResourceProvider
 {
   ResourceProvider(
       const ResourceProviderInfo& _info,
-      const HttpConnection& _http)
+      const StreamingHttpConnection<v1::resource_provider::Event>& _http)
     : info(_info),
       http(_http) {}
 
@@ -148,8 +136,8 @@ struct ResourceProvider
   }
 
   ResourceProviderInfo info;
-  HttpConnection http;
-  hashmap<UUID, Owned<Promise<Nothing>>> publishes;
+  StreamingHttpConnection<v1::resource_provider::Event> http;
+  hashmap<id::UUID, Owned<Promise<Nothing>>> publishes;
 };
 
 
@@ -157,7 +145,7 @@ class ResourceProviderManagerProcess
   : public Process<ResourceProviderManagerProcess>
 {
 public:
-  ResourceProviderManagerProcess();
+  ResourceProviderManagerProcess(Owned<Registrar> _registrar);
 
   Future<http::Response> api(
       const http::Request& request,
@@ -170,18 +158,31 @@ public:
 
   void reconcileOperations(const ReconcileOperationsMessage& message);
 
+  Future<Nothing> removeResourceProvider(
+      const ResourceProviderID& resourceProviderId);
+
   Future<Nothing> publishResources(const Resources& resources);
 
   Queue<ResourceProviderMessage> messages;
 
 private:
   void subscribe(
-      const HttpConnection& http,
+      const StreamingHttpConnection<v1::resource_provider::Event>& http,
       const Call::Subscribe& subscribe);
+
+  void _subscribe(
+      const Future<bool>& admitResourceProvider,
+      Owned<ResourceProvider> resourceProvider);
 
   void updateOperationStatus(
       ResourceProvider* resourceProvider,
       const Call::UpdateOperationStatus& update);
+
+  ResourceProviderMessage createUpdateOperationStatus(
+      const OperationStatus& operationStatus,
+      const Option<id::UUID>& operationUuid,
+      const Option<FrameworkID>& frameworkId,
+      const Option<OperationStatus>& latestStatus);
 
   void updateState(
       ResourceProvider* resourceProvider,
@@ -191,6 +192,11 @@ private:
       ResourceProvider* resourceProvider,
       const Call::UpdatePublishResourcesStatus& update);
 
+  Future<Nothing> recover(
+      const mesos::resource_provider::registry::Registry& registry);
+
+  void initialize() override;
+
   ResourceProviderID newResourceProviderId();
 
   double gaugeSubscribed();
@@ -198,6 +204,10 @@ private:
   struct ResourceProviders
   {
     hashmap<ResourceProviderID, Owned<ResourceProvider>> subscribed;
+    hashmap<
+        ResourceProviderID,
+        mesos::resource_provider::registry::ResourceProvider>
+      known;
   } resourceProviders;
 
   struct Metrics
@@ -205,158 +215,221 @@ private:
     explicit Metrics(const ResourceProviderManagerProcess& manager);
     ~Metrics();
 
-    Gauge subscribed;
+    PullGauge subscribed;
+    Counter subscriptions;
+    Counter disconnections;
   };
+
+  Owned<Registrar> registrar;
+  Promise<Nothing> recovered;
 
   Metrics metrics;
 };
 
 
-ResourceProviderManagerProcess::ResourceProviderManagerProcess()
+ResourceProviderManagerProcess::ResourceProviderManagerProcess(
+    Owned<Registrar> _registrar)
   : ProcessBase(process::ID::generate("resource-provider-manager")),
-    metrics(*this) {}
+    registrar(std::move(_registrar)),
+    metrics(*this)
+{
+  CHECK_NOTNULL(registrar.get());
+}
+
+
+void ResourceProviderManagerProcess::initialize()
+{
+  // Recover the registrar.
+  registrar->recover()
+    .then(defer(self(), &ResourceProviderManagerProcess::recover, lambda::_1))
+    .onAny([](const Future<Nothing>& recovered) {
+      if (!recovered.isReady()) {
+        LOG(FATAL)
+        << "Failed to recover resource provider manager registry: "
+        << recovered;
+      }
+    });
+}
+
+
+Future<Nothing> ResourceProviderManagerProcess::recover(
+    const mesos::resource_provider::registry::Registry& registry)
+{
+  foreach (
+      const mesos::resource_provider::registry::ResourceProvider&
+        resourceProvider,
+      registry.resource_providers()) {
+    resourceProviders.known.put(resourceProvider.id(), resourceProvider);
+  }
+
+  recovered.set(Nothing());
+
+  return Nothing();
+}
 
 
 Future<http::Response> ResourceProviderManagerProcess::api(
     const http::Request& request,
     const Option<Principal>& principal)
 {
-  if (request.method != "POST") {
-    return MethodNotAllowed({"POST"}, request.method);
-  }
+  // TODO(bbannier): This implementation does not limit the number of messages
+  // in the actor's inbox which could become large should a big number of
+  // resource providers attempt to subscribe before recovery completed. Consider
+  // rejecting requests until the resource provider manager has recovered. This
+  // would likely require implementing retry logic in resource providers.
+  return recovered.future().then(defer(
+      self(), [this, request, principal](const Nothing&) -> http::Response {
+        if (request.method != "POST") {
+          return MethodNotAllowed({"POST"}, request.method);
+        }
 
-  v1::resource_provider::Call v1Call;
+        v1::resource_provider::Call v1Call;
 
-  // TODO(anand): Content type values are case-insensitive.
-  Option<string> contentType = request.headers.get("Content-Type");
+        // TODO(anand): Content type values are case-insensitive.
+        Option<string> contentType = request.headers.get("Content-Type");
 
-  if (contentType.isNone()) {
-    return BadRequest("Expecting 'Content-Type' to be present");
-  }
+        if (contentType.isNone()) {
+          return BadRequest("Expecting 'Content-Type' to be present");
+        }
 
-  if (contentType.get() == APPLICATION_PROTOBUF) {
-    if (!v1Call.ParseFromString(request.body)) {
-      return BadRequest("Failed to parse body into Call protobuf");
-    }
-  } else if (contentType.get() == APPLICATION_JSON) {
-    Try<JSON::Value> value = JSON::parse(request.body);
-    if (value.isError()) {
-      return BadRequest("Failed to parse body into JSON: " + value.error());
-    }
+        if (contentType.get() == APPLICATION_PROTOBUF) {
+          if (!v1Call.ParseFromString(request.body)) {
+            return BadRequest("Failed to parse body into Call protobuf");
+          }
+        } else if (contentType.get() == APPLICATION_JSON) {
+          Try<JSON::Value> value = JSON::parse(request.body);
+          if (value.isError()) {
+            return BadRequest(
+                "Failed to parse body into JSON: " + value.error());
+          }
 
-    Try<v1::resource_provider::Call> parse =
-      ::protobuf::parse<v1::resource_provider::Call>(value.get());
+          Try<v1::resource_provider::Call> parse =
+            ::protobuf::parse<v1::resource_provider::Call>(value.get());
 
-    if (parse.isError()) {
-      return BadRequest("Failed to convert JSON into Call protobuf: " +
-                        parse.error());
-    }
+          if (parse.isError()) {
+            return BadRequest(
+                "Failed to convert JSON into Call protobuf: " + parse.error());
+          }
 
-    v1Call = parse.get();
-  } else {
-    return UnsupportedMediaType(
-        string("Expecting 'Content-Type' of ") +
-        APPLICATION_JSON + " or " + APPLICATION_PROTOBUF);
-  }
+          v1Call = parse.get();
+        } else {
+          return UnsupportedMediaType(
+              string("Expecting 'Content-Type' of ") + APPLICATION_JSON +
+              " or " + APPLICATION_PROTOBUF);
+        }
 
-  Call call = devolve(v1Call);
+        Call call = devolve(v1Call);
 
-  Option<Error> error = validate(call);
-  if (error.isSome()) {
-    return BadRequest(
-        "Failed to validate resource_provider::Call: " + error->message);
-  }
+        Option<Error> error = validate(call, None());
+        if (error.isSome()) {
+          return BadRequest(
+              "Failed to validate resource_provider::Call: " + error->message);
+        }
 
-  if (call.type() == Call::SUBSCRIBE) {
-    // We default to JSON 'Content-Type' in the response since an empty
-    // 'Accept' header results in all media types considered acceptable.
-    ContentType acceptType = ContentType::JSON;
+        if (call.type() == Call::SUBSCRIBE) {
+          // We default to JSON 'Content-Type' in the response since an empty
+          // 'Accept' header results in all media types considered acceptable.
+          ContentType acceptType = ContentType::JSON;
 
-    if (request.acceptsMediaType(APPLICATION_JSON)) {
-      acceptType = ContentType::JSON;
-    } else if (request.acceptsMediaType(APPLICATION_PROTOBUF)) {
-      acceptType = ContentType::PROTOBUF;
-    } else {
-      return NotAcceptable(
-          string("Expecting 'Accept' to allow ") +
-          "'" + APPLICATION_PROTOBUF + "' or '" + APPLICATION_JSON + "'");
-    }
+          if (request.acceptsMediaType(APPLICATION_JSON)) {
+            acceptType = ContentType::JSON;
+          } else if (request.acceptsMediaType(APPLICATION_PROTOBUF)) {
+            acceptType = ContentType::PROTOBUF;
+          } else {
+            return NotAcceptable(
+                string("Expecting 'Accept' to allow ") + "'" +
+                APPLICATION_PROTOBUF + "' or '" + APPLICATION_JSON + "'");
+          }
 
-    if (request.headers.contains("Mesos-Stream-Id")) {
-      return BadRequest(
-          "Subscribe calls should not include the 'Mesos-Stream-Id' header");
-    }
+          if (request.headers.contains("Mesos-Stream-Id")) {
+            return BadRequest(
+                "Subscribe calls should not include the 'Mesos-Stream-Id' "
+                "header");
+          }
 
-    Pipe pipe;
-    OK ok;
+          Pipe pipe;
+          OK ok;
 
-    ok.headers["Content-Type"] = stringify(acceptType);
-    ok.type = http::Response::PIPE;
-    ok.reader = pipe.reader();
+          ok.headers["Content-Type"] = stringify(acceptType);
+          ok.type = http::Response::PIPE;
+          ok.reader = pipe.reader();
 
-    // Generate a stream ID and return it in the response.
-    id::UUID streamId = id::UUID::random();
-    ok.headers["Mesos-Stream-Id"] = streamId.toString();
+          // Generate a stream ID and return it in the response.
+          id::UUID streamId = id::UUID::random();
+          ok.headers["Mesos-Stream-Id"] = streamId.toString();
 
-    HttpConnection http(pipe.writer(), acceptType, streamId);
-    subscribe(http, call.subscribe());
+          StreamingHttpConnection<v1::resource_provider::Event> http(
+              pipe.writer(), acceptType, streamId);
 
-    return ok;
-  }
+          this->subscribe(http, call.subscribe());
 
-  if (!resourceProviders.subscribed.contains(call.resource_provider_id())) {
-    return BadRequest("Resource provider is not subscribed");
-  }
+          return std::move(ok);
+        }
 
-  ResourceProvider* resourceProvider =
-    resourceProviders.subscribed.at(call.resource_provider_id()).get();
+        if (!this->resourceProviders.subscribed.contains(
+                call.resource_provider_id())) {
+          return BadRequest("Resource provider is not subscribed");
+        }
 
-  // This isn't a `SUBSCRIBE` call, so the request should include a stream ID.
-  if (!request.headers.contains("Mesos-Stream-Id")) {
-    return BadRequest(
-        "All non-subscribe calls should include to 'Mesos-Stream-Id' header");
-  }
+        ResourceProvider* resourceProvider = CHECK_NOTNULL(
+            this->resourceProviders.subscribed.at(call.resource_provider_id())
+              .get());
 
-  const string& streamId = request.headers.at("Mesos-Stream-Id");
-  if (streamId != resourceProvider->http.streamId.toString()) {
-    return BadRequest(
-        "The stream ID '" + streamId + "' included in this request "
-        "didn't match the stream ID currently associated with "
-        " resource provider ID " + resourceProvider->info.id().value());
-  }
+        // Perform additional validation with the now known provider info.
+        error = validate(call, resourceProvider->info);
+        if (error.isSome()) {
+          return BadRequest("Inconsistent call: " + error->message);
+        }
 
-  switch(call.type()) {
-    case Call::UNKNOWN: {
-      return NotImplemented();
-    }
+        // This isn't a `SUBSCRIBE` call, so the request should include a stream
+        // ID.
+        if (!request.headers.contains("Mesos-Stream-Id")) {
+          return BadRequest(
+              "All non-subscribe calls should include to 'Mesos-Stream-Id' "
+              "header");
+        }
 
-    case Call::SUBSCRIBE: {
-      // `SUBSCRIBE` call should have been handled above.
-      LOG(FATAL) << "Unexpected 'SUBSCRIBE' call";
-    }
+        const string& streamId = request.headers.at("Mesos-Stream-Id");
+        if (streamId != resourceProvider->http.streamId.toString()) {
+          return BadRequest(
+              "The stream ID '" + streamId +
+              "' included in this request "
+              "didn't match the stream ID currently associated with "
+              " resource provider ID " +
+              resourceProvider->info.id().value());
+        }
 
-    case Call::UPDATE_OPERATION_STATUS: {
-      updateOperationStatus(
-          resourceProvider,
-          call.update_operation_status());
+        switch (call.type()) {
+          case Call::UNKNOWN: {
+            return NotImplemented();
+          }
 
-      return Accepted();
-    }
+          case Call::SUBSCRIBE: {
+            // `SUBSCRIBE` call should have been handled above.
+            LOG(FATAL) << "Unexpected 'SUBSCRIBE' call";
+          }
 
-    case Call::UPDATE_STATE: {
-      updateState(resourceProvider, call.update_state());
-      return Accepted();
-    }
+          case Call::UPDATE_OPERATION_STATUS: {
+            this->updateOperationStatus(
+                resourceProvider, call.update_operation_status());
 
-    case Call::UPDATE_PUBLISH_RESOURCES_STATUS: {
-      updatePublishResourcesStatus(
-          resourceProvider,
-          call.update_publish_resources_status());
-      return Accepted();
-    }
-  }
+            return Accepted();
+          }
 
-  UNREACHABLE();
+          case Call::UPDATE_STATE: {
+            this->updateState(resourceProvider, call.update_state());
+            return Accepted();
+          }
+
+          case Call::UPDATE_PUBLISH_RESOURCES_STATUS: {
+            this->updatePublishResourcesStatus(
+                resourceProvider, call.update_publish_resources_status());
+            return Accepted();
+          }
+        }
+
+        UNREACHABLE();
+      }));
 }
 
 
@@ -364,7 +437,9 @@ void ResourceProviderManagerProcess::applyOperation(
     const ApplyOperationMessage& message)
 {
   const Offer::Operation& operation = message.operation_info();
-  const FrameworkID& frameworkId = message.framework_id();
+  const Option<FrameworkID> frameworkId = message.has_framework_id()
+    ? message.framework_id()
+    : Option<FrameworkID>::none();
   const UUID& operationUUID = message.operation_uuid();
 
   Result<ResourceProviderID> resourceProviderId =
@@ -373,7 +448,11 @@ void ResourceProviderManagerProcess::applyOperation(
   if (!resourceProviderId.isSome()) {
     LOG(ERROR) << "Failed to get the resource provider ID of operation "
                << "'" << operation.id() << "' (uuid: " << operationUUID
-               << ") from framework " << frameworkId << ": "
+               << ") from "
+               << (frameworkId.isSome()
+                     ? "framework " + stringify(frameworkId.get())
+                     : "an operator API call")
+               << ": "
                << (resourceProviderId.isError() ? resourceProviderId.error()
                                                 : "Not found");
     return;
@@ -381,7 +460,10 @@ void ResourceProviderManagerProcess::applyOperation(
 
   if (!resourceProviders.subscribed.contains(resourceProviderId.get())) {
     LOG(WARNING) << "Dropping operation '" << operation.id() << "' (uuid: "
-                 << operationUUID << ") from framework " << frameworkId
+                 << operationUUID << ") from "
+                 << (frameworkId.isSome()
+                       ? "framework " + stringify(frameworkId.get())
+                       : "an operator API call")
                  << " because resource provider " << resourceProviderId.get()
                  << " is not subscribed";
     return;
@@ -401,8 +483,10 @@ void ResourceProviderManagerProcess::applyOperation(
 
   Event event;
   event.set_type(Event::APPLY_OPERATION);
-  event.mutable_apply_operation()
-    ->mutable_framework_id()->CopyFrom(frameworkId);
+  if (frameworkId.isSome()) {
+    event.mutable_apply_operation()
+      ->mutable_framework_id()->CopyFrom(frameworkId.get());
+  }
   event.mutable_apply_operation()->mutable_info()->CopyFrom(operation);
   event.mutable_apply_operation()
     ->mutable_operation_uuid()->CopyFrom(message.operation_uuid());
@@ -412,9 +496,12 @@ void ResourceProviderManagerProcess::applyOperation(
 
   if (!resourceProvider->http.send(event)) {
     LOG(WARNING) << "Failed to send operation '" << operation.id() << "' "
-                 << "(uuid: " << operationUUID << ") from framework "
-                 << frameworkId << " to resource provider "
-                 << resourceProviderId.get() << ": connection closed";
+                 << "(uuid: " << operationUUID << ") from "
+                 << (frameworkId.isSome()
+                       ? "framework " + stringify(frameworkId.get())
+                       : "an operator API call")
+                 << " to resource provider " << resourceProviderId.get()
+                 << ": connection closed";
   }
 }
 
@@ -478,18 +565,64 @@ void ResourceProviderManagerProcess::reconcileOperations(
       }
   };
 
-  // Construct events for individual resource providers.
+  // If the framework ID is set, then this reconciliation request originated
+  // from the framework; otherwise, it originated from the master. If it's from
+  // the framework, then we return an operation state based on whether or not
+  // the resource provider is known. If it's from the master, then we forward it
+  // to the resource provider to determine whether or not this operation was
+  // dropped en route to the agent.
+  Option<FrameworkID> frameworkId = message.has_framework_id()
+    ? message.framework_id()
+    : Option<FrameworkID>::none();
+
+  // Construct events for individual resource providers, or send appropriate
+  // operation status updates if resource providers are not subscribed.
   foreach (
       const ReconcileOperationsMessage::Operation& operation,
       message.operations()) {
     if (operation.has_resource_provider_id()) {
       if (!resourceProviders.subscribed.contains(
               operation.resource_provider_id())) {
-        LOG(WARNING) << "Dropping operation reconciliation message with"
-                     << " operation_uuid " << operation.operation_uuid()
-                     << " because resource provider "
-                     << operation.resource_provider_id()
-                     << " is not subscribed";
+        OperationState state;
+        if (resourceProviders.known.contains(
+                operation.resource_provider_id())) {
+          // The resource provider is not currently subscribed, but since it is
+          // known, we expect it to resubscribe. We send OPERATION_RECOVERING in
+          // this case.
+          state = OPERATION_RECOVERING;
+        } else {
+          // The resource provider is not known; we return OPERATION_UNKNOWN in
+          // this case.
+          state = OPERATION_UNKNOWN;
+        }
+
+        Option<id::UUID> uuid;
+        if (operation.has_operation_uuid()) {
+          Try<id::UUID> uuid_ =
+            id::UUID::fromBytes(operation.operation_uuid().value());
+          CHECK_SOME(uuid_);
+          uuid = uuid_.get();
+        }
+
+        // NOTE: the `SlaveID` is left blank in the operation status below
+        // because the RP manager does not have access to this information. The
+        // agent will inject the ID before forwarding to the master.
+        messages.put(
+            createUpdateOperationStatus(
+                protobuf::createOperationStatus(
+                    state,
+                    operation.has_operation_id()
+                      ? operation.operation_id()
+                      : Option<OperationID>::none(),
+                    None(),
+                    None(),
+                    uuid,
+                    None(),
+                    operation.resource_provider_id()),
+                uuid,
+                frameworkId,
+                None()));
+
         continue;
       }
 
@@ -511,6 +644,66 @@ void ResourceProviderManagerProcess::reconcileOperations(
                    << ": connection closed";
     }
   }
+}
+
+
+Future<Nothing> ResourceProviderManagerProcess::removeResourceProvider(
+    const ResourceProviderID& resourceProviderId)
+{
+  LOG(INFO) << "Removing resource provider " << resourceProviderId;
+
+  Future<bool> removeResourceProvider = registrar
+    ->apply(Owned<mesos::resource_provider::Registrar::Operation>(
+        new RemoveResourceProvider(resourceProviderId)));
+
+  removeResourceProvider.onAny(
+      [resourceProviderId](const Future<bool>& removeResourceProvider) {
+        if (!removeResourceProvider.isReady()) {
+          LOG(ERROR) << "Not removing resource provider " << resourceProviderId
+                     << " as registry update did not succeed: "
+                     << removeResourceProvider;
+        }
+      });
+
+  return removeResourceProvider
+    .then(defer(
+        self(),
+        [this, resourceProviderId](const Future<bool>& removeResourceProvider) {
+          // TODO(bbannier): We should also on a best effort basis send a
+          // `TEARDOWN` event when a removed resource provider attempts to
+          // resubscribe. This can happen e.g., if the event gets lost on its
+          // way to the resource provider, or if the resource provider is not
+          // connected.
+          if (resourceProviders.subscribed.contains(resourceProviderId)) {
+            const Owned<ResourceProvider>& resourceProvider =
+              resourceProviders.subscribed.at(resourceProviderId);
+            Event event;
+            event.set_type(Event::TEARDOWN);
+
+            if (!resourceProvider->http.send(event)) {
+              LOG(WARNING)
+                << "Failed to send TEARDOWN event to resource provider "
+                << resourceProviderId << ": connection closed";
+            }
+          } else {
+            LOG(WARNING)
+              << "Failed to send TEARDOWN event to resource provider "
+              << resourceProviderId << ": resource provider not subscribed";
+          }
+
+          resourceProviders.known.erase(resourceProviderId);
+          resourceProviders.subscribed.erase(resourceProviderId);
+
+          ResourceProviderMessage::Remove remove{resourceProviderId};
+
+          ResourceProviderMessage message;
+          message.type = ResourceProviderMessage::Type::REMOVE;
+          message.remove = std::move(remove);
+
+          messages.put(std::move(message));
+
+          return Nothing();
+        }));
 }
 
 
@@ -541,17 +734,18 @@ Future<Nothing> ResourceProviderManagerProcess::publishResources(
     providedResources[resourceProviderId] += resource;
   }
 
-  list<Future<Nothing>> futures;
+  vector<Future<Nothing>> futures;
 
   foreachpair (const ResourceProviderID& resourceProviderId,
                const Resources& resources,
                providedResources) {
-    UUID uuid = protobuf::createUUID();
+    id::UUID uuid = id::UUID::random();
 
     Event event;
     event.set_type(Event::PUBLISH_RESOURCES);
-    event.mutable_publish_resources()->mutable_uuid()->CopyFrom(uuid);
-    event.mutable_publish_resources()->mutable_resources()->CopyFrom(resources);
+    *event.mutable_publish_resources()->mutable_uuid() =
+      protobuf::createUUID(uuid);
+    *event.mutable_publish_resources()->mutable_resources() = resources;
 
     ResourceProvider* resourceProvider =
       resourceProviders.subscribed.at(resourceProviderId).get();
@@ -576,7 +770,7 @@ Future<Nothing> ResourceProviderManagerProcess::publishResources(
 
 
 void ResourceProviderManagerProcess::subscribe(
-    const HttpConnection& http,
+    const StreamingHttpConnection<v1::resource_provider::Event>& http,
     const Call::Subscribe& subscribe)
 {
   const ResourceProviderInfo& resourceProviderInfo =
@@ -590,31 +784,85 @@ void ResourceProviderManagerProcess::subscribe(
   Owned<ResourceProvider> resourceProvider(
       new ResourceProvider(resourceProviderInfo, http));
 
+  Future<bool> admitResourceProvider;
+
   if (!resourceProviderInfo.has_id()) {
     // The resource provider is subscribing for the first time.
     resourceProvider->info.mutable_id()->CopyFrom(newResourceProviderId());
+
+    // If we are handing out a new `ResourceProviderID` persist the ID by
+    // triggering a `AdmitResourceProvider` operation on the registrar.
+    admitResourceProvider =
+      registrar->apply(Owned<mesos::resource_provider::Registrar::Operation>(
+          new AdmitResourceProvider(
+              createRegistryResourceProvider(resourceProvider->info))));
   } else {
     // TODO(chhsiao): The resource provider is resubscribing after being
     // restarted or an agent failover. The 'ResourceProviderInfo' might
     // have been updated, but its type and name should remain the same.
     // We should checkpoint its 'type', 'name' and ID, then check if the
-    // resubscribption is consistent with the checkpointed record.
+    // resubscription is consistent with the checkpointed record.
+
+    const ResourceProviderID& resourceProviderId = resourceProviderInfo.id();
+
+    if (!resourceProviders.known.contains(resourceProviderId)) {
+      LOG(INFO)
+        << "Dropping resubscription attempt of resource provider with ID "
+        << resourceProviderId
+        << " since it is unknown";
+
+      return;
+    }
+
+    // Check whether the resource provider has change
+    // information which should be static.
+    mesos::resource_provider::registry::ResourceProvider resourceProvider_ =
+      createRegistryResourceProvider(resourceProvider->info);
+
+    const mesos::resource_provider::registry::ResourceProvider&
+      storedResourceProvider = resourceProviders.known.at(resourceProviderId);
+
+    if (resourceProvider_ != storedResourceProvider) {
+      LOG(INFO)
+        << "Dropping resubscription attempt of resource provider "
+        << resourceProvider_
+        << " since it does not match the previous information "
+        << storedResourceProvider;
+      return;
+    }
+
+    // If the resource provider is known we do not need to admit it
+    // again, and the registrar operation implicitly succeeded.
+    admitResourceProvider = true;
   }
 
-  const ResourceProviderID& resourceProviderId = resourceProvider->info.id();
+  admitResourceProvider.onAny(defer(
+      self(),
+      &ResourceProviderManagerProcess::_subscribe,
+      lambda::_1,
+      std::move(resourceProvider)));
+}
 
-  Event event;
-  event.set_type(Event::SUBSCRIBED);
-  event.mutable_subscribed()->mutable_provider_id()
-    ->CopyFrom(resourceProviderId);
 
-  if (!resourceProvider->http.send(event)) {
-    LOG(WARNING) << "Failed to send SUBSCRIBED event to resource provider "
-                 << resourceProviderId << ": connection closed";
+void ResourceProviderManagerProcess::_subscribe(
+    const Future<bool>& admitResourceProvider,
+    Owned<ResourceProvider> resourceProvider)
+{
+  if (!admitResourceProvider.isReady()) {
+    LOG(INFO)
+      << "Not subscribing resource provider " << resourceProvider->info.id()
+      << " as registry update did not succeed: " << admitResourceProvider;
+
     return;
   }
 
-  http.closed()
+  CHECK(admitResourceProvider.get())
+    << "Could not admit resource provider " << resourceProvider->info.id()
+    << " as registry update was rejected";
+
+  const ResourceProviderID& resourceProviderId = resourceProvider->info.id();
+
+  resourceProvider->http.closed()
     .onAny(defer(self(), [=](const Future<Nothing>& future) {
       // Iff the remote side closes the HTTP connection, the future will be
       // ready. We will remove the resource provider in that case.
@@ -635,12 +883,50 @@ void ResourceProviderManagerProcess::subscribe(
       message.disconnect = std::move(disconnect);
 
       messages.put(std::move(message));
+
+      ++metrics.disconnections;
     }));
+
+  if (!resourceProviders.known.contains(resourceProviderId)) {
+    mesos::resource_provider::registry::ResourceProvider resourceProvider_ =
+      createRegistryResourceProvider(resourceProvider->info);
+
+    resourceProviders.known.put(
+        resourceProviderId,
+        std::move(resourceProvider_));
+  }
+
+  ResourceProviderMessage::Subscribe subscribe{resourceProvider->info};
+
+  ResourceProviderMessage message;
+  message.type = ResourceProviderMessage::Type::SUBSCRIBE;
+  message.subscribe = std::move(subscribe);
+
+  // Store a pointer to the resource provider so that we can access it
+  // even after moving it into the list of subscribed providers below.
+  ResourceProvider* _resourceProvider = resourceProvider.get();
 
   // TODO(jieyu): Start heartbeat for the resource provider.
   resourceProviders.subscribed.put(
       resourceProviderId,
       std::move(resourceProvider));
+
+  messages.put(std::move(message));
+  ++metrics.subscriptions;
+
+  // Only send a `SUBSCRIBED` event after we have updated our internal
+  // bookkeeping so that e.g., metrics always reflect correct
+  // subscription state.
+  Event event;
+  event.set_type(Event::SUBSCRIBED);
+  event.mutable_subscribed()->mutable_provider_id()
+    ->CopyFrom(resourceProviderId);
+
+  if (!_resourceProvider->http.send(event)) {
+    LOG(WARNING) << "Failed to send SUBSCRIBED event to resource provider "
+                 << resourceProviderId << ": connection closed";
+    return;
+  }
 }
 
 
@@ -648,21 +934,62 @@ void ResourceProviderManagerProcess::updateOperationStatus(
     ResourceProvider* resourceProvider,
     const Call::UpdateOperationStatus& update)
 {
-  ResourceProviderMessage::UpdateOperationStatus body;
-  body.update.mutable_status()->CopyFrom(update.status());
-  body.update.mutable_operation_uuid()->CopyFrom(update.operation_uuid());
+  CHECK_EQ(update.status().resource_provider_id(), resourceProvider->info.id());
+
+  Option<FrameworkID> frameworkId;
   if (update.has_framework_id()) {
-    body.update.mutable_framework_id()->CopyFrom(update.framework_id());
+    frameworkId = update.framework_id();
   }
+
+  Option<OperationStatus> latestStatus;
   if (update.has_latest_status()) {
-    body.update.mutable_latest_status()->CopyFrom(update.latest_status());
+    CHECK_EQ(
+        update.latest_status().resource_provider_id(),
+        resourceProvider->info.id());
+
+    latestStatus = update.latest_status();
+  }
+
+  Try<id::UUID> uuid = id::UUID::fromBytes(update.operation_uuid().value());
+  CHECK_SOME(uuid);
+
+  messages.put(
+      createUpdateOperationStatus(
+          update.status(),
+          uuid.get(),
+          frameworkId,
+          latestStatus));
+}
+
+
+ResourceProviderMessage
+ResourceProviderManagerProcess::createUpdateOperationStatus(
+    const OperationStatus& operationStatus,
+    const Option<id::UUID>& operationUuid,
+    const Option<FrameworkID>& frameworkId,
+    const Option<OperationStatus>& latestStatus)
+{
+  ResourceProviderMessage::UpdateOperationStatus body;
+  body.update.mutable_status()->CopyFrom(operationStatus);
+
+  if (operationUuid.isSome()) {
+    body.update.mutable_operation_uuid()->CopyFrom(
+        protobuf::createUUID(operationUuid.get()));
+  }
+
+  if (frameworkId.isSome()) {
+    body.update.mutable_framework_id()->CopyFrom(frameworkId.get());
+  }
+
+  if (latestStatus.isSome()) {
+    body.update.mutable_latest_status()->CopyFrom(latestStatus.get());
   }
 
   ResourceProviderMessage message;
   message.type = ResourceProviderMessage::Type::UPDATE_OPERATION_STATUS;
   message.updateOperationStatus = std::move(body);
 
-  messages.put(std::move(message));
+  return message;
 }
 
 
@@ -687,7 +1014,7 @@ void ResourceProviderManagerProcess::updateState(
     << resourceProvider->info.id();
 
   ResourceProviderMessage::UpdateState updateState{
-      resourceProvider->info,
+      resourceProvider->info.id(),
       update.resource_version_uuid(),
       update.resources(),
       std::move(operations)};
@@ -704,32 +1031,39 @@ void ResourceProviderManagerProcess::updatePublishResourcesStatus(
     ResourceProvider* resourceProvider,
     const Call::UpdatePublishResourcesStatus& update)
 {
-  const UUID& uuid = update.uuid();
+  Try<id::UUID> uuid = id::UUID::fromBytes(update.uuid().value());
 
-  if (!resourceProvider->publishes.contains(uuid)) {
-    LOG(ERROR) << "Ignoring UpdatePublishResourcesStatus from resource"
-               << " provider " << resourceProvider->info.id()
-               << " because UUID " << uuid << " is unknown";
+  if (uuid.isError()) {
+    LOG(ERROR)
+      << "Ignoring UpdatePublishResourcesStatus from resource provider "
+      << resourceProvider->info.id() << ": " << uuid.error();
+
+    return;
+  }
+
+  if (!resourceProvider->publishes.contains(uuid.get())) {
+    LOG(ERROR)
+      << "Ignoring UpdatePublishResourcesStatus from resource provider "
+      << resourceProvider->info.id() << ": Unknown UUID " << uuid.get();
+
     return;
   }
 
   LOG(INFO)
     << "Received UPDATE_PUBLISH_RESOURCES_STATUS call for PUBLISH_RESOURCES"
-    << " event " << uuid << " with " << update.status()
+    << " event " << uuid.get() << " with " << update.status()
     << " status from resource provider " << resourceProvider->info.id();
 
   if (update.status() == Call::UpdatePublishResourcesStatus::OK) {
-    resourceProvider->publishes.at(uuid)->set(Nothing());
+    resourceProvider->publishes.at(uuid.get())->set(Nothing());
   } else {
     // TODO(jieyu): Consider to include an error message in
     // 'UpdatePublishResourcesStatus' and surface that to the caller.
-    resourceProvider->publishes.at(uuid)->fail(
-        "Failed to publish resources for resource provider " +
-        stringify(resourceProvider->info.id()) + ": Received " +
-        stringify(update.status()) + " status");
+    resourceProvider->publishes.at(uuid.get())->fail(
+        "Received " + stringify(update.status()) + " status");
   }
 
-  resourceProvider->publishes.erase(uuid);
+  resourceProvider->publishes.erase(uuid.get());
 }
 
 
@@ -750,21 +1084,27 @@ double ResourceProviderManagerProcess::gaugeSubscribed()
 ResourceProviderManagerProcess::Metrics::Metrics(
     const ResourceProviderManagerProcess& manager)
   : subscribed(
-      "resource_provider_manager/subscribed",
-      defer(manager, &ResourceProviderManagerProcess::gaugeSubscribed))
+        "resource_provider_manager/subscribed",
+        defer(manager, &ResourceProviderManagerProcess::gaugeSubscribed)),
+    subscriptions("resource_provider_manager/events/subscribe"),
+    disconnections("resource_provider_manager/events/disconnect")
 {
   process::metrics::add(subscribed);
+  process::metrics::add(subscriptions);
+  process::metrics::add(disconnections);
 }
 
 
 ResourceProviderManagerProcess::Metrics::~Metrics()
 {
   process::metrics::remove(subscribed);
+  process::metrics::remove(subscriptions);
+  process::metrics::remove(disconnections);
 }
 
 
-ResourceProviderManager::ResourceProviderManager()
-  : process(new ResourceProviderManagerProcess())
+ResourceProviderManager::ResourceProviderManager(Owned<Registrar> registrar)
+  : process(new ResourceProviderManagerProcess(std::move(registrar)))
 {
   spawn(CHECK_NOTNULL(process.get()));
 }
@@ -818,6 +1158,15 @@ void ResourceProviderManager::reconcileOperations(
       message);
 }
 
+
+Future<Nothing> ResourceProviderManager::removeResourceProvider(
+    const ResourceProviderID& resourceProviderId) const
+{
+  return dispatch(
+      process.get(),
+      &ResourceProviderManagerProcess::removeResourceProvider,
+      resourceProviderId);
+}
 
 Future<Nothing> ResourceProviderManager::publishResources(
     const Resources& resources)

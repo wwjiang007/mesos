@@ -62,7 +62,9 @@ namespace internal {
 // Helpers for evolving types between versions. Please add as necessary!
 v1::AgentID evolve(const SlaveID& slaveId);
 v1::AgentInfo evolve(const SlaveInfo& slaveInfo);
+v1::ContainerInfo evolve(const ContainerInfo& containerInfo);
 v1::DomainInfo evolve(const DomainInfo& domainInfo);
+v1::DrainInfo evolve(const DrainInfo& drainInfo);
 v1::ExecutorID evolve(const ExecutorID& executorId);
 v1::ExecutorInfo evolve(const ExecutorInfo& executorInfo);
 v1::FileInfo evolve(const FileInfo& fileInfo);
@@ -84,41 +86,40 @@ v1::TaskInfo evolve(const TaskInfo& taskInfo);
 v1::TaskStatus evolve(const TaskStatus& status);
 v1::UUID evolve(const UUID& uuid);
 
-v1::agent::Call evolve(const mesos::agent::Call& call);
-v1::agent::ProcessIO evolve(const mesos::agent::ProcessIO& processIO);
-v1::agent::Response evolve(const mesos::agent::Response& response);
+
+v1::agent::Call evolve(const agent::Call& call);
+v1::agent::ProcessIO evolve(const agent::ProcessIO& processIO);
+v1::agent::Response evolve(const agent::Response& response);
+
 
 v1::maintenance::ClusterStatus evolve(
     const maintenance::ClusterStatus& cluster);
 v1::maintenance::Schedule evolve(const maintenance::Schedule& schedule);
 
-v1::master::Response evolve(const mesos::master::Response& response);
 
-
-v1::resource_provider::Call evolve(const mesos::resource_provider::Call& call);
-v1::resource_provider::Event evolve(
-    const mesos::resource_provider::Event& event);
-
-
-v1::scheduler::Call evolve(const scheduler::Call& call);
+v1::resource_provider::Call evolve(const resource_provider::Call& call);
+v1::resource_provider::Event evolve(const resource_provider::Event& event);
 
 
 // Helper for repeated field evolving to 'T1' from 'T2'.
 template <typename T1, typename T2>
 google::protobuf::RepeatedPtrField<T1> evolve(
-    google::protobuf::RepeatedPtrField<T2> t2s)
+    const google::protobuf::RepeatedPtrField<T2>& t2s)
 {
   google::protobuf::RepeatedPtrField<T1> t1s;
+  t1s.Reserve(t2s.size());
 
   foreach (const T2& t2, t2s) {
-    t1s.Add()->CopyFrom(evolve(t2));
+    *t1s.Add() = evolve(t2);
   }
 
   return t1s;
 }
 
 
-v1::scheduler::Event evolve(const scheduler::Event& event);
+v1::scheduler::Call evolve(const mesos::scheduler::Call& call);
+v1::scheduler::Event evolve(const mesos::scheduler::Event& event);
+v1::scheduler::Response evolve(const mesos::scheduler::Response& response);
 
 
 // Helper functions that evolve old style internal messages to a
@@ -136,6 +137,7 @@ v1::scheduler::Event evolve(const RescindResourceOfferMessage& message);
 v1::scheduler::Event evolve(const StatusUpdateMessage& message);
 v1::scheduler::Event evolve(const UpdateOperationStatusMessage& message);
 
+
 v1::executor::Call evolve(const executor::Call& call);
 v1::executor::Event evolve(const executor::Event& event);
 
@@ -151,6 +153,7 @@ v1::executor::Event evolve(const StatusUpdateAcknowledgementMessage& message);
 
 
 v1::master::Event evolve(const mesos::master::Event& event);
+v1::master::Response evolve(const mesos::master::Response& response);
 
 
 // Before the v1 API we had REST endpoints that returned JSON. The JSON was not
@@ -170,6 +173,7 @@ v1::master::Response evolve(const JSON::Object& object);
 // REST endpoints pre v1 API.
 template <v1::agent::Response::Type T>
 v1::agent::Response evolve(const JSON::Object& object);
+
 
 template <v1::agent::Response::Type T>
 v1::agent::Response evolve(const JSON::Array& array);

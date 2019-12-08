@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "common/protobuf_utils.hpp"
+
 #ifdef __WINDOWS__
 #include <stout/internal/windows/grp.hpp>
 #include <stout/internal/windows/pwd.hpp>
@@ -47,7 +49,6 @@
 #endif // __WINDOWS__
 
 #include "common/http.hpp"
-#include "common/protobuf_utils.hpp"
 #include "common/resources_utils.hpp"
 
 #include "master/master.hpp"
@@ -65,7 +66,9 @@ using google::protobuf::RepeatedPtrField;
 
 using mesos::authorization::VIEW_ROLE;
 
+using mesos::slave::ContainerFileOperation;
 using mesos::slave::ContainerLimitation;
+using mesos::slave::ContainerMountInfo;
 using mesos::slave::ContainerState;
 
 using process::Owned;
@@ -74,6 +77,62 @@ using process::UPID;
 namespace mesos {
 namespace internal {
 namespace protobuf {
+
+// If `descriptor` is not a descriptor of a protobuf union,
+// this constructor will abort the process.
+UnionValidator::UnionValidator(const google::protobuf::Descriptor* descriptor)
+{
+  const auto* typeFieldDescriptor = descriptor->FindFieldByName("type");
+  CHECK_NOTNULL(typeFieldDescriptor);
+
+  typeDescriptor_ = typeFieldDescriptor->enum_type();
+  CHECK_NOTNULL(typeDescriptor_);
+
+  const auto* unknownTypeValueDescriptor =
+    typeDescriptor_->FindValueByNumber(0);
+  if (unknownTypeValueDescriptor != nullptr) {
+    CHECK_EQ(unknownTypeValueDescriptor->name(), "UNKNOWN");
+  }
+
+  for (int index = 0; index < typeDescriptor_->value_count(); index++) {
+    const auto* typeValueDescriptor = typeDescriptor_->value(index);
+    if (typeValueDescriptor->number() == 0) {
+      // We are skipping the "UNKNOWN" value of the enum.
+      continue;
+    }
+
+    const auto* fieldDescriptor =
+      descriptor->FindFieldByName(strings::lower(typeValueDescriptor->name()));
+
+    CHECK_NOTNULL(fieldDescriptor);
+    unionFieldDescriptors_.emplace_back(
+        typeValueDescriptor->number(), fieldDescriptor);
+  }
+}
+
+
+Option<Error> UnionValidator::validate(
+  const int messageTypeNumber, const google::protobuf::Message& message) const
+{
+  const auto* reflection = message.GetReflection();
+  for (const auto& item : unionFieldDescriptors_) {
+    const auto typeNumber = item.first;
+    const auto* fieldDescriptor = item.second;
+    if (
+        messageTypeNumber != typeNumber &&
+        reflection->HasField(message, fieldDescriptor)) {
+      const auto* descr = typeDescriptor_->FindValueByNumber(messageTypeNumber);
+      return Error(
+          "Protobuf union `" + message.GetDescriptor()->full_name() +
+          "` with `Type == " +
+          (descr == nullptr ? string("<UNKNOWN>") : descr->name()) +
+          "` should not have the field `" +
+          fieldDescriptor->name() + "` set.");
+    }
+  }
+  return None();
+}
+
 
 bool frameworkHasCapability(
     const FrameworkInfo& framework,
@@ -92,14 +151,26 @@ bool frameworkHasCapability(
 
 bool isTerminalState(const TaskState& state)
 {
-  return (state == TASK_FINISHED ||
-          state == TASK_FAILED ||
-          state == TASK_KILLED ||
-          state == TASK_LOST ||
-          state == TASK_ERROR ||
-          state == TASK_DROPPED ||
-          state == TASK_GONE ||
-          state == TASK_GONE_BY_OPERATOR);
+  switch (state) {
+    case TASK_FINISHED:
+    case TASK_FAILED:
+    case TASK_KILLED:
+    case TASK_LOST:
+    case TASK_ERROR:
+    case TASK_DROPPED:
+    case TASK_GONE:
+    case TASK_GONE_BY_OPERATOR:
+      return true;
+    case TASK_KILLING:
+    case TASK_STAGING:
+    case TASK_STARTING:
+    case TASK_RUNNING:
+    case TASK_UNREACHABLE:
+    case TASK_UNKNOWN:
+      return false;
+  }
+
+  UNREACHABLE();
 }
 
 
@@ -341,6 +412,14 @@ Task createTask(
     t.mutable_container()->CopyFrom(task.container());
   }
 
+  if (task.has_health_check()) {
+    t.mutable_health_check()->CopyFrom(task.health_check());
+  }
+
+  if (task.has_kill_policy()) {
+    t.mutable_kill_policy()->CopyFrom(task.kill_policy());
+  }
+
   // Copy `user` if set.
   if (task.has_command() && task.command().has_user()) {
     t.set_user(task.command().user());
@@ -403,12 +482,16 @@ Option<ContainerStatus> getTaskContainerStatus(const Task& task)
 bool isTerminalState(const OperationState& state)
 {
   switch (state) {
-    case OPERATION_FINISHED:
-    case OPERATION_FAILED:
-    case OPERATION_ERROR:
     case OPERATION_DROPPED:
+    case OPERATION_ERROR:
+    case OPERATION_FAILED:
+    case OPERATION_FINISHED:
+    case OPERATION_GONE_BY_OPERATOR:
       return true;
     case OPERATION_PENDING:
+    case OPERATION_RECOVERING:
+    case OPERATION_UNKNOWN:
+    case OPERATION_UNREACHABLE:
     case OPERATION_UNSUPPORTED:
       return false;
   }
@@ -422,7 +505,9 @@ OperationStatus createOperationStatus(
     const Option<OperationID>& operationId,
     const Option<string>& message,
     const Option<Resources>& convertedResources,
-    const Option<id::UUID>& uuid)
+    const Option<id::UUID>& uuid,
+    const Option<SlaveID>& slaveId,
+    const Option<ResourceProviderID>& resourceProviderId)
 {
   OperationStatus status;
   status.set_state(state);
@@ -441,6 +526,14 @@ OperationStatus createOperationStatus(
 
   if (uuid.isSome()) {
     status.mutable_uuid()->CopyFrom(protobuf::createUUID(uuid.get()));
+  }
+
+  if (slaveId.isSome()) {
+    status.mutable_slave_id()->CopyFrom(slaveId.get());
+  }
+
+  if (resourceProviderId.isSome()) {
+    status.mutable_resource_provider_id()->CopyFrom(resourceProviderId.get());
   }
 
   return status;
@@ -703,33 +796,37 @@ void injectAllocationInfo(
       break;
     }
 
-    case Offer::Operation::CREATE_VOLUME: {
+    case Offer::Operation::GROW_VOLUME: {
       inject(
-          *operation->mutable_create_volume()->mutable_source(),
+          *operation->mutable_grow_volume()->mutable_volume(),
+          allocationInfo);
+
+      inject(
+          *operation->mutable_grow_volume()->mutable_addition(),
           allocationInfo);
 
       break;
     }
 
-    case Offer::Operation::DESTROY_VOLUME: {
+    case Offer::Operation::SHRINK_VOLUME: {
       inject(
-          *operation->mutable_destroy_volume()->mutable_volume(),
+          *operation->mutable_shrink_volume()->mutable_volume(),
           allocationInfo);
 
       break;
     }
 
-    case Offer::Operation::CREATE_BLOCK: {
+    case Offer::Operation::CREATE_DISK: {
       inject(
-          *operation->mutable_create_block()->mutable_source(),
+          *operation->mutable_create_disk()->mutable_source(),
           allocationInfo);
 
       break;
     }
 
-    case Offer::Operation::DESTROY_BLOCK: {
+    case Offer::Operation::DESTROY_DISK: {
       inject(
-          *operation->mutable_destroy_block()->mutable_block(),
+          *operation->mutable_destroy_disk()->mutable_source(),
           allocationInfo);
 
       break;
@@ -818,26 +915,27 @@ void stripAllocationInfo(Offer::Operation* operation)
       break;
     }
 
-    case Offer::Operation::CREATE_VOLUME: {
-      strip(*operation->mutable_create_volume()->mutable_source());
+    case Offer::Operation::GROW_VOLUME: {
+      strip(*operation->mutable_grow_volume()->mutable_volume());
+      strip(*operation->mutable_grow_volume()->mutable_addition());
 
       break;
     }
 
-    case Offer::Operation::DESTROY_VOLUME: {
-      strip(*operation->mutable_destroy_volume()->mutable_volume());
+    case Offer::Operation::SHRINK_VOLUME: {
+      strip(*operation->mutable_shrink_volume()->mutable_volume());
 
       break;
     }
 
-    case Offer::Operation::CREATE_BLOCK: {
-      strip(*operation->mutable_create_block()->mutable_source());
+    case Offer::Operation::CREATE_DISK: {
+      strip(*operation->mutable_create_disk()->mutable_source());
 
       break;
     }
 
-    case Offer::Operation::DESTROY_BLOCK: {
-      strip(*operation->mutable_destroy_block()->mutable_block());
+    case Offer::Operation::DESTROY_DISK: {
+      strip(*operation->mutable_destroy_disk()->mutable_source());
 
       break;
     }
@@ -853,15 +951,18 @@ bool isSpeculativeOperation(const Offer::Operation& operation)
   switch (operation.type()) {
     case Offer::Operation::LAUNCH:
     case Offer::Operation::LAUNCH_GROUP:
-    case Offer::Operation::CREATE_VOLUME:
-    case Offer::Operation::DESTROY_VOLUME:
-    case Offer::Operation::CREATE_BLOCK:
-    case Offer::Operation::DESTROY_BLOCK:
+    case Offer::Operation::CREATE_DISK:
+    case Offer::Operation::DESTROY_DISK:
       return false;
     case Offer::Operation::RESERVE:
     case Offer::Operation::UNRESERVE:
     case Offer::Operation::CREATE:
     case Offer::Operation::DESTROY:
+    // TODO(zhitao): Convert `GROW_VOLUME` and `SHRINK_VOLUME` to
+    // non-speculative operations once we can support non-speculative operator
+    // API.
+    case Offer::Operation::GROW_VOLUME:
+    case Offer::Operation::SHRINK_VOLUME:
       return true;
     case Offer::Operation::UNKNOWN:
       UNREACHABLE();
@@ -990,18 +1091,16 @@ ContainerID parseContainerId(const string& value)
 Try<Resources> getConsumedResources(const Offer::Operation& operation)
 {
   switch (operation.type()) {
-    case Offer::Operation::CREATE_VOLUME:
-      return operation.create_volume().source();
-    case Offer::Operation::DESTROY_VOLUME:
-      return operation.destroy_volume().volume();
-    case Offer::Operation::CREATE_BLOCK:
-      return operation.create_block().source();
-    case Offer::Operation::DESTROY_BLOCK:
-      return operation.destroy_block().block();
+    case Offer::Operation::CREATE_DISK:
+      return operation.create_disk().source();
+    case Offer::Operation::DESTROY_DISK:
+      return operation.destroy_disk().source();
     case Offer::Operation::RESERVE:
     case Offer::Operation::UNRESERVE:
     case Offer::Operation::CREATE:
-    case Offer::Operation::DESTROY: {
+    case Offer::Operation::DESTROY:
+    case Offer::Operation::GROW_VOLUME:
+    case Offer::Operation::SHRINK_VOLUME: {
       Try<vector<ResourceConversion>> conversions =
         getResourceConversions(operation);
 
@@ -1038,7 +1137,10 @@ bool operator==(const Capabilities& left, const Capabilities& right)
   return left.multiRole == right.multiRole &&
          left.hierarchicalRole == right.hierarchicalRole &&
          left.reservationRefinement == right.reservationRefinement &&
-         left.resourceProvider == right.resourceProvider;
+         left.resourceProvider == right.resourceProvider &&
+         left.resizeVolume == right.resizeVolume &&
+         left.agentOperationFeedback == right.agentOperationFeedback &&
+         left.agentDraining == right.agentDraining;
 }
 
 
@@ -1077,6 +1179,7 @@ ContainerLimitation createContainerLimitation(
 
 ContainerState createContainerState(
     const Option<ExecutorInfo>& executorInfo,
+    const Option<ContainerInfo>& containerInfo,
     const ContainerID& containerId,
     pid_t pid,
     const string& directory)
@@ -1087,11 +1190,120 @@ ContainerState createContainerState(
     state.mutable_executor_info()->CopyFrom(executorInfo.get());
   }
 
+  if (containerInfo.isSome()) {
+    state.mutable_container_info()->CopyFrom(containerInfo.get());
+  }
+
   state.mutable_container_id()->CopyFrom(containerId);
   state.set_pid(pid);
   state.set_directory(directory);
 
   return state;
+}
+
+
+ContainerMountInfo createContainerMount(
+    const string& source,
+    const string& target,
+    unsigned long flags)
+{
+  ContainerMountInfo mnt;
+
+  mnt.set_source(source);
+  mnt.set_target(target);
+  mnt.set_flags(flags);
+
+  return mnt;
+}
+
+
+ContainerMountInfo createContainerMount(
+    const string& source,
+    const string& target,
+    const string& type,
+    unsigned long flags)
+{
+  ContainerMountInfo mnt;
+
+  mnt.set_source(source);
+  mnt.set_target(target);
+  mnt.set_type(type);
+  mnt.set_flags(flags);
+
+  return mnt;
+}
+
+
+ContainerMountInfo createContainerMount(
+    const string& source,
+    const string& target,
+    const string& type,
+    const string& options,
+    unsigned long flags)
+{
+  ContainerMountInfo mnt;
+
+  mnt.set_source(source);
+  mnt.set_target(target);
+  mnt.set_type(type);
+  mnt.set_options(options);
+  mnt.set_flags(flags);
+
+  return mnt;
+}
+
+
+mesos::slave::ContainerFileOperation containerSymlinkOperation(
+    const std::string& source,
+    const std::string& target)
+{
+  ContainerFileOperation op;
+
+  op.set_operation(ContainerFileOperation::SYMLINK);
+  op.mutable_symlink()->set_source(source);
+  op.mutable_symlink()->set_target(target);
+
+  return op;
+}
+
+
+mesos::slave::ContainerFileOperation containerRenameOperation(
+    const std::string& source,
+    const std::string& target)
+{
+  ContainerFileOperation op;
+
+  op.set_operation(ContainerFileOperation::RENAME);
+  op.mutable_rename()->set_source(source);
+  op.mutable_rename()->set_target(target);
+
+  return op;
+}
+
+
+mesos::slave::ContainerFileOperation containerMkdirOperation(
+    const std::string& target,
+    const bool recursive)
+{
+  ContainerFileOperation op;
+
+  op.set_operation(ContainerFileOperation::MKDIR);
+  op.mutable_mkdir()->set_target(target);
+  op.mutable_mkdir()->set_recursive(recursive);
+
+  return op;
+}
+
+
+mesos::slave::ContainerFileOperation containerMountOperation(
+    const ContainerMountInfo& mnt)
+{
+  ContainerFileOperation op;
+
+  op.set_operation(ContainerFileOperation::MOUNT);
+  *op.mutable_mount() = mnt;
+
+  return op;
 }
 
 } // namespace slave {
@@ -1156,6 +1368,47 @@ mesos::maintenance::Schedule createSchedule(
 } // namespace maintenance {
 
 namespace master {
+
+void addMinimumCapability(
+    google::protobuf::RepeatedPtrField<Registry::MinimumCapability>*
+      capabilities,
+    const MasterInfo::Capability::Type& capability)
+{
+  int capabilityIndex =
+    std::find_if(
+        capabilities->begin(),
+        capabilities->end(),
+        [&](const Registry::MinimumCapability& mc) {
+          return mc.capability() == MasterInfo_Capability_Type_Name(capability);
+        }) -
+    capabilities->begin();
+
+  if (capabilityIndex == capabilities->size()) {
+    capabilities->Add()->set_capability(
+        MasterInfo_Capability_Type_Name(capability));
+  }
+}
+
+
+void removeMinimumCapability(
+    google::protobuf::RepeatedPtrField<Registry::MinimumCapability>*
+      capabilities,
+    const MasterInfo::Capability::Type& capability)
+{
+  int capabilityIndex =
+    std::find_if(
+        capabilities->begin(),
+        capabilities->end(),
+        [&](const Registry::MinimumCapability& mc) {
+          return mc.capability() == MasterInfo_Capability_Type_Name(capability);
+        }) -
+    capabilities->begin();
+
+  if (capabilityIndex < capabilities->size()) {
+    capabilities->DeleteSubrange(capabilityIndex, 1);
+  }
+}
+
 namespace event {
 
 mesos::master::Event createTaskUpdated(
@@ -1190,10 +1443,6 @@ mesos::master::Event createTaskAdded(const Task& task)
 mesos::master::Event createFrameworkAdded(
     const mesos::internal::master::Framework& _framework)
 {
-  CHECK(_framework.active());
-  CHECK(_framework.connected());
-  CHECK(!_framework.recovered());
-
   mesos::master::Event event;
   event.set_type(mesos::master::Event::FRAMEWORK_ADDED);
 
@@ -1259,6 +1508,8 @@ mesos::master::Event createFrameworkRemoved(const FrameworkInfo& frameworkInfo)
 
 mesos::master::Response::GetAgents::Agent createAgentResponse(
     const mesos::internal::master::Slave& slave,
+    const Option<DrainInfo>& drainInfo,
+    bool deactivated,
     const Option<Owned<ObjectApprovers>>& approvers)
 {
   mesos::master::Response::GetAgents::Agent agent;
@@ -1267,6 +1518,7 @@ mesos::master::Response::GetAgents::Agent createAgentResponse(
 
   agent.set_pid(string(slave.pid));
   agent.set_active(slave.active);
+  agent.set_deactivated(deactivated);
   agent.set_version(slave.version);
 
   agent.mutable_registered_time()->set_nanoseconds(
@@ -1319,18 +1571,32 @@ mesos::master::Response::GetAgents::Agent createAgentResponse(
         resourceProvider.totalResources);
   }
 
+  if (drainInfo.isSome()) {
+    agent.mutable_drain_info()->CopyFrom(drainInfo.get());
+
+    if (slave.estimatedDrainStartTime.isSome()) {
+      agent.mutable_estimated_drain_start_time()->set_nanoseconds(
+          Seconds(slave.estimatedDrainStartTime->secs()).ns());
+    }
+  }
+
   return agent;
 }
 
 
 mesos::master::Event createAgentAdded(
-    const mesos::internal::master::Slave& slave)
+    const mesos::internal::master::Slave& slave,
+    const Option<DrainInfo>& drainInfo,
+    bool deactivated)
 {
   mesos::master::Event event;
   event.set_type(mesos::master::Event::AGENT_ADDED);
 
   event.mutable_agent_added()->mutable_agent()->CopyFrom(
-      createAgentResponse(slave));
+      createAgentResponse(
+          slave,
+          drainInfo,
+          deactivated));
 
   return event;
 }

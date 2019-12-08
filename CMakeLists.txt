@@ -24,7 +24,7 @@ endif ()
 
 project(Mesos)
 set(MESOS_MAJOR_VERSION 1)
-set(MESOS_MINOR_VERSION 6)
+set(MESOS_MINOR_VERSION 10)
 set(MESOS_PATCH_VERSION 0)
 set(PACKAGE_VERSION
   ${MESOS_MAJOR_VERSION}.${MESOS_MINOR_VERSION}.${MESOS_PATCH_VERSION})
@@ -67,31 +67,6 @@ endif ()
 
 # PACKAGING.
 ############
-# List of sources we will ignore when generating a source package.
-# We assume there are no artifacts from an autotools build.
-#
-# NOTE: An in-source build is not supported. The build directory
-# must be different than the source directory.
-set(CPACK_SOURCE_IGNORE_FILES
-  .clang-format;
-  .gitignore;
-  .reviewboardrc;
-  bootstrap.bat;
-  bootstrap;
-  configure.ac;
-  Doxyfile;
-  mesos.pc.in;
-  /.git/;
-  /docs/;
-  /m4/;
-  /mpi/;
-  /site/;
-  /support/;
-  ${CMAKE_BINARY_DIR};)
-
-# Convert the ignore list to a string (as required by CPack).
-set(CPACK_SOURCE_IGNORE_FILES "${CPACK_SOURCE_IGNORE_FILES}")
-
 # Set the basename of any packages to 'mesos-<version>'.
 set(CPACK_PACKAGE_FILE_NAME "mesos-${MESOS_PACKAGE_VERSION}")
 set(CPACK_SOURCE_PACKAGE_FILE_NAME ${CPACK_PACKAGE_FILE_NAME})
@@ -120,3 +95,15 @@ option(CPACK_SOURCE_TZ   "Enable to build TZ source packages"   OFF)
 option(CPACK_SOURCE_ZIP  "Enable to build ZIP source packages"  OFF)
 
 include(CPack)
+
+if (NOT WIN32)
+  # These targets are intended to mirror the same targets of the Autotools
+  # build. Because these are written as Shell scripts, they cannot be
+  # run on Windows.
+  add_custom_target(dist
+    COMMAND ${CMAKE_SOURCE_DIR}/cmake/dist.sh ${MESOS_PACKAGE_VERSION})
+
+  add_custom_target(distcheck
+    COMMAND ${CMAKE_SOURCE_DIR}/cmake/distcheck.sh ${MESOS_PACKAGE_VERSION}
+    DEPENDS dist)
+endif ()

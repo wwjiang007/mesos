@@ -33,6 +33,7 @@
 
 #include "slave/containerizer/mesos/isolators/docker/volume/driver.hpp"
 #include "slave/containerizer/mesos/isolators/docker/volume/isolator.hpp"
+#include "slave/containerizer/mesos/isolators/docker/volume/paths.hpp"
 
 #include "slave/containerizer/mesos/isolators/filesystem/linux.hpp"
 
@@ -78,7 +79,7 @@ class MockDockerVolumeDriverClient : public DriverClient
 public:
   MockDockerVolumeDriverClient() {}
 
-  virtual ~MockDockerVolumeDriverClient() {}
+  ~MockDockerVolumeDriverClient() override {}
 
   MOCK_METHOD3(
       mount,
@@ -98,7 +99,7 @@ public:
 class DockerVolumeIsolatorTest : public MesosTest
 {
 protected:
-  virtual void TearDown()
+  void TearDown() override
   {
     // Try to remove any mounts under sandbox.
     if (::geteuid() == 0) {
@@ -202,6 +203,7 @@ protected:
         flags,
         true,
         fetcher.get(),
+        nullptr,
         std::move(launcher),
         provisioner->share(),
         {std::move(linuxIsolator),
@@ -685,6 +687,156 @@ TEST_F(DockerVolumeIsolatorTest, ROOT_CommandTaskNoRootfsSlaveRecovery)
 }
 
 
+// This test verifies that agent can recover properly even there is
+// an orphan container's docker volumes checkpoint file is empty which
+// could happen in a real environment if the agent is hard rebooted
+// after the file is created but before the data is synced on disk.
+TEST_F(DockerVolumeIsolatorTest, ROOT_EmptyCheckpointFileSlaveRecovery)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  MockDockerVolumeDriverClient* mockClient = new MockDockerVolumeDriverClient;
+
+  Try<Owned<MesosContainerizer>> containerizer =
+    createContainerizer(flags, Owned<DriverClient>(mockClient));
+
+  ASSERT_SOME(containerizer);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      detector.get(),
+      containerizer->get(),
+      flags);
+
+  ASSERT_SOME(slave);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+
+  MockScheduler sched;
+
+  MesosSchedulerDriver driver(
+      &sched,
+      frameworkInfo,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const Offer& offer = offers.get()[0];
+
+  // Create a volume with relative path.
+  const string driver1 = "driver1";
+  const string name1 = "name1";
+  const string containerPath1 = "tmp/foo1";
+
+  Volume volume1 = createDockerVolume(driver1, name1, containerPath1);
+
+  TaskInfo task = createTask(
+      offer.slave_id(),
+      offer.resources(),
+      "while true; do test -f " + containerPath1 + "/file1; done");
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::MESOS);
+  containerInfo.add_volumes()->CopyFrom(volume1);
+
+  task.mutable_container()->CopyFrom(containerInfo);
+
+  // Create mount point for volume1.
+  const string mountPoint1 = path::join(os::getcwd(), "volume1");
+  ASSERT_SOME(os::mkdir(mountPoint1));
+  ASSERT_SOME(os::touch(path::join(mountPoint1, "file1")));
+
+  Future<string> mount1Name;
+
+  EXPECT_CALL(*mockClient, mount(driver1, _, _))
+    .WillOnce(DoAll(FutureArg<1>(&mount1Name),
+                    Return(mountPoint1)));
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
+
+  Future<Nothing> ack1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> ack2 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  // Wait for the ACK to be checkpointed.
+  AWAIT_READY(ack1);
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  // Wait for the ACK to be checkpointed.
+  AWAIT_READY(ack2);
+
+  Future<hashset<ContainerID>> containers = containerizer.get()->containers();
+  AWAIT_READY(containers);
+  ASSERT_EQ(1u, containers->size());
+
+  ContainerID containerId = *(containers->begin());
+
+  // Stop the slave after TASK_RUNNING is received.
+  slave.get()->terminate();
+
+  // Make the docker volumes checkpoint file empty. This is to simulate the
+  // case that the agent is hard rebooted after the file is created but before
+  // the data is synced on disk, i.e., the file is left empty on disk.
+  const string volumesPath = slave::docker::volume::paths::getVolumesPath(
+      flags.docker_volume_checkpoint_dir,
+      containerId.value());
+
+  ASSERT_SOME(os::write(volumesPath, ""));
+
+  mockClient = new MockDockerVolumeDriverClient;
+
+  containerizer = createContainerizer(flags, Owned<DriverClient>(mockClient));
+
+  ASSERT_SOME(containerizer);
+
+  Future<SlaveReregisteredMessage> reregistered =
+    FUTURE_PROTOBUF(SlaveReregisteredMessage(), master.get()->pid, _);
+
+  // Use the same flags.
+  slave = StartSlave(detector.get(), containerizer->get(), flags);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(reregistered);
+
+  driver.stop();
+  driver.join();
+}
+
+
 // This test verifies that a single docker volumes can be used by
 // multiple containers, and the docker volume isolator will mount
 // the single volume to multiple containers when running tasks and
@@ -1105,6 +1257,415 @@ TEST_F(DockerVolumeIsolatorTest,
 
   AWAIT_READY(statusFinished);
   EXPECT_EQ(TASK_FINISHED, statusFinished->state());
+
+  // Make sure the docker volume unmount parameters are same with
+  // the parameters in `containerInfo`.
+  AWAIT_EXPECT_EQ(name, unmountName);
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that a docker volume with absolute path can
+// be properly mounted to a container with rootfs, and launches a
+// command task that is running as a non-root user and is able to
+// write files from the mounted docker volume.
+TEST_F(DockerVolumeIsolatorTest,
+       ROOT_INTERNET_CURL_UNPRIVILEGED_USER_CommandTaskRootfs)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "docker/volume,docker/runtime,filesystem/linux";
+  flags.image_providers = "docker";
+  flags.docker_volume_chown = true;
+
+  MockDockerVolumeDriverClient* mockClient = new MockDockerVolumeDriverClient;
+
+  Try<Owned<MesosContainerizer>> containerizer =
+    createContainerizer(flags, Owned<DriverClient>(mockClient));
+
+  ASSERT_SOME(containerizer);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      detector.get(),
+      containerizer->get(),
+      flags);
+
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+
+  MesosSchedulerDriver driver(
+      &sched,
+      DEFAULT_FRAMEWORK_INFO,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const Offer& offer = offers.get()[0];
+
+  // Create a volume with absolute path.
+  const string volumeDriver = "driver";
+  const string name = "name";
+
+  const string containerPath = path::join(os::getcwd(), "foo");
+
+  Volume volume = createDockerVolume(volumeDriver, name, containerPath);
+
+  Option<string> user = os::getenv("SUDO_USER");
+  ASSERT_SOME(user);
+
+  // NOTE: We use a non-shell command here because 'sh' might not be
+  // in the PATH. 'alpine' does not specify env PATH in the image. On
+  // some linux distribution, '/bin' is not in the PATH by default.
+  CommandInfo command;
+  command.set_shell(false);
+  command.set_value("/usr/bin/test");
+  command.add_arguments("test");
+  command.add_arguments("-w");
+  command.add_arguments(containerPath);
+
+  command.set_user(user.get());
+
+  TaskInfo task = createTask(
+      offer.slave_id(),
+      offer.resources(),
+      command);
+
+  Image image;
+  image.set_type(Image::DOCKER);
+  image.mutable_docker()->set_name("alpine");
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::MESOS);
+  containerInfo.add_volumes()->CopyFrom(volume);
+
+  containerInfo.mutable_mesos()->mutable_image()->CopyFrom(image);
+
+  task.mutable_container()->CopyFrom(containerInfo);
+
+  // Create mount point for volume.
+  const string mountPoint = path::join(os::getcwd(), "volume");
+  ASSERT_SOME(os::mkdir(mountPoint));
+
+  Future<string> mountName;
+
+  EXPECT_CALL(*mockClient, mount(volumeDriver, _, _))
+    .WillOnce(DoAll(FutureArg<1>(&mountName),
+                    Return(mountPoint)));
+
+  Future<string> unmountName;
+
+  EXPECT_CALL(*mockClient, unmount(volumeDriver, _))
+    .WillOnce(DoAll(FutureArg<1>(&unmountName),
+                    Return(Nothing())));
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFinished;
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFinished));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  AWAIT_EXPECT_EQ(name, mountName);
+
+  AWAIT_READY(statusFinished);
+  EXPECT_EQ(TASK_FINISHED, statusFinished->state());
+
+  AWAIT_EXPECT_EQ(name, unmountName);
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that a container launched without
+// a rootfs cannot write to a read-only docker volume.
+TEST_F(DockerVolumeIsolatorTest, ROOT_CommandTaskNoRootfsWithReadOnlyVolume)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  MockDockerVolumeDriverClient* mockClient = new MockDockerVolumeDriverClient;
+
+  Try<Owned<MesosContainerizer>> containerizer =
+    createContainerizer(flags, Owned<DriverClient>(mockClient));
+
+  ASSERT_SOME(containerizer);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      detector.get(),
+      containerizer->get(),
+      flags);
+
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+
+  MesosSchedulerDriver driver(
+      &sched,
+      DEFAULT_FRAMEWORK_INFO,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const Offer& offer = offers.get()[0];
+
+  const string key = "iops";
+  const string value = "150";
+
+  hashmap<string, string> options = {{key, value}};
+
+  // Create a volume with relative path.
+  const string _driver = "driver";
+  const string name = "name";
+  const string containerPath = "tmp/foo";
+
+  Volume volume = createDockerVolume(_driver, name, containerPath, options);
+  volume.set_mode(Volume::RO);
+
+  TaskInfo task = createTask(
+      offer.slave_id(),
+      offer.resources(),
+      "echo 'hello' > " + containerPath + "/file");
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::MESOS);
+  containerInfo.add_volumes()->CopyFrom(volume);
+
+  task.mutable_container()->CopyFrom(containerInfo);
+
+  // Create mount point for volume.
+  const string mountPoint = path::join(os::getcwd(), "volume");
+  ASSERT_SOME(os::mkdir(mountPoint));
+
+  Future<string> mountName;
+  Future<hashmap<string, string>> mountOptions;
+
+  EXPECT_CALL(*mockClient, mount(_driver, _, _))
+    .WillOnce(DoAll(FutureArg<1>(&mountName),
+                    FutureArg<2>(&mountOptions),
+                    Return(mountPoint)));
+
+  Future<string> unmountName;
+
+  EXPECT_CALL(*mockClient, unmount(_driver, _))
+    .WillOnce(DoAll(FutureArg<1>(&unmountName),
+                    Return(Nothing())));
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFailed;
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFailed));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  // Make sure the docker volume mount parameters are same with the
+  // parameters in `containerInfo`.
+  AWAIT_EXPECT_EQ(name, mountName);
+
+  AWAIT_READY(mountOptions);
+  EXPECT_SOME_EQ(value, mountOptions->get(key));
+
+  AWAIT_READY(statusFailed);
+  EXPECT_EQ(TASK_FAILED, statusFailed->state());
+
+  // Make sure the docker volume unmount parameters are same with
+  // the parameters in `containerInfo`.
+  AWAIT_EXPECT_EQ(name, unmountName);
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that a container launched with
+// a rootfs cannot write to a read-only docker volume.
+TEST_F(DockerVolumeIsolatorTest,
+       ROOT_INTERNET_CURL_CommandTaskRootfsWithReadOnlyVolume)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "docker/volume,docker/runtime,filesystem/linux";
+  flags.image_providers = "docker";
+
+  MockDockerVolumeDriverClient* mockClient = new MockDockerVolumeDriverClient;
+
+  Try<Owned<MesosContainerizer>> containerizer =
+    createContainerizer(flags, Owned<DriverClient>(mockClient));
+
+  ASSERT_SOME(containerizer);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      detector.get(),
+      containerizer->get(),
+      flags);
+
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+
+  MesosSchedulerDriver driver(
+      &sched,
+      DEFAULT_FRAMEWORK_INFO,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const Offer& offer = offers.get()[0];
+
+  const string key = "iops";
+  const string value = "150";
+
+  hashmap<string, string> options = {{key, value}};
+
+  // Create a volume with relative path.
+  const string _driver = "driver";
+  const string name = "name";
+  const string containerPath = "tmp/foo";
+
+  Volume volume = createDockerVolume(_driver, name, containerPath, options);
+  volume.set_mode(Volume::RO);
+
+  TaskInfo task = createTask(
+      offer.slave_id(),
+      offer.resources(),
+      "echo 'hello' > " + containerPath + "/file");
+
+  Image image;
+  image.set_type(Image::DOCKER);
+  image.mutable_docker()->set_name("alpine");
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::MESOS);
+  containerInfo.add_volumes()->CopyFrom(volume);
+
+  containerInfo.mutable_mesos()->mutable_image()->CopyFrom(image);
+
+  task.mutable_container()->CopyFrom(containerInfo);
+
+  // Create mount point for volume.
+  const string mountPoint = path::join(os::getcwd(), "volume");
+  ASSERT_SOME(os::mkdir(mountPoint));
+
+  Future<string> mountName;
+  Future<hashmap<string, string>> mountOptions;
+
+  EXPECT_CALL(*mockClient, mount(_driver, _, _))
+    .WillOnce(DoAll(FutureArg<1>(&mountName),
+                    FutureArg<2>(&mountOptions),
+                    Return(mountPoint)));
+
+  Future<string> unmountName;
+
+  EXPECT_CALL(*mockClient, unmount(_driver, _))
+    .WillOnce(DoAll(FutureArg<1>(&unmountName),
+                    Return(Nothing())));
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFailed;
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFailed));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  // Make sure the docker volume mount parameters are same with the
+  // parameters in `containerInfo`.
+  AWAIT_EXPECT_EQ(name, mountName);
+
+  AWAIT_READY(mountOptions);
+  EXPECT_SOME_EQ(value, mountOptions->get(key));
+
+  AWAIT_READY(statusFailed);
+  EXPECT_EQ(TASK_FAILED, statusFailed->state());
 
   // Make sure the docker volume unmount parameters are same with
   // the parameters in `containerInfo`.

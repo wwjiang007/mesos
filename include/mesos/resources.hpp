@@ -23,9 +23,13 @@
 #include <string>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+#include <boost/iterator/indirect_iterator.hpp>
+
 #include <google/protobuf/repeated_field.h>
 
 #include <mesos/mesos.hpp>
+#include <mesos/resource_quantities.hpp>
 #include <mesos/type_utils.hpp>
 #include <mesos/values.hpp>
 
@@ -100,6 +104,22 @@ private:
       }
     }
 
+    /*implicit*/ Resource_(Resource&& _resource)
+      : resource(std::move(_resource)),
+        sharedCount(None())
+    {
+      // Setting the counter to 1 to denote "one copy" of the shared resource.
+      if (resource.has_shared()) {
+        sharedCount = 1;
+      }
+    }
+
+    Resource_(const Resource_& resource_) = default;
+    Resource_(Resource_&& resource_) = default;
+
+    Resource_& operator=(const Resource_&) = default;
+    Resource_& operator=(Resource_&&) = default;
+
     // By implicitly converting to Resource we are able to keep Resource_
     // logic internal and expose only the protobuf object.
     operator const Resource&() const { return resource; }
@@ -150,6 +170,11 @@ private:
   };
 
 public:
+  // We rename the type here to alert people about the fact that with
+  // `shared_ptr`, no mutation should be made without obtaining exclusive
+  // ownership. See `resourcesNoMutationWithoutExclusiveOwnership`.
+  using Resource_Unsafe = std::shared_ptr<Resource_>;
+
   /**
    * Returns a Resource with the given name, value, and role.
    *
@@ -324,6 +349,16 @@ public:
   // Tests if the given Resource object is shared.
   static bool isShared(const Resource& resource);
 
+  // Returns true if the resource is allocated to the role subtree
+  // (i.e. either to the role itself or to its decedents).
+  static bool isAllocatedToRoleSubtree(
+      const Resource& resource, const std::string& role);
+
+  // Returns true if the resource is reserved to the role subtree
+  // (i.e. either to the role itself or to its decedents).
+  static bool isReservedToRoleSubtree(
+      const Resource& resource, const std::string& role);
+
   // Tests if the given Resource object has refined reservations.
   static bool hasRefinedReservations(const Resource& resource);
 
@@ -340,6 +375,20 @@ public:
   // Returns false otherwise (i.e. the resource is indivisible.
   // E.g. MOUNT volume).
   static bool shrink(Resource* resource, const Value::Scalar& target);
+
+  // Returns the most refined reserved resource that can be
+  // reached by modifications to `a`'s or `b`'s reservations.
+  //
+  // Both `a` and `b` must refer to identical resource quantities.
+  static Resource getReservationAncestor(const Resource& a, const Resource& b);
+
+  // Returns the most refined reserved resources that can be
+  // reached by modifications to `a`'s or `b`'s reservations.
+  //
+  // Both `a` and `b` must be non-empty, and must contain the
+  // same resources except for reservations.
+  static Resources getReservationAncestor(
+      const Resources& a, const Resources& b);
 
   // Returns the summed up Resources given a hashmap<Key, Resources>.
   //
@@ -368,32 +417,60 @@ public:
 
   // TODO(jieyu): Consider using C++11 initializer list.
   /*implicit*/ Resources(const Resource& resource);
+  /*implicit*/ Resources(Resource&& resource);
 
   /*implicit*/
   Resources(const std::vector<Resource>& _resources);
+  Resources(std::vector<Resource>&& _resources);
 
   /*implicit*/
   Resources(const google::protobuf::RepeatedPtrField<Resource>& _resources);
+  Resources(google::protobuf::RepeatedPtrField<Resource>&& _resources);
 
-  Resources(const Resources& that) : resources(that.resources) {}
+  Resources(const Resources& that) = default;
+  Resources(Resources&& that) = default;
 
   Resources& operator=(const Resources& that)
   {
     if (this != &that) {
-      resources = that.resources;
+      resourcesNoMutationWithoutExclusiveOwnership =
+        that.resourcesNoMutationWithoutExclusiveOwnership;
     }
     return *this;
   }
 
-  bool empty() const { return resources.size() == 0; }
+  Resources& operator=(Resources&& that)
+  {
+    if (this != &that) {
+      resourcesNoMutationWithoutExclusiveOwnership =
+        std::move(that.resourcesNoMutationWithoutExclusiveOwnership);
+    }
+    return *this;
+  }
 
-  size_t size() const { return resources.size(); }
+  bool empty() const
+  {
+    return resourcesNoMutationWithoutExclusiveOwnership.size() == 0;
+  }
+
+  size_t size() const
+  {
+    return resourcesNoMutationWithoutExclusiveOwnership.size();
+  }
 
   // Checks if this Resources is a superset of the given Resources.
   bool contains(const Resources& that) const;
 
   // Checks if this Resources contains the given Resource.
   bool contains(const Resource& that) const;
+
+  // Checks if the quantities of this `Resources` is a superset of the
+  // given `ResourceQuantities`. If a `Resource` object is `SCALAR` type,
+  // its quantity is its scalar value. For `RANGES` and `SET` type, their
+  // quantities are the number of different instances in the range or set.
+  // For example, "range:[1-5]" has a quantity of 5 and "set:{a,b}" has a
+  // quantity of 2.
+  bool contains(const ResourceQuantities& quantities) const;
 
   // Count the Resource objects that match the specified value.
   //
@@ -428,6 +505,14 @@ public:
   // definition of 'allocatableTo'.
   Resources allocatableTo(const std::string& role) const;
 
+  // Returns resources that are allocated to the role subtree
+  // (i.e. either to the role itself or to its decedents).
+  Resources allocatedToRoleSubtree(const std::string& role) const;
+
+  // Returns resources that are reserved to the role subtree
+  // (i.e. either to the role itself or to its decedents).
+  Resources reservedToRoleSubtree(const std::string& role) const;
+
   // Returns the unreserved resources.
   Resources unreserved() const;
 
@@ -452,21 +537,20 @@ public:
 
   // Returns a `Resources` object with the new reservation added to the back.
   // The new reservation must be a valid refinement of the current reservation.
-  Resources pushReservation(const Resource::ReservationInfo& reservation) const;
+  STOUT_NODISCARD Resources pushReservation(
+      const Resource::ReservationInfo& reservation) const;
 
   // Returns a `Resources` object with the last reservation removed.
   // Every resource in `Resources` must have `resource.reservations_size() > 0`.
-  Resources popReservation() const;
+  STOUT_NODISCARD Resources popReservation() const;
 
   // Returns a `Resources` object with all of the reservations removed.
   Resources toUnreserved() const;
 
   // Returns a Resources object that contains all the scalar resources
-  // in this object, but with their AllocationInfo, ReservationInfo,
-  // DiskInfo, and SharedInfo omitted. The `role` and RevocableInfo,
-  // if any, are preserved. Because we clear ReservationInfo but
-  // preserve `role`, this means that stripping a dynamically reserved
-  // resource makes it effectively statically reserved.
+  // but with all the meta-data fields, such as AllocationInfo,
+  // ReservationInfo and etc. cleared. Only scalar resources' name,
+  // type (SCALAR) and value are preserved.
   //
   // This is intended for code that would like to aggregate together
   // Resource values without regard for metadata like whether the
@@ -554,24 +638,38 @@ public:
   // which holds the ephemeral ports allocation logic.
   Option<Value::Ranges> ephemeral_ports() const;
 
-  // NOTE: Non-`const` `iterator`, `begin()` and `end()` are __intentionally__
-  // defined with `const` semantics in order to prevent mutable access to the
-  // `Resource` objects within `resources`.
-  typedef std::vector<Resource_>::const_iterator iterator;
-  typedef std::vector<Resource_>::const_iterator const_iterator;
+  // We use `boost::indirect_iterator` to expose `Resource` (implicitly
+  // converted from `Resource_`) iteration, while actually storing
+  // `Resource_Unsafe`.
+  //
+  // NOTE: Non-const `begin()` and `end()` intentionally return const
+  // iterators to prevent mutable access to the `Resource` objects.
+
+  typedef boost::indirect_iterator<
+      boost::container::small_vector_base<Resource_Unsafe>::const_iterator>
+    const_iterator;
 
   const_iterator begin()
   {
-    return static_cast<const std::vector<Resource_>&>(resources).begin();
+    const auto& self = *this;
+    return self.begin();
   }
 
   const_iterator end()
   {
-    return static_cast<const std::vector<Resource_>&>(resources).end();
+    const auto& self = *this;
+    return self.end();
   }
 
-  const_iterator begin() const { return resources.begin(); }
-  const_iterator end() const { return resources.end(); }
+  const_iterator begin() const
+  {
+    return resourcesNoMutationWithoutExclusiveOwnership.begin();
+  }
+
+  const_iterator end() const
+  {
+    return resourcesNoMutationWithoutExclusiveOwnership.end();
+  }
 
   // Using this operator makes it easy to copy a resources object into
   // a protocol buffer field.
@@ -587,10 +685,23 @@ public:
   // doing subtraction), the semantics is as though the second operand
   // was actually just an empty resource (as though you didn't do the
   // operation at all).
-  Resources operator+(const Resource& that) const;
-  Resources operator+(const Resources& that) const;
+  Resources operator+(const Resource& that) const &;
+  Resources operator+(const Resource& that) &&;
+
+  Resources operator+(Resource&& that) const &;
+  Resources operator+(Resource&& that) &&;
+
   Resources& operator+=(const Resource& that);
+  Resources& operator+=(Resource&& that);
+
+  Resources operator+(const Resources& that) const &;
+  Resources operator+(const Resources& that) &&;
+
+  Resources operator+(Resources&& that) const &;
+  Resources operator+(Resources&& that) &&;
+
   Resources& operator+=(const Resources& that);
+  Resources& operator+=(Resources&& that);
 
   Resources operator-(const Resource& that) const;
   Resources operator-(const Resources& that) const;
@@ -621,15 +732,48 @@ private:
   // NOTE: `Resource` objects are implicitly converted to `Resource_`
   // objects, so here the API can also accept a `Resource` object.
   void add(const Resource_& r);
+  void add(Resource_&& r);
+
+  // TODO(mzhu): Add move support.
+  void add(const Resource_Unsafe& that);
+
   void subtract(const Resource_& r);
 
-  Resources operator+(const Resource_& that) const;
   Resources& operator+=(const Resource_& that);
+  Resources& operator+=(Resource_&& that);
 
-  Resources operator-(const Resource_& that) const;
   Resources& operator-=(const Resource_& that);
 
-  std::vector<Resource_> resources;
+  // Resources are stored using copy-on-write:
+  //
+  //   (1) Copies are done by copying the `shared_ptr`. This
+  //       makes read-only filtering (e.g. `unreserved()`)
+  //       inexpensive as we do not have to perform copies
+  //       of the resource objects.
+  //
+  //   (2) When a write occurs:
+  //      (a) If there's a single reference to the resource
+  //          object, we mutate directly.
+  //      (b) If there's more than a single reference to the
+  //          resource object, we copy first, then mutate the copy.
+  //
+  // We name the `vector` field `resourcesNoMutationWithoutExclusiveOwnership`
+  // and typedef its item type to `Resource_Unsafe` to alert people
+  // regarding (2).
+  //
+  // TODO(mzhu): While naming the vector and its item type may help, this is
+  // still brittle and certainly not ideal. Explore more robust designs such as
+  // introducing a customized copy-on-write abstraction that hides direct
+  // setters and only allow mutations in a controlled fashion.
+  //
+  // TODO(mzhu): Consider using `boost::intrusive_ptr` for
+  // possibly better performance.
+  //
+  // We chose a size of 15 based on the fact that we have five first class
+  // resources (cpu, mem, disk, gpu and port). And 15 would allow one set of
+  // unreserved resources and two sets of reservations.
+  boost::container::small_vector<Resource_Unsafe, 15>
+    resourcesNoMutationWithoutExclusiveOwnership;
 };
 
 
@@ -694,6 +838,15 @@ hashmap<Key, Resources> operator+(
   result += right;
   return result;
 }
+
+
+// Tests if `right` is contained in `left`, note that most
+// callers should just make use of `Resources::contains(...)`.
+// However, if dealing only with singular `Resource` objects,
+// this has lower overhead.
+//
+// NOTE: `left` and `right` must be valid resource objects.
+bool contains(const Resource& left, const Resource& right);
 
 
 /**

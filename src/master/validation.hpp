@@ -50,10 +50,14 @@ namespace master {
 namespace call {
 
 // Validates that a master:Call is well-formed.
+//
+// TODO(bmahler): Note that this does not validate the fields within
+// the nested messages (e.g. `ReserveResources`) which is unintuitive.
+// Consider moving all `master::Call` validation that does not require
+// master state into this function.
+//
 // TODO(bmahler): Add unit tests.
-Option<Error> validate(
-    const mesos::master::Call& call,
-    const Option<process::http::authentication::Principal>& principal = None());
+Option<Error> validate(const mesos::master::Call& call);
 
 } // namespace call {
 
@@ -99,13 +103,32 @@ namespace internal {
 // +-------+-------+---------+
 Option<Error> validateRoles(const mesos::FrameworkInfo& frameworkInfo);
 
+Option<Error> validateFrameworkId(const mesos::FrameworkInfo& frameworkInfo);
+
+Option<Error> validateOfferFilters(const FrameworkInfo& frameworkInfo);
+
 } // namespace internal {
 
 // Validate a FrameworkInfo.
-//
-// TODO(jay_guo): This currently only validates
-// the role(s), validate more fields!
 Option<Error> validate(const mesos::FrameworkInfo& frameworkInfo);
+
+// Validate that the immutable fields of two FrameworkInfos are identical.
+// Currently these fields are 'principal', 'user' and 'checkpoint'.
+Option<Error> validateUpdate(
+    const FrameworkInfo& oldInfo,
+    const FrameworkInfo& newInfo);
+
+// Adjusts `newInfo` to ensure that the `user` and `checkpoint` fields
+// are not modified and logs a warning if they were modified.
+//
+// NOTE: This is a legacy function used to preserve the behavior of
+// re-subscription silently ignoring these fields. It should not be
+// used in new code.
+//
+// TODO(asekretenko): Remove this function (see MESOS-9747).
+void preserveImmutableFields(
+    const FrameworkInfo& oldInfo,
+    FrameworkInfo* newInfo);
 
 } // namespace framework {
 
@@ -132,6 +155,11 @@ Option<Error> validateSingleResourceProvider(
     const google::protobuf::RepeatedPtrField<Resource>& resources);
 
 } // namespace internal {
+
+// Returns `true` if there is any overlap between set- or range-valued
+// resources in the provided `Resources` objects.
+bool detectOverlappingSetAndRangeResources(
+    const std::vector<Resources>& resources);
 
 // Validates resources specified by frameworks.
 // NOTE: We cannot take 'Resources' here because invalid resources are
@@ -188,6 +216,9 @@ Option<Error> validateTaskAndExecutorResources(const TaskInfo& task);
 
 // Validates the kill policy of the task.
 Option<Error> validateKillPolicy(const TaskInfo& task);
+
+// Validates `max_completion_time` of the task.
+Option<Error> validateMaxCompletionTime(const TaskInfo& task);
 
 // Validates the check of the task.
 Option<Error> validateCheck(const TaskInfo& task);
@@ -299,10 +330,20 @@ Option<Error> validate(
     const Option<FrameworkInfo>& frameworkInfo = None());
 
 
-Option<Error> validate(const Offer::Operation::CreateVolume& createVolume);
-Option<Error> validate(const Offer::Operation::DestroyVolume& destroyVolume);
-Option<Error> validate(const Offer::Operation::CreateBlock& createBlock);
-Option<Error> validate(const Offer::Operation::DestroyBlock& destroyBlock);
+Option<Error> validate(
+    const Offer::Operation::GrowVolume& growVolume,
+    const protobuf::slave::Capabilities& agentCapabilities);
+
+
+Option<Error> validate(
+    const Offer::Operation::ShrinkVolume& shrinkVolume,
+    const protobuf::slave::Capabilities& agentCapabilities);
+
+
+Option<Error> validate(const Offer::Operation::CreateDisk& createDisk);
+
+
+Option<Error> validate(const Offer::Operation::DestroyDisk& destroyDisk);
 
 } // namespace operation {
 

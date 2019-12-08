@@ -16,6 +16,8 @@
 #include <sys/param.h>
 #endif // __WINDOWS__
 
+#include <event2/event-config.h>
+
 #include <openssl/err.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
@@ -29,9 +31,12 @@
 #include <process/once.hpp>
 
 #include <process/ssl/flags.hpp>
+#include <process/ssl/tls_config.hpp>
 
 #include <stout/os.hpp>
 #include <stout/strings.hpp>
+#include <stout/stopwatch.hpp>
+#include <stout/try.hpp>
 
 #ifdef __WINDOWS__
 // OpenSSL on Windows requires this adapter module to be compiled as part of the
@@ -41,6 +46,18 @@
 // https://www.openssl.org/docs/faq.html
 #include <openssl/applink.c>
 #endif // __WINDOWS__
+
+// Smallest OpenSSL version number to which the `X509_VERIFY_PARAM_*()`
+// family of functions was backported. (OpenSSL 1.0.2)
+#define MIN_VERSION_X509_VERIFY_PARAM 0x10002000L
+
+// Smallest OpenSSL version number that deprecated the `ASN1_STRING_data()`
+// function in favor of `ASN1_STRING_get0_data()`. (OpenSSL 1.1.0)
+#define MIN_VERSION_ASN1_STRING_GET0 0x10100000L
+
+#if OPENSSL_VERSION_NUMBER < MIN_VERSION_ASN1_STRING_GET0
+#  define ASN1_STRING_get0_data ASN1_STRING_data
+#endif
 
 using std::map;
 using std::ostringstream;
@@ -58,6 +75,14 @@ struct CRYPTO_dynlock_value
 namespace process {
 namespace network {
 namespace openssl {
+
+// A warning is printed when a reverse DNS lookup takes longer
+// than this threshold value. According to [1], average DNS query
+// times vary between 5ms up to 50ms depending on what the network
+// is doing, but most should be down in the < 20ms range.
+//
+// [1] https://blogs.akamai.com/2017/06/why-you-should-care-about-dns-latency.html
+static constexpr Duration SLOW_DNS_WARN_THRESHOLD = Milliseconds(100);
 
 // _Global_ OpenSSL context, initialized via 'initialize'.
 static SSL_CTX* ctx = nullptr;
@@ -85,15 +110,31 @@ Flags::Flags()
       "key_file",
       "Path to key.");
 
+  // NOTE: We're not using the libprocess built-in `DeprecatedName` mechanism
+  // for these aliases. This is to prevent the situation where a task
+  // configuration specifies the old value and the agent configuration
+  // specifies the new value, causing a program crash at startup when
+  // libprocess parses the environment for flags.
   add(&Flags::verify_cert,
       "verify_cert",
-      "Whether or not to verify peer certificates.",
+      "Legacy alias for `verify_server_cert`.",
+      false);
+
+  add(&Flags::verify_server_cert,
+      "verify_server_cert",
+      "Whether or not to require and verify server certificates for "
+      "connections in client mode.",
       false);
 
   add(&Flags::require_cert,
       "require_cert",
-      "Whether or not to require peer certificates. Requiring a peer "
-      "certificate implies verifying it.",
+      "Legacy alias for `require_client_cert",
+      false);
+
+  add(&Flags::require_client_cert,
+      "require_client_cert",
+      "Whether or not to require and verify client certificates for "
+      "connections in server mode.",
       false);
 
   add(&Flags::verify_ipadd,
@@ -136,6 +177,18 @@ Flags::Flags()
       "the documentation of your OpenSSL.",
       "auto");
 
+  add(&Flags::hostname_validation_scheme,
+      "hostname_validation_scheme",
+      "Select the scheme used to perform hostname validation when"
+      " verifying certificates.\n"
+      "Possible values: 'legacy', 'openssl'\n"
+      "See `docs/ssl.md` for details on the individual algorithms.\n"
+#if OPENSSL_VERSION_NUMBER < MIN_VERSION_X509_VERIFY_PARAM
+      "NOTE: The currently linked version of OpenSSL is too old to support"
+      " the 'openssl' scheme, version 1.0.2 or higher is required.\n"
+#endif
+      , "legacy");
+
   // We purposely don't have a flag for SSLv2. We do this because most
   // systems have disabled SSLv2 at compilation due to having so many
   // security vulnerabilities.
@@ -147,18 +200,23 @@ Flags::Flags()
 
   add(&Flags::enable_tls_v1_0,
       "enable_tls_v1_0",
-      "Enable SSLV1.0.",
+      "Enable TLSv1.0.",
       false);
 
   add(&Flags::enable_tls_v1_1,
       "enable_tls_v1_1",
-      "Enable SSLV1.1.",
+      "Enable TLSv1.1.",
       false);
 
   add(&Flags::enable_tls_v1_2,
       "enable_tls_v1_2",
-      "Enable SSLV1.2.",
+      "Enable TLSv1.2.",
       true);
+
+  add(&Flags::enable_tls_v1_3,
+      "enable_tls_v1_3",
+      "Enable TLSv1.3.",
+      false);
 }
 
 
@@ -488,6 +546,30 @@ void reinitialize()
       "Failed SSL connections will be downgraded to a non-SSL socket";
   }
 
+  // TODO(bevers): Remove the deprecated names for these flags after an
+  // appropriate amount of time. (MESOS-9973)
+  if (ssl_flags->verify_cert) {
+    LOG(WARNING) << "Usage of LIBPROCESS_SSL_VERIFY_CERT is deprecated; "
+                    "it was renamed to LIBPROCESS_SSL_VERIFY_SERVER_CERT";
+    ssl_flags->verify_server_cert = true;
+  }
+
+  if (ssl_flags->require_cert) {
+    LOG(WARNING) << "Usage of LIBPROCESS_SSL_REQUIRE_CERT is deprecated; "
+                    "it was renamed to LIBPROCESS_SSL_REQUIRE_CLIENT_CERT";
+    ssl_flags->require_client_cert = true;
+  }
+
+  // Print an additional warning if certificate verification is enabled while
+  // supporting downgrades, since this is most likely a misconfiguration.
+  if ((ssl_flags->require_client_cert || ssl_flags->verify_server_cert) &&
+      ssl_flags->support_downgrade) {
+    LOG(WARNING)
+      << "TLS certificate verification was enabled by setting one of"
+      << " LIBPROCESS_SSL_VERIFY_CERT or LIBPROCESS_SSL_REQUIRE_CERT, but"
+      << " can be bypassed because TLS downgrades are enabled.";
+  }
+
   // Now do some validation of the flags/environment variables.
   if (ssl_flags->key_file.isNone()) {
     EXIT(EXIT_FAILURE)
@@ -510,35 +592,72 @@ void reinitialize()
               << "Set CA directory path with LIBPROCESS_SSL_CA_DIR=<dirpath>";
   }
 
-  if (!ssl_flags->verify_cert) {
-    LOG(INFO) << "Will not verify peer certificate!\n"
-              << "NOTE: Set LIBPROCESS_SSL_VERIFY_CERT=1 to enable "
-              << "peer certificate verification";
+  if (ssl_flags->require_client_cert) {
+    LOG(INFO) << "Will require client certificates for incoming TLS "
+              << "connections.";
   }
 
-  if (!ssl_flags->require_cert) {
-    LOG(INFO) << "Will only verify peer certificate if presented!\n"
-              << "NOTE: Set LIBPROCESS_SSL_REQUIRE_CERT=1 to require "
-              << "peer certificate verification";
+// NOTE: Newer versions of libevent call these macros `EVENT__NUMERIC_VERSION`
+// and `EVENT__HAVE_POLL`.
+#if defined(_EVENT_HAVE_EPOLL) && \
+    defined(_EVENT_NUMERIC_VERSION) && \
+    _EVENT_NUMERIC_VERSION < 0x02010400L
+  if (ssl_flags->require_client_cert &&
+      ssl_flags->hostname_validation_scheme == "legacy") {
+    LOG(WARNING) << "Enabling client certificate validation with the "
+                 << "'legacy' hostname validation scheme is known to "
+                 << "cause sporadic hangs with older versions of libevent. "
+                 << "See https://issues.apache.org/jira/browse/MESOS-9867.";
   }
+#endif
 
   if (ssl_flags->verify_ipadd) {
     LOG(INFO) << "Will use IP address verification in subject alternative name "
               << "certificate extension.";
   }
 
-  if (ssl_flags->require_cert && !ssl_flags->verify_cert) {
-    // Requiring a certificate implies that is should be verified.
-    ssl_flags->verify_cert = true;
+  if (ssl_flags->require_client_cert && !ssl_flags->verify_server_cert) {
+    // For backwards compatibility, `require_cert` implies `verify_cert`.
+    //
+    // NOTE: Even without backwards compatibility considerations, this is
+    // a reasonable requirement on the configuration so we apply the
+    // same logic even when the modern names `require_client_cert` and
+    // `verify_server_cert` are used.
+    ssl_flags->verify_server_cert = true;
 
     LOG(INFO) << "LIBPROCESS_SSL_REQUIRE_CERT implies "
-              << "peer certificate verification.\n"
+              << "server certificate verification.\n"
               << "LIBPROCESS_SSL_VERIFY_CERT set to true";
   }
 
+  if (ssl_flags->verify_server_cert) {
+    LOG(INFO) << "Will verify server certificates for outgoing TLS "
+              << "connections.";
+  } else {
+    LOG(INFO) << "Will not verify server certificates!\n"
+              << "NOTE: Set LIBPROCESS_SSL_VERIFY_SERVER_CERT=1 to enable "
+              << "peer certificate verification";
+  }
+
+  if (ssl_flags->hostname_validation_scheme != "legacy" &&
+      ssl_flags->hostname_validation_scheme != "openssl") {
+    EXIT(EXIT_FAILURE) << "Unknown value for hostname_validation_scheme: "
+                       << ssl_flags->hostname_validation_scheme;
+  }
+
+  if (ssl_flags->hostname_validation_scheme == "openssl" &&
+      OPENSSL_VERSION_NUMBER < MIN_VERSION_X509_VERIFY_PARAM) {
+    EXIT(EXIT_FAILURE)
+      << "The 'openssl' hostname validation scheme requires OpenSSL"
+         " version 1.0.2 or higher";
+  }
+
+  LOG(INFO) << "Using '" << ssl_flags->hostname_validation_scheme
+            << "' scheme for hostname validation";
+
   // Initialize OpenSSL if we've been asked to do verification of peer
   // certificates.
-  if (ssl_flags->verify_cert) {
+  if (ssl_flags->verify_server_cert) {
     // Set CA locations.
     if (ssl_flags->ca_file.isSome() || ssl_flags->ca_dir.isSome()) {
       const char* ca_file =
@@ -595,19 +714,10 @@ void reinitialize()
                 << "' and/or directory '" << ca_dir << "'";
     }
 
-    // Set SSL peer verification callback.
-    int mode = SSL_VERIFY_PEER;
-
-    if (ssl_flags->require_cert) {
-      mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
-    }
-
-    SSL_CTX_set_verify(ctx, mode, &verify_callback);
-
     SSL_CTX_set_verify_depth(ctx, ssl_flags->verification_depth);
-  } else {
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
   }
+
+  SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
 
   // Set certificate chain.
   if (SSL_CTX_use_certificate_chain_file(
@@ -645,19 +755,23 @@ void reinitialize()
       << "(OpenSSL error #" << stringify(error) << "): " << error_string(error);
   }
 
+  long ssl_options =
+    SSL_OP_NO_SSLv2 |
+    SSL_OP_NO_SSLv3 |
+    SSL_OP_NO_TLSv1 |
+    SSL_OP_NO_TLSv1_1 |
+#if defined(SSL_OP_NO_TLSv1_3)
+    SSL_OP_NO_TLSv1_3 |
+#endif
+    SSL_OP_NO_TLSv1_2;
+
   // Clear all the protocol options. They will be reset if needed
   // below. We do this because 'SSL_CTX_set_options' only augments, it
   // does not do an overwrite.
-  SSL_CTX_clear_options(
-      ctx,
-      SSL_OP_NO_SSLv2 |
-      SSL_OP_NO_SSLv3 |
-      SSL_OP_NO_TLSv1 |
-      SSL_OP_NO_TLSv1_1 |
-      SSL_OP_NO_TLSv1_2);
+  SSL_CTX_clear_options(ctx, ssl_options);
 
   // Use server preference for cipher.
-  long ssl_options = SSL_OP_CIPHER_SERVER_PREFERENCE;
+  ssl_options = SSL_OP_CIPHER_SERVER_PREFERENCE;
 
   // Always disable SSLv2. We do this because most systems have
   // disabled SSLv2 at compilation due to having so many security
@@ -672,6 +786,10 @@ void reinitialize()
   if (!ssl_flags->enable_tls_v1_1) { ssl_options |= SSL_OP_NO_TLSv1_1; }
   // Disable TLSv1.2.
   if (!ssl_flags->enable_tls_v1_2) { ssl_options |= SSL_OP_NO_TLSv1_2; }
+#if defined(SSL_OP_NO_TLSv1_3)
+  // Disable TLSv1.3.
+  if (!ssl_flags->enable_tls_v1_3) { ssl_options |= SSL_OP_NO_TLSv1_3; }
+#endif
 
   SSL_CTX_set_options(ctx, ssl_options);
 
@@ -709,42 +827,87 @@ SSL_CTX* context()
 
 Try<Nothing> verify(
     const SSL* const ssl,
+    Mode mode,
     const Option<string>& hostname,
     const Option<net::IP>& ip)
 {
   // Return early if we don't need to verify.
-  if (!ssl_flags->verify_cert) {
+  if (mode == Mode::CLIENT && !ssl_flags->verify_server_cert) {
+    return Nothing();
+  }
+
+  if (mode == Mode::SERVER && !ssl_flags->require_client_cert) {
     return Nothing();
   }
 
   // The X509 object must be freed if this call succeeds.
-  // TODO(jmlvanre): handle this better. How about RAII?
-  X509* cert = SSL_get_peer_certificate(ssl);
+  std::unique_ptr<X509, decltype(&X509_free)> cert(
+      SSL_get_peer_certificate(ssl),
+      X509_free);
 
+  // NOTE: Even without this check, the OpenSSL handshake will not complete
+  // when connecting to servers that do not present a certificate, unless an
+  // anonymous cipher is used.
   if (cert == nullptr) {
-    return ssl_flags->require_cert
-      ? Error("Peer did not provide certificate")
-      : Try<Nothing>(Nothing());
+    return Error("Peer did not provide certificate");
   }
 
   if (SSL_get_verify_result(ssl) != X509_V_OK) {
-    X509_free(cert);
     return Error("Could not verify peer certificate");
   }
 
-  if (!ssl_flags->verify_ipadd && hostname.isNone()) {
-    X509_free(cert);
-    return ssl_flags->require_cert
+  // When using the 'openssl' scheme, hostname validation was already
+  // performed during the TLS handshake so we don't have to do it again
+  // here.
+  //
+  // NOTE: When using the 'openssl' scheme, we technically dont need
+  // to call the `openssl::verify()` function *at all*.
+  if (ssl_flags->hostname_validation_scheme == "openssl") {
+    return Try<Nothing>(Nothing());
+  }
+
+  // NOTE: For backwards compatibility, we ignore the passed hostname here,
+  // i.e. the 'legacy' hostname validation scheme will always attempt to get
+  // the peer hostname using a reverse DNS lookup.
+  Option<std::string> peer_hostname = hostname;
+  if (ip.isSome()) {
+    VLOG(1) << "Doing rDNS lookup for 'legacy' hostname validation";
+    Stopwatch watch;
+
+    watch.start();
+    Try<string> lookup = net::getHostname(ip.get());
+    watch.stop();
+
+    // Due to MESOS-9339, a slow reverse DNS lookup will cause
+    // serious issues as it blocks the event loop thread.
+    if (watch.elapsed() > SLOW_DNS_WARN_THRESHOLD) {
+      LOG(WARNING) << "Reverse DNS lookup for '" << ip.get() << "'"
+                   << " took " << watch.elapsed().ms() << "ms"
+                   << ", slowness is problematic (see MESOS-9339)";
+    }
+
+    if (lookup.isError()) {
+      LOG(WARNING) << "Reverse DNS lookup for '" << ip.get() << "'"
+                   << " failed: " << lookup.error();
+    } else {
+      VLOG(2) << "Accepting from " << lookup.get();
+      peer_hostname = lookup.get();
+    }
+  }
+
+  if (!ssl_flags->verify_ipadd && peer_hostname.isNone()) {
+    return ssl_flags->require_client_cert
       ? Error("Cannot verify peer certificate: peer hostname unknown")
       : Try<Nothing>(Nothing());
   }
 
   // From https://wiki.openssl.org/index.php/Hostname_validation.
   // Check the Subject Alternate Name extension (SAN). This is useful
-  // for certificates that serve multiple physical hosts.
+  // for certificates where multiple domains are served from the same
+  // physical host.
   STACK_OF(GENERAL_NAME)* san_names =
     reinterpret_cast<STACK_OF(GENERAL_NAME)*>(X509_get_ext_d2i(
-        reinterpret_cast<X509*>(cert),
+        cert.get(),
         NID_subject_alt_name,
         nullptr,
         nullptr));
@@ -758,17 +921,15 @@ Try<Nothing> verify(
 
       switch(current_name->type) {
         case GEN_DNS: {
-          if (hostname.isSome()) {
+          if (peer_hostname.isSome()) {
             // Current name is a DNS name, let's check it.
-            const string dns_name =
-              reinterpret_cast<char*>(ASN1_STRING_data(
-                  current_name->d.dNSName));
+            const string dns_name = reinterpret_cast<const char*>(
+                ASN1_STRING_get0_data(current_name->d.dNSName));
 
             // Make sure there isn't an embedded NUL character in the DNS name.
             const size_t length = ASN1_STRING_length(current_name->d.dNSName);
             if (length != dns_name.length()) {
               sk_GENERAL_NAME_pop_free(san_names, GENERAL_NAME_free);
-              X509_free(cert);
               return Error(
                   "X509 certificate malformed: "
                   "embedded NUL character in DNS name");
@@ -776,11 +937,10 @@ Try<Nothing> verify(
               VLOG(2) << "Matching dNSName(" << i << "): " << dns_name;
 
               // Compare expected hostname with the DNS name.
-              if (hostname.get() == dns_name) {
+              if (peer_hostname.get() == dns_name) {
                 sk_GENERAL_NAME_pop_free(san_names, GENERAL_NAME_free);
-                X509_free(cert);
 
-                VLOG(2) << "dNSName match found for " << hostname.get();
+                VLOG(2) << "dNSName match found for " << peer_hostname.get();
 
                 return Nothing();
               }
@@ -803,7 +963,6 @@ Try<Nothing> verify(
 
               if (ip.get() == ip_add) {
                 sk_GENERAL_NAME_pop_free(san_names, GENERAL_NAME_free);
-                X509_free(cert);
 
                 VLOG(2) << "iPAddress match found for " << ip.get();
 
@@ -819,10 +978,10 @@ Try<Nothing> verify(
     sk_GENERAL_NAME_pop_free(san_names, GENERAL_NAME_free);
   }
 
-  if (hostname.isSome()) {
+  if (peer_hostname.isSome()) {
     // If we still haven't verified the hostname, try doing it via
     // the certificate subject name.
-    X509_NAME* name = X509_get_subject_name(cert);
+    X509_NAME* name = X509_get_subject_name(cert.get());
 
     if (name != nullptr) {
       char text[MAXHOSTNAMELEN] {};
@@ -834,28 +993,24 @@ Try<Nothing> verify(
               sizeof(text)) > 0) {
         VLOG(2) << "Matching common name: " << text;
 
-        if (hostname.get() != text) {
-          X509_free(cert);
+        if (peer_hostname.get() != text) {
           return Error(
             "Presented Certificate Name: " + stringify(text) +
-            " does not match peer hostname name: " + hostname.get());
+            " does not match peer hostname name: " + peer_hostname.get());
         }
 
-        VLOG(2) << "Common name match found for " << hostname.get();
+        VLOG(2) << "Common name match found for " << peer_hostname.get();
 
-        X509_free(cert);
         return Nothing();
       }
     }
   }
 
   // If we still haven't exited, we haven't verified it, and we give up.
-  X509_free(cert);
-
   std::vector<string> details;
 
-  if (hostname.isSome()) {
-    details.push_back("hostname " + hostname.get());
+  if (peer_hostname.isSome()) {
+    details.push_back("hostname " + peer_hostname.get());
   }
 
   if (ip.isSome()) {
@@ -865,6 +1020,125 @@ Try<Nothing> verify(
   return Error(
       "Could not verify presented certificate with " +
       strings::join(", ", details));
+}
+
+
+// A callback to configure the `SSL` object before the connection is
+// established.
+Try<Nothing> configure_socket(
+    SSL* ssl,
+    openssl::Mode mode,
+    const Address& peer_address,
+    const Option<std::string>& peer_hostname)
+{
+  if (mode == Mode::CLIENT && ssl_flags->verify_server_cert) {
+    SSL_set_verify(
+        ssl,
+        SSL_VERIFY_PEER,
+        &verify_callback);
+  }
+
+  if (mode == Mode::SERVER && ssl_flags->require_client_cert) {
+    SSL_set_verify(
+        ssl,
+        SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+        &verify_callback);
+  }
+
+  if (ssl_flags->hostname_validation_scheme == "openssl") {
+#if OPENSSL_VERSION_NUMBER < MIN_VERSION_X509_VERIFY_PARAM
+    // We should have already checked this during startup.
+    EXIT(EXIT_FAILURE) <<
+        "The linked OpenSSL library does not support `X509_VERIFY_PARAM` for"
+        " hostname validation. OpenSSL >= 1.0.2 is required.";
+#else
+    if (mode == openssl::Mode::SERVER) {
+      // We don't do client hostname validation, because the application layer
+      // should set the policy on which certificate fields are considered a
+      // valid proof of identity.
+      //
+      // TODO(bevers): Provide hooks to the application code to make these
+      // policy decisions, for example via a Mesos module.
+      return Nothing();
+    }
+
+    if (mode == openssl::Mode::CLIENT && !ssl_flags->verify_server_cert) {
+      return Nothing();
+    }
+
+    // Decide whether we want to verify the peer's IP or DNS name.
+    X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
+    if (peer_hostname.isSome()) {
+      if (!X509_VERIFY_PARAM_set1_host(param, peer_hostname->c_str(), 0)) {
+        return Error("Could not enable x509 hostname check.");
+      }
+    } else {
+      if (!ssl_flags->verify_ipadd) {
+        return Error("No DNS name given and IP address verification is "
+                     " disabled. I cannot work like this :(");
+      }
+
+      if (peer_address.family() != Address::Family::INET4 &&
+          peer_address.family() != Address::Family::INET6) {
+        return Error("Can only use IPv4 or IPv6 addresses for IP address"
+                     " validation.");
+      }
+
+      Try<inet::Address> inetAddress =
+        network::convert<inet::Address>(peer_address);
+
+      string ip = stringify(inetAddress->ip);
+      if (!X509_VERIFY_PARAM_set1_ip_asc(param, ip.c_str())) {
+        return Error("Could not enable x509 IP check.");
+      }
+    }
+#endif
+  }
+
+  return Nothing();
+}
+
+
+// Wrappers to be able to use the above `verify()` and `configure_socket()`
+// inside a `TLSClientConfig` struct.
+Try<Nothing> client_verify(
+    const SSL* const ssl,
+    const Option<std::string>& hostname,
+    const Option<net::IP>& ip)
+{
+  return verify(ssl, Mode::CLIENT, hostname, ip);
+}
+
+
+Try<Nothing> client_configure_socket(
+    SSL* ssl,
+    const Address& peer,
+    const Option<std::string>& peer_hostname)
+{
+  return configure_socket(ssl, Mode::CLIENT, peer, peer_hostname);
+}
+
+
+TLSClientConfig::TLSClientConfig(
+    const Option<std::string>& servername,
+    SSL_CTX *ctx,
+    ConfigureSocketCallback configure_socket,
+    VerifyCallback verify)
+  : ctx(ctx),
+    servername(servername),
+    verify(verify),
+    configure_socket(configure_socket)
+{}
+
+
+TLSClientConfig create_tls_client_config(
+    const Option<std::string>& servername)
+{
+  return TLSClientConfig(
+      servername,
+      openssl::ctx,
+      &client_configure_socket,
+      &client_verify);
 }
 
 } // namespace openssl {

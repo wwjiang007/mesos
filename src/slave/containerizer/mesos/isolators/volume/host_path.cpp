@@ -32,11 +32,13 @@
 #include <stout/os/stat.hpp>
 #include <stout/os/touch.hpp>
 
+#include "common/protobuf_utils.hpp"
 #include "common/validation.hpp"
 
 #include "linux/fs.hpp"
 
 #include "slave/containerizer/mesos/isolators/volume/host_path.hpp"
+#include "slave/containerizer/mesos/isolators/volume/utils.hpp"
 
 using std::string;
 
@@ -51,6 +53,8 @@ using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLaunchInfo;
 using mesos::slave::ContainerMountInfo;
 using mesos::slave::Isolator;
+
+using mesos::internal::slave::volume::PathValidator;
 
 namespace mesos {
 namespace internal {
@@ -68,7 +72,11 @@ Try<Isolator*> VolumeHostPathIsolatorProcess::create(
   }
 
   Owned<MesosIsolatorProcess> process(
-      new VolumeHostPathIsolatorProcess(flags));
+      flags.host_path_volume_force_creation.isSome()
+      ? new VolumeHostPathIsolatorProcess(
+            flags,
+            PathValidator::parse(flags.host_path_volume_force_creation.get()))
+      : new VolumeHostPathIsolatorProcess(flags));
 
   return new MesosIsolator(process);
 }
@@ -77,7 +85,16 @@ Try<Isolator*> VolumeHostPathIsolatorProcess::create(
 VolumeHostPathIsolatorProcess::VolumeHostPathIsolatorProcess(
     const Flags& _flags)
   : ProcessBase(process::ID::generate("volume-host-path-isolator")),
-    flags(_flags) {}
+    flags(_flags),
+    pathValidator() {}
+
+
+VolumeHostPathIsolatorProcess::VolumeHostPathIsolatorProcess(
+    const Flags& _flags,
+    const PathValidator& _pathValidator)
+  : ProcessBase(process::ID::generate("volume-host-path-isolator")),
+    flags(_flags),
+    pathValidator(_pathValidator) {}
 
 
 VolumeHostPathIsolatorProcess::~VolumeHostPathIsolatorProcess() {}
@@ -163,8 +180,32 @@ Future<Option<ContainerLaunchInfo>> VolumeHostPathIsolatorProcess::prepare(
     }
 
     if (!os::exists(hostPath.get())) {
-      return Failure(
-          "Path '" + hostPath.get() + "' in HOST_PATH volume does not exist");
+      if (pathValidator.isNone()) {
+        return Failure(
+            "Path '" + hostPath.get() + "' in HOST_PATH volume does not exist");
+      }
+
+      Try<string> normalizedPath = path::normalize(hostPath.get());
+      if (normalizedPath.isError()) {
+        return Failure(
+            "Failed to normalized the host path '" + hostPath.get() + "': " +
+            normalizedPath.error());
+      }
+
+      Try<Nothing> validate = pathValidator->validate(normalizedPath.get());
+      if (validate.isError()) {
+        return Failure(
+            "Path '" + hostPath.get() + "' in HOST_PATH volume does not exist "
+            "and is not whitelisted for creation: " + validate.error());
+      }
+
+      // Always assume the non-existing host path as a directory.
+      Try<Nothing> mkdir = os::mkdir(normalizedPath.get());
+      if (mkdir.isError()) {
+        return Failure(
+            "Failed to create the host path at '" + hostPath.get() + "': " +
+            mkdir.error());
+      }
     }
 
     // Determine the mount point for the host volume.
@@ -267,18 +308,13 @@ Future<Option<ContainerLaunchInfo>> VolumeHostPathIsolatorProcess::prepare(
     if (mountPropagationBidirectional) {
       // First, find the mount entry that is the parent of the host
       // volume source. If it is not a shared mount, return a failure.
-
-      // Get realpath here because the mount table uses realpaths.
-      Result<string> realHostPath = os::realpath(hostPath.get());
-      if (!realHostPath.isSome()) {
-        return Failure(
-            "Failed to get the realpath of the host path '" +
-            hostPath.get() + "': " +
-            (realHostPath.isError() ? realHostPath.error() : "Not found"));
+      Try<fs::MountInfoTable> table = fs::MountInfoTable::read();
+      if (table.isError()) {
+        return Failure("Failed to read mount table: " + table.error());
       }
 
       Try<fs::MountInfoTable::Entry> sourceMountEntry =
-        fs::MountInfoTable::findByTarget(realHostPath.get());
+        table->findByTarget(hostPath.get());
 
       if (sourceMountEntry.isError()) {
         return Failure(
@@ -309,11 +345,10 @@ Future<Option<ContainerLaunchInfo>> VolumeHostPathIsolatorProcess::prepare(
     // result, no need for the bind mount because the 'hostPath' is
     // already accessible in the container.
     if (hostPath.get() != mountPoint) {
-      // TODO(jieyu): Consider the mode in the volume.
-      ContainerMountInfo* mount = launchInfo.add_mounts();
-      mount->set_source(hostPath.get());
-      mount->set_target(mountPoint);
-      mount->set_flags(MS_BIND | MS_REC);
+      *launchInfo.add_mounts() = protobuf::slave::createContainerMount(
+          hostPath.get(),
+          mountPoint,
+          MS_BIND | MS_REC | (volume.mode() == Volume::RO ? MS_RDONLY : 0));
     }
   }
 

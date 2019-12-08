@@ -49,7 +49,7 @@ public:
       const process::Shared<uri::Fetcher>& fetcher,
       SecretResolver* secretResolver);
 
-  ~RegistryPuller();
+  ~RegistryPuller() override;
 
   /**
    * Pulls an image into a download directory. This image could
@@ -58,11 +58,11 @@ public:
    * @param reference local name of the image.
    * @param directory path to which the layers will be downloaded.
    */
-  process::Future<std::vector<std::string>> pull(
+  process::Future<Image> pull(
       const ::docker::spec::ImageReference& reference,
       const std::string& directory,
       const std::string& backend,
-      const Option<Secret>& config = None());
+      const Option<Secret>& config = None()) override;
 
 private:
   RegistryPuller(process::Owned<RegistryPullerProcess> _process);

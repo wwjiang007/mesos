@@ -46,6 +46,8 @@
 #include <process/socket.hpp>
 #include <process/state_machine.hpp>
 
+#include <process/ssl/tls_config.hpp>
+
 #include <stout/error.hpp>
 #include <stout/foreach.hpp>
 #include <stout/ip.hpp>
@@ -86,8 +88,15 @@ using process::network::internal::SocketImpl;
 namespace process {
 namespace http {
 
+struct StatusDescription {
+  uint16_t code;
+  const char* description;
+};
 
-hashmap<uint16_t, string>* statuses = new hashmap<uint16_t, string> {
+
+// Status code reason strings, from the HTTP1.1 RFC:
+// http://www.w3.org/Protocols/rfc2616/rfc2616-sec6.html
+StatusDescription statuses[] = {
   {100, "100 Continue"},
   {101, "101 Switching Protocols"},
   {200, "200 OK"},
@@ -173,10 +182,36 @@ const uint16_t Status::GATEWAY_TIMEOUT = 504;
 const uint16_t Status::HTTP_VERSION_NOT_SUPPORTED = 505;
 
 
+// Since the status codes are stored in increasing order, we could also
+// use std::lower_bound to do the lookup with logarithmic complexity.
+// However, according to some cursory research, on most CPUs this will
+// be slower until the array size is around 100 elemnts.
+//
+// [1]: https://schani.wordpress.com/2010/04/30/linear-vs-binary-search/
+// [2]: https://stackoverflow.com/questions/1275665/at-which-n-does-binary-search-become-faster-than-linear-search-on-a-modern-cpu
+
 string Status::string(uint16_t code)
 {
-  return http::statuses->get(code)
-    .getOrElse(stringify(code));
+  auto value = std::find_if(
+      std::begin(statuses),
+      std::end(statuses),
+      [code](const StatusDescription& sd) { return sd.code == code; });
+
+  if (value != std::end(statuses)) {
+    return value->description;
+  }
+
+  // Fallback for unknown status codes.
+  return stringify(code);
+}
+
+
+bool isValidStatus(uint16_t code)
+{
+  return std::end(statuses) != std::find_if(
+      std::begin(statuses),
+      std::end(statuses),
+      [code](const StatusDescription& sd) { return sd.code == code; });
 }
 
 
@@ -602,28 +637,99 @@ Future<Nothing> Pipe::Writer::readerClosed() const
 
 namespace header {
 
-Try<WWWAuthenticate> WWWAuthenticate::create(const string& value)
+Try<WWWAuthenticate> WWWAuthenticate::create(const string& input)
 {
   // Set `maxTokens` as 2 since auth-param quoted string may
   // contain space (e.g., "Basic realm="Registry Realm").
-  vector<string> tokens = strings::tokenize(value, " ", 2);
+  vector<string> tokens = strings::tokenize(input, " ", 2);
   if (tokens.size() != 2) {
-    return Error("Unexpected WWW-Authenticate header format: '" + value + "'");
+    return Error("Unexpected WWW-Authenticate header format: '" + input + "'");
   }
 
+  // Since the authentication parameters can contain quote values, we
+  // do not use `strings::split` here since the delimiter may occur in
+  // a quoted value which should not be split.
   hashmap<string, string> authParam;
-  foreach (const string& token, strings::split(tokens[1], ",")) {
-    vector<string> split = strings::split(token, "=");
-    if (split.size() != 2) {
-      return Error(
-          "Unexpected auth-param format: '" +
-          token + "' in '" + tokens[1] + "'");
-    }
+  Option<string> key, value;
+  bool inQuotes = false;
 
+  foreach (char c, tokens[1]) {
     // Auth-param values can be a quoted-string or directive values.
     // Please see section "3.2.2.4 Directive values and quoted-string":
     // https://tools.ietf.org/html/rfc2617.
-    authParam[split[0]] = strings::trim(split[1], strings::ANY, "\"");
+    //
+    // If we see a quote we know we must already be parsing `value`
+    // since `key` cannot be a quoted-string.
+    if (c != '"' && inQuotes) {
+      if (value.isNone()) {
+        return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+      }
+
+      value->append({c});
+      continue;
+    }
+
+    // If we have not yet parsed `key` this character must belong to
+    // it if it is not a space, and cannot be a `,` delimiter.
+    if (key.isNone()) {
+      if (c == ',') {
+        return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+      }
+
+      if (c == ' ') {
+        continue;
+      }
+
+      key = string({c});
+      continue;
+    }
+
+    // If the current character is `=` we must start parsing a new
+    // `value`. Since we have already handled `=` in quotes above we
+    // cannot already have started parsing `value`.
+    if (c == '=') {
+      if (value.isSome()) {
+        return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+      }
+      value = "";
+      continue;
+    }
+
+    // If the current character is a quote, drop the
+    // character and toogle the quote state.
+    if (c == '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+
+    // If the current character is a record delimiter and we are not
+    // in quotes, we should have parsed both a key and a value. Store
+    // them, drop the delimiter, and restart parsing.
+    if (c == ',' && !inQuotes) {
+      if (key.isNone() || value.isNone()) {
+        return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+      }
+      authParam[*key] = *value;
+      key = None();
+      value = None();
+
+      continue;
+    }
+
+    // If we have not started parsing `value` we are still parsing `key`.
+    if (value.isNone()) {
+      key->append({c});
+    } else {
+      value->append({c});
+    }
+  }
+
+  // Record the last parsed `(key, value)` pair.
+  if (key.isSome()) {
+    if (value.isNone() || inQuotes) {
+      return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+    }
+    authParam[*key] = *value;
   }
 
   // The realm directive (case-insensitive) is required for all
@@ -657,23 +763,22 @@ OK::OK(const JSON::Value& value, const Option<string>& jsonp)
 {
   type = BODY;
 
-  std::ostringstream out;
-
   if (jsonp.isSome()) {
-    out << jsonp.get() << "(";
-  }
-
-  out << value;
-
-  if (jsonp.isSome()) {
-    out << ");";
     headers["Content-Type"] = "text/javascript";
+
+    string stringified = stringify(value);
+
+    body.reserve(jsonp->size() + 1 + stringified.size() + 1);
+    body += jsonp.get();
+    body += "(";
+    body += stringified;
+    body += ")";
   } else {
     headers["Content-Type"] = "application/json";
+    body = stringify(value);
   }
 
-  headers["Content-Length"] = stringify(out.str().size());
-  body = out.str();
+  headers["Content-Length"] = stringify(body.size());
 }
 
 
@@ -682,22 +787,21 @@ OK::OK(JSON::Proxy&& value, const Option<string>& jsonp)
 {
   type = BODY;
 
-  std::ostringstream out;
-
   if (jsonp.isSome()) {
-    out << jsonp.get() << "(";
-  }
-
-  out << std::move(value);
-
-  if (jsonp.isSome()) {
-    out << ");";
     headers["Content-Type"] = "text/javascript";
+
+    string stringified = std::move(value);
+
+    body.reserve(jsonp->size() + 1 + stringified.size() + 1);
+    body += jsonp.get();
+    body += "(";
+    body += stringified;
+    body += ")";
   } else {
     headers["Content-Type"] = "application/json";
+    body = std::move(value);
   }
 
-  body = out.str();
   headers["Content-Length"] = stringify(body.size());
 }
 
@@ -957,7 +1061,7 @@ Pipe::Reader encode(const Request& request)
     vector<string> query;
 
     foreachpair (const string& key, const string& value, request.url.query) {
-      query.push_back(key + "=" + value);
+      query.push_back(http::encode(key) + "=" + http::encode(value));
     }
 
     out << "?" << strings::join("&", query);
@@ -1181,7 +1285,7 @@ public:
   }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // Start the read loop on the socket. We read independently
     // of the requests being sent in order to detect socket
@@ -1189,7 +1293,7 @@ protected:
     read();
   }
 
-  virtual void finalize()
+  void finalize() override
   {
     disconnect("Connection object was destructed");
   }
@@ -1392,7 +1496,10 @@ Future<Nothing> Connection::disconnected()
 }
 
 
-Future<Connection> connect(const network::Address& address, Scheme scheme)
+Future<Connection> connect(
+    const network::Address& address,
+    Scheme scheme,
+    const Option<string>& peer_hostname)
 {
   SocketImpl::Kind kind;
 
@@ -1415,7 +1522,21 @@ Future<Connection> connect(const network::Address& address, Scheme scheme)
     return Failure("Failed to create socket: " + socket.error());
   }
 
-  return socket->connect(address)
+  Future<Nothing> connected = [&]() {
+    switch (scheme) {
+      case Scheme::HTTP:
+        return socket->connect(address);
+#ifdef USE_SSL_SOCKET
+      case Scheme::HTTPS:
+        return socket->connect(
+            address,
+            network::openssl::create_tls_client_config(peer_hostname));
+#endif
+    }
+    UNREACHABLE();
+  }();
+
+  return connected
     .then([socket, address]() -> Future<Connection> {
       Try<network::Address> localAddress = socket->address();
       if (localAddress.isError()) {
@@ -1425,6 +1546,14 @@ Future<Connection> connect(const network::Address& address, Scheme scheme)
 
       return Connection(socket.get(), localAddress.get(), address);
     });
+}
+
+
+Future<Connection> connect(
+    const network::Address& address,
+    Scheme scheme)
+{
+  return connect(address, scheme, None());
 }
 
 
@@ -1458,12 +1587,12 @@ Future<Connection> connect(const URL& url)
 
   // Default to 'http' if no scheme was specified.
   if (url.scheme.isNone() || url.scheme == string("http")) {
-    return connect(address, Scheme::HTTP);
+    return connect(address, Scheme::HTTP, url.domain);
   }
 
   if (url.scheme == string("https")) {
 #ifdef USE_SSL_SOCKET
-    return connect(address, Scheme::HTTPS);
+    return connect(address, Scheme::HTTPS, url.domain);
 #else
     return Failure("'https' scheme requires SSL enabled");
 #endif
@@ -1549,23 +1678,16 @@ Future<Nothing> sendfile(
     return send(socket, InternalServerError(body), request);
   }
 
-  struct stat s; // Need 'struct' because of function named 'stat'.
-  // We don't bother introducing a `os::fstat` since this is only
-  // one of two places where we use `fstat` in the entire codebase
-  // as of writing this comment.
-#ifdef __WINDOWS__
-  if (::fstat(fd->crt(), &s) != 0) {
-#else
-  if (::fstat(fd.get(), &s) != 0) {
-#endif
+  const Try<Bytes> size = os::stat::size(fd.get());
+  if (size.isError()) {
     const string body =
-      "Failed to fstat '" + response.path + "': " + os::strerror(errno);
+      "Failed to fstat '" + response.path + "': " + size.error();
     // TODO(benh): VLOG(1)?
     // TODO(benh): Don't send error back as part of InternalServiceError?
     // TODO(benh): Copy headers from `response`?
     os::close(fd.get());
     return send(socket, InternalServerError(body), request);
-  } else if (S_ISDIR(s.st_mode)) {
+  } else if (os::stat::isdir(fd.get())) {
     const string body = "'" + response.path + "' is a directory";
     // TODO(benh): VLOG(1)?
     // TODO(benh): Don't send error back as part of InternalServiceError?
@@ -1576,7 +1698,7 @@ Future<Nothing> sendfile(
 
   // While the user is expected to properly set a 'Content-Type'
   // header, we'll fill in (or overwrite) 'Content-Length' header.
-  response.headers["Content-Length"] = stringify(s.st_size);
+  response.headers["Content-Length"] = stringify(size->bytes());
 
   // TODO(benh): If this is a TCP socket consider turning on TCP_CORK
   // for both sends and then turning it off.
@@ -1593,7 +1715,7 @@ Future<Nothing> sendfile(
     })
     .then([=]() mutable -> Future<Nothing> {
       // NOTE: the file descriptor gets closed by FileEncoder.
-      Encoder* encoder = new FileEncoder(fd.get(), s.st_size);
+      Encoder* encoder = new FileEncoder(fd.get(), size->bytes());
       return send(socket, encoder)
         .onAny([=]() {
           delete encoder;
@@ -2087,7 +2209,7 @@ public:
           // After the grace period expires discard all the clients
           // and then keep waiting.
           .after(options.grace_period,
-                 defer(self(), [=](Future<list<Future<Nothing>>> f) {
+                 defer(self(), [=](Future<vector<Future<Nothing>>> f) {
                    f.discard();
                    return await(lambda::map(
                        [](Client&& client) {
@@ -2112,7 +2234,7 @@ public:
   }
 
 protected:
-  virtual void finalize()
+  void finalize() override
   {
     // If we started the accept loop then discard it and any clients
     // we are already serving.

@@ -231,13 +231,16 @@ public:
   // those that are not used by the launched tasks or their executors)
   // will be considered declined. Note that this includes resources
   // used by tasks that the framework attempted to launch but failed
-  // (with TASK_ERROR) due to a malformed task description. The
-  // specified filters are applied on all unused resources (see
-  // mesos.proto for a description of Filters). Available resources
-  // are aggregated when multiple offers are provided. Note that all
-  // offers must belong to the same slave. Invoking this function with
-  // an empty collection of tasks declines offers in their entirety
-  // (see Scheduler::declineOffer).
+  // (with TASK_ERROR) due to a malformed task description.
+  //
+  // The specified filters are applied on all unused resources (see
+  // mesos.proto for a description of Filters). Note that the default
+  // argument includes a 5-second `refuse_offers` filter.
+  //
+  // Available resources are aggregated when multiple offers are provided.
+  // Note that all offers must belong to the same slave. Invoking this
+  // function with an empty collection of tasks declines offers in their
+  // entirety (see Scheduler::declineOffer).
   virtual Status launchTasks(
       const std::vector<OfferID>& offerIds,
       const std::vector<TaskInfo>& tasks,
@@ -281,14 +284,40 @@ public:
       const OfferID& offerId,
       const Filters& filters = Filters()) = 0;
 
-  // Removes all filters previously set by the framework (via
-  // launchTasks()). This enables the framework to receive offers from
-  // those filtered slaves.
+  // Removes all filters previously set by the framework (via launchTasks()
+  // or declineOffer()) and clears the set of suppressed roles.
+  //
+  // NOTE: If the framework is not connected to the master, the set
+  // of suppressed roles stored by the driver will be cleared, and an
+  // up-to-date set of suppressed roles will be sent to the master
+  // during re-registration.
   virtual Status reviveOffers() = 0;
 
-  // Inform Mesos master to stop sending offers to the framework. The
-  // scheduler should call reviveOffers() to resume getting offers.
+  // Removes filters for the specified roles and removes  these roles from
+  // the suppressed set.  If the framework is not connected to the master,
+  // an up-to-date set of suppressed roles will be sent to the master
+  // during re-registration.
+  //
+  // NOTE: If 'roles' is empty, this method does nothing.
+  virtual Status reviveOffers(const std::vector<std::string>& roles) = 0;
+
+  // Informs Mesos master to stop sending offers to the framework (i.e.
+  // to suppress all roles of the framework). To resume getting offers,
+  // the scheduler can call reviveOffers() or set the suppressed roles
+  // explicitly via updateFramework().
+  //
+  // NOTE: If the framework is not connected to the master, all the roles
+  // will be added to the set of suppressed roles in the driver, and an
+  // up-to-date suppressed roles set will be sent to the master during
+  // re-registration.
   virtual Status suppressOffers() = 0;
+
+  // Adds the roles to the suppressed set. If the framework is not connected
+  // to the master, an up-to-date set of suppressed roles will be sent to
+  // the master during re-registration.
+  //
+  // NOTE: If 'roles' is empty, this method does nothing.
+  virtual Status suppressOffers(const std::vector<std::string>& roles) = 0;
 
   // Acknowledges the status update. This should only be called
   // once the status update is processed durably by the scheduler.
@@ -314,6 +343,26 @@ public:
   // currently known.
   virtual Status reconcileTasks(
       const std::vector<TaskStatus>& statuses) = 0;
+
+  // Inform Mesos master about changes to the `FrameworkInfo` and
+  // the set of suppressed roles. The driver will store the new
+  // `FrameworkInfo` and the new set of suppressed roles, and all
+  // subsequent re-registrations will use them.
+  //
+  // NOTE: If the supplied info is invalid or fails authorization,
+  // the `error()` callback will be invoked asynchronously (after
+  // the master replies with a `FrameworkErrorMessage`).
+  //
+  // NOTE: This must be called after initial registration with the
+  // master completes and the `FrameworkID` is assigned. The assigned
+  // `FrameworkID` must be set in `frameworkInfo`.
+  //
+  // NOTE: The `FrameworkInfo.user` and `FrameworkInfo.hostname`
+  // fields will be auto-populated using the same approach used
+  // during driver initialization.
+  virtual Status updateFramework(
+      const FrameworkInfo& frameworkInfo,
+      const std::vector<std::string>& suppressedRoles) = 0;
 };
 
 
@@ -397,59 +446,85 @@ public:
       bool implicitAcknowlegements,
       const Credential& credential);
 
+  // These constructors are the same as the above two, but allow
+  // the framework to also specify the initial set of suppressed roles.
+  MesosSchedulerDriver(
+      Scheduler* scheduler,
+      const FrameworkInfo& framework,
+      const std::vector<std::string>& suppressedRoles,
+      const std::string& master,
+      bool implicitAcknowledgements);
+
+  MesosSchedulerDriver(
+      Scheduler* scheduler,
+      const FrameworkInfo& framework,
+      const std::vector<std::string>& suppressedRoles,
+      const std::string& master,
+      bool implicitAcknowlegements,
+      const Credential& credential);
+
+
   // This destructor will block indefinitely if
   // MesosSchedulerDriver::start was invoked successfully (possibly
   // via MesosSchedulerDriver::run) and MesosSchedulerDriver::stop has
   // not been invoked.
-  virtual ~MesosSchedulerDriver();
+  ~MesosSchedulerDriver() override;
 
   // See SchedulerDriver for descriptions of these.
-  virtual Status start();
-  virtual Status stop(bool failover = false);
-  virtual Status abort();
-  virtual Status join();
-  virtual Status run();
+  Status start() override;
+  Status stop(bool failover = false) override;
+  Status abort() override;
+  Status join() override;
+  Status run() override;
 
-  virtual Status requestResources(
-      const std::vector<Request>& requests);
+  Status requestResources(
+      const std::vector<Request>& requests) override;
 
   // TODO(nnielsen): launchTasks using single offer is deprecated.
   // Use launchTasks with offer list instead.
-  virtual Status launchTasks(
+  Status launchTasks(
       const OfferID& offerId,
       const std::vector<TaskInfo>& tasks,
-      const Filters& filters = Filters());
+      const Filters& filters = Filters()) override;
 
-  virtual Status launchTasks(
+  Status launchTasks(
       const std::vector<OfferID>& offerIds,
       const std::vector<TaskInfo>& tasks,
-      const Filters& filters = Filters());
+      const Filters& filters = Filters()) override;
 
-  virtual Status killTask(const TaskID& taskId);
+  Status killTask(const TaskID& taskId) override;
 
-  virtual Status acceptOffers(
+  Status acceptOffers(
       const std::vector<OfferID>& offerIds,
       const std::vector<Offer::Operation>& operations,
-      const Filters& filters = Filters());
+      const Filters& filters = Filters()) override;
 
-  virtual Status declineOffer(
+  Status declineOffer(
       const OfferID& offerId,
-      const Filters& filters = Filters());
+      const Filters& filters = Filters()) override;
 
-  virtual Status reviveOffers();
+  Status reviveOffers() override;
 
-  virtual Status suppressOffers();
+  Status reviveOffers(const std::vector<std::string>& roles) override;
 
-  virtual Status acknowledgeStatusUpdate(
-      const TaskStatus& status);
+  Status suppressOffers() override;
 
-  virtual Status sendFrameworkMessage(
+  Status suppressOffers(const std::vector<std::string>& roles) override;
+
+  Status acknowledgeStatusUpdate(
+      const TaskStatus& status) override;
+
+  Status sendFrameworkMessage(
       const ExecutorID& executorId,
       const SlaveID& slaveId,
-      const std::string& data);
+      const std::string& data) override;
 
-  virtual Status reconcileTasks(
-      const std::vector<TaskStatus>& statuses);
+  Status reconcileTasks(
+      const std::vector<TaskStatus>& statuses) override;
+
+  Status updateFramework(
+      const FrameworkInfo& frameworkInfo,
+      const std::vector<std::string>& suppressedRoles) override;
 
 protected:
   // Used to detect (i.e., choose) the master.
@@ -460,6 +535,7 @@ private:
 
   Scheduler* scheduler;
   FrameworkInfo framework;
+  const std::vector<std::string> initialSuppressedRoles;
   std::string master;
 
   // Used for communicating with the master.

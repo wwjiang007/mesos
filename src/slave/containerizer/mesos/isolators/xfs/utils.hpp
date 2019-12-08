@@ -24,7 +24,13 @@
 #include <stout/nothing.hpp>
 #include <stout/try.hpp>
 
+// Fedora 30 defines prid_t via <xfs/xfs.h>, but earlier versions
+// need an explicit <xfs/xfs_types.h>.
+#include <xfs/xfs.h>
+
+#if HAVE_XFS_XFS_TYPES_H
 #include <xfs/xfs_types.h>
+#endif
 
 namespace mesos {
 namespace internal {
@@ -32,7 +38,8 @@ namespace xfs {
 
 struct QuotaInfo
 {
-  Bytes limit;
+  Bytes softLimit;
+  Bytes hardLimit;
   Bytes used;
 };
 
@@ -70,14 +77,18 @@ private:
 
 
 enum class QuotaPolicy {
-  ENFORCING,
   ACCOUNTING,
+  ENFORCING_ACTIVE,
+  ENFORCING_PASSIVE
 };
 
 
 inline bool operator==(const QuotaInfo& left, const QuotaInfo& right)
 {
-  return left.limit == right.limit && left.used == right.used;
+  return
+    left.hardLimit == right.hardLimit &&
+    left.softLimit == right.softLimit &&
+    left.used == right.used;
 }
 
 
@@ -93,6 +104,12 @@ bool isPathXfs(const std::string& path);
 Try<bool> isQuotaEnabled(const std::string& path);
 
 
+// Return the path of the block device backing the given path. If the path
+// is a filesystem path, then the corresponding block device is resolved. If
+// the path is already a block device path, then the same path is returned.
+Try<std::string> getDeviceForPath(const std::string& path);
+
+
 Result<QuotaInfo> getProjectQuota(
     const std::string& path,
     prid_t projectId);
@@ -101,7 +118,14 @@ Result<QuotaInfo> getProjectQuota(
 Try<Nothing> setProjectQuota(
     const std::string& path,
     prid_t projectId,
-    Bytes limit);
+    Bytes softLimit,
+    Bytes hardLimit);
+
+
+Try<Nothing> setProjectQuota(
+    const std::string& path,
+    prid_t projectId,
+    Bytes hardLimit);
 
 
 Try<Nothing> clearProjectQuota(

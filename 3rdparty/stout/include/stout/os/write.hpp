@@ -20,6 +20,7 @@
 #include <stout/try.hpp>
 
 #include <stout/os/close.hpp>
+#include <stout/os/fsync.hpp>
 #include <stout/os/int_fd.hpp>
 #include <stout/os/open.hpp>
 #include <stout/os/socket.hpp>
@@ -29,7 +30,6 @@
 #else
 #include <stout/os/posix/write.hpp>
 #endif // __WINDOWS__
-
 
 namespace os {
 
@@ -44,7 +44,11 @@ inline ssize_t write_impl(int_fd fd, const char* buffer, size_t count)
 
     if (length < 0) {
 #ifdef __WINDOWS__
-      int error = WSAGetLastError();
+      // NOTE: There is no actual difference between `WSAGetLastError` and
+      // `GetLastError`, the former is an alias for the latter. So we can
+      // simply use the former here for both `HANDLE` and `SOCKET` types of
+      // `int_fd`. See MESOS-8764.
+      int error = ::GetLastError();
 #else
       int error = errno;
 #endif // __WINDOWS__
@@ -95,16 +99,23 @@ inline Try<Nothing> write(int_fd fd, const std::string& message)
 {
   ssize_t result = signal_safe::write(fd, message);
   if (result < 0) {
+#ifdef __WINDOWS__
+    return WindowsError();
+#else
     return ErrnoError();
+#endif // __WINDOWS__
   }
 
   return Nothing();
 }
 
 
-// A wrapper function that wraps the above write() with
-// open and closing the file.
-inline Try<Nothing> write(const std::string& path, const std::string& message)
+// A wrapper function for the above `write()` with opening and closing the file.
+// If `sync` is set to true, an `fsync()` will be called before `close()`.
+inline Try<Nothing> write(
+    const std::string& path,
+    const std::string& message,
+    bool sync = false)
 {
   Try<int_fd> fd = os::open(
       path,
@@ -112,25 +123,38 @@ inline Try<Nothing> write(const std::string& path, const std::string& message)
       S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
   if (fd.isError()) {
-    return ErrnoError("Failed to open file '" + path + "'");
+    return Error(fd.error());
   }
 
-  Try<Nothing> result = write(fd.get(), message);
+  Try<Nothing> write = os::write(fd.get(), message);
 
-  // We ignore the return value of close(). This is because users
-  // calling this function are interested in the return value of
-  // write(). Also an unsuccessful close() doesn't affect the write.
-  os::close(fd.get());
+  if (sync && write.isSome()) {
+    // We call `fsync()` before closing the file instead of opening it with the
+    // `O_SYNC` flag for better performance. See:
+    // http://lkml.iu.edu/hypermail/linux/kernel/0105.3/0353.html
+    write = os::fsync(fd.get());
+  }
 
-  return result;
+  Try<Nothing> close = os::close(fd.get());
+
+  // We propagate `close` failures if `write` on the file was successful.
+  if (write.isSome() && close.isError()) {
+    write =
+      Error("Failed to close '" + stringify(fd.get()) + "':" + close.error());
+  }
+
+  return write;
 }
 
 
 // NOTE: This overload is necessary to disambiguate between arguments
 // of type `HANDLE` (`typedef void*`) and `char*` on Windows.
-inline Try<Nothing> write(const char* path, const std::string& message)
+inline Try<Nothing> write(
+    const char* path,
+    const std::string& message,
+    bool sync = false)
 {
-  return write(std::string(path), message);
+  return write(std::string(path), message, sync);
 }
 
 } // namespace os {

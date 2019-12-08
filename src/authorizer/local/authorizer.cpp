@@ -38,6 +38,7 @@
 #include <stout/try.hpp>
 #include <stout/unreachable.hpp>
 
+#include "common/authorization.hpp"
 #include "common/http.hpp"
 #include "common/parse.hpp"
 #include "common/protobuf_utils.hpp"
@@ -182,7 +183,7 @@ public:
       action_(action),
       permissive_(permissive) {}
 
-  virtual Try<bool> approved(
+  Try<bool> approved(
       const Option<ObjectApprover::Object>& object) const noexcept override
   {
     // Construct subject.
@@ -411,18 +412,30 @@ public:
         case authorization::START_MAINTENANCE:
         case authorization::STOP_MAINTENANCE:
         case authorization::UPDATE_MAINTENANCE_SCHEDULE:
+        case authorization::DRAIN_AGENT:
+        case authorization::DEACTIVATE_AGENT:
+        case authorization::REACTIVATE_AGENT:
         case authorization::MODIFY_RESOURCE_PROVIDER_CONFIG:
+        case authorization::MARK_RESOURCE_PROVIDER_GONE:
+        case authorization::VIEW_RESOURCE_PROVIDER:
         case authorization::PRUNE_IMAGES:
           aclObject.set_type(ACL::Entity::ANY);
 
           break;
         case authorization::CREATE_VOLUME:
+        case authorization::RESIZE_VOLUME:
         case authorization::GET_QUOTA:
         case authorization::RESERVE_RESOURCES:
         case authorization::UPDATE_QUOTA:
+        case authorization::UPDATE_QUOTA_WITH_CONFIG:
         case authorization::UPDATE_WEIGHT:
         case authorization::VIEW_ROLE:
         case authorization::REGISTER_FRAMEWORK:
+        case authorization::CREATE_BLOCK_DISK:
+        case authorization::DESTROY_BLOCK_DISK:
+        case authorization::CREATE_MOUNT_DISK:
+        case authorization::DESTROY_MOUNT_DISK:
+        case authorization::DESTROY_RAW_DISK:
           return Error("Authorization for action " + stringify(action_) +
                        " requires a specialized approver object.");
         case authorization::UNKNOWN:
@@ -475,7 +488,7 @@ public:
   // under an executor running under a given OS user and, if a command
   // is available, the principal is also allowed to run the command as
   // the given OS user.
-  virtual Try<bool> approved(
+  Try<bool> approved(
       const Option<ObjectApprover::Object>& object) const noexcept override
   {
     if (object.isNone() || object->command_info == nullptr) {
@@ -519,7 +532,7 @@ public:
   // Executors are permitted to perform an action when the root ContainerID in
   // the object is equal to the ContainerID that was extracted from the
   // subject's claims.
-  virtual Try<bool> approved(
+  Try<bool> approved(
       const Option<ObjectApprover::Object>& object) const noexcept override
   {
     return object.isSome() &&
@@ -541,7 +554,7 @@ public:
   // Resource providers are permitted to perform an action when the
   // ContainerID in the object is prefixed by the namespace extracted
   // from the subject's claims.
-  virtual Try<bool> approved(
+  Try<bool> approved(
       const Option<ObjectApprover::Object>& object) const noexcept override
   {
     return object.isSome() &&
@@ -558,7 +571,7 @@ private:
 class RejectingObjectApprover : public ObjectApprover
 {
 public:
-  virtual Try<bool> approved(
+  Try<bool> approved(
       const Option<ObjectApprover::Object>& object) const noexcept override
   {
     return false;
@@ -584,7 +597,7 @@ public:
     }
   }
 
-  virtual Try<bool> approved(const Option<ObjectApprover::Object>& object) const
+  Try<bool> approved(const Option<ObjectApprover::Object>& object) const
       noexcept override
   {
     ACL::Entity entityObject;
@@ -594,7 +607,13 @@ public:
     } else {
       switch (action_) {
         case authorization::CREATE_VOLUME:
-        case authorization::RESERVE_RESOURCES: {
+        case authorization::RESIZE_VOLUME:
+        case authorization::RESERVE_RESOURCES:
+        case authorization::CREATE_BLOCK_DISK:
+        case authorization::DESTROY_BLOCK_DISK:
+        case authorization::CREATE_MOUNT_DISK:
+        case authorization::DESTROY_MOUNT_DISK:
+        case authorization::DESTROY_RAW_DISK: {
           entityObject.set_type(ACL::Entity::SOME);
           if (object->resource) {
             if (object->resource->reservations_size() > 0) {
@@ -635,9 +654,7 @@ public:
         }
         case authorization::GET_QUOTA: {
           entityObject.set_type(mesos::ACL::Entity::SOME);
-          if (object->quota_info) {
-            entityObject.add_values(object->quota_info->role());
-          } else if (object->value) {
+          if (object->value) {
             entityObject.add_values(*(object->value));
           } else {
             entityObject.set_type(mesos::ACL::Entity::ANY);
@@ -650,6 +667,15 @@ public:
           CHECK_NOTNULL(object->quota_info);
 
           entityObject.add_values(object->quota_info->role());
+          entityObject.set_type(mesos::ACL::Entity::SOME);
+
+          break;
+        }
+        case authorization::UPDATE_QUOTA_WITH_CONFIG: {
+          // Check object has the required types set.
+          CHECK_NOTNULL(object->value);
+
+          entityObject.add_values(*(object->value));
           entityObject.set_type(mesos::ACL::Entity::SOME);
 
           break;
@@ -709,6 +735,9 @@ public:
         case authorization::SET_LOG_LEVEL:
         case authorization::START_MAINTENANCE:
         case authorization::STOP_MAINTENANCE:
+        case authorization::DRAIN_AGENT:
+        case authorization::DEACTIVATE_AGENT:
+        case authorization::REACTIVATE_AGENT:
         case authorization::TEARDOWN_FRAMEWORK:
         case authorization::UNRESERVE_RESOURCES:
         case authorization::UPDATE_MAINTENANCE_SCHEDULE:
@@ -721,6 +750,8 @@ public:
         case authorization::WAIT_NESTED_CONTAINER:
         case authorization::WAIT_STANDALONE_CONTAINER:
         case authorization::MODIFY_RESOURCE_PROVIDER_CONFIG:
+        case authorization::MARK_RESOURCE_PROVIDER_GONE:
+        case authorization::VIEW_RESOURCE_PROVIDER:
         case authorization::UNKNOWN:
           UNREACHABLE();
       }
@@ -875,6 +906,11 @@ public:
             createHierarchicalRoleACLs(acls.create_volumes());
         break;
       }
+      case authorization::RESIZE_VOLUME: {
+        hierarchicalRoleACLs =
+            createHierarchicalRoleACLs(acls.resize_volumes());
+        break;
+      }
       case authorization::RESERVE_RESOURCES: {
         hierarchicalRoleACLs =
             createHierarchicalRoleACLs(acls.reserve_resources());
@@ -900,9 +936,35 @@ public:
             createHierarchicalRoleACLs(acls.register_frameworks());
         break;
       }
-      case authorization::UPDATE_QUOTA: {
+      case authorization::UPDATE_QUOTA:
+      case authorization::UPDATE_QUOTA_WITH_CONFIG: {
         hierarchicalRoleACLs =
             createHierarchicalRoleACLs(acls.update_quotas());
+        break;
+      }
+      case authorization::CREATE_BLOCK_DISK: {
+        hierarchicalRoleACLs =
+          createHierarchicalRoleACLs(acls.create_block_disks());
+        break;
+      }
+      case authorization::DESTROY_BLOCK_DISK: {
+        hierarchicalRoleACLs =
+          createHierarchicalRoleACLs(acls.destroy_block_disks());
+        break;
+      }
+      case authorization::CREATE_MOUNT_DISK: {
+        hierarchicalRoleACLs =
+          createHierarchicalRoleACLs(acls.create_mount_disks());
+        break;
+      }
+      case authorization::DESTROY_MOUNT_DISK: {
+        hierarchicalRoleACLs =
+          createHierarchicalRoleACLs(acls.destroy_mount_disks());
+        break;
+      }
+      case authorization::DESTROY_RAW_DISK: {
+        hierarchicalRoleACLs =
+          createHierarchicalRoleACLs(acls.destroy_raw_disks());
         break;
       }
       case authorization::ACCESS_MESOS_LOG:
@@ -927,6 +989,9 @@ public:
       case authorization::SET_LOG_LEVEL:
       case authorization::START_MAINTENANCE:
       case authorization::STOP_MAINTENANCE:
+      case authorization::DRAIN_AGENT:
+      case authorization::DEACTIVATE_AGENT:
+      case authorization::REACTIVATE_AGENT:
       case authorization::TEARDOWN_FRAMEWORK:
       case authorization::UNKNOWN:
       case authorization::UNRESERVE_RESOURCES:
@@ -940,6 +1005,8 @@ public:
       case authorization::WAIT_NESTED_CONTAINER:
       case authorization::WAIT_STANDALONE_CONTAINER:
       case authorization::MODIFY_RESOURCE_PROVIDER_CONFIG:
+      case authorization::MARK_RESOURCE_PROVIDER_GONE:
+      case authorization::VIEW_RESOURCE_PROVIDER:
         UNREACHABLE();
     }
 
@@ -1048,7 +1115,8 @@ public:
           (action == authorization::LAUNCH_STANDALONE_CONTAINER ||
            action == authorization::WAIT_STANDALONE_CONTAINER ||
            action == authorization::KILL_STANDALONE_CONTAINER ||
-           action == authorization::REMOVE_STANDALONE_CONTAINER));
+           action == authorization::REMOVE_STANDALONE_CONTAINER ||
+           action == authorization::VIEW_STANDALONE_CONTAINER));
 
     Option<string> subjectPrefix;
     foreach (const Label& claim, subject->claims().labels()) {
@@ -1095,7 +1163,8 @@ public:
       if (action == authorization::LAUNCH_STANDALONE_CONTAINER ||
           action == authorization::WAIT_STANDALONE_CONTAINER ||
           action == authorization::KILL_STANDALONE_CONTAINER ||
-          action == authorization::REMOVE_STANDALONE_CONTAINER) {
+          action == authorization::REMOVE_STANDALONE_CONTAINER ||
+          action == authorization::VIEW_STANDALONE_CONTAINER) {
         return getImplicitResourceProviderObjectApprover(subject, action);
       }
     }
@@ -1113,12 +1182,19 @@ public:
         return getNestedContainerObjectApprover(subject, action);
       }
       case authorization::CREATE_VOLUME:
+      case authorization::RESIZE_VOLUME:
       case authorization::RESERVE_RESOURCES:
       case authorization::UPDATE_WEIGHT:
       case authorization::VIEW_ROLE:
       case authorization::GET_QUOTA:
       case authorization::REGISTER_FRAMEWORK:
-      case authorization::UPDATE_QUOTA: {
+      case authorization::UPDATE_QUOTA:
+      case authorization::UPDATE_QUOTA_WITH_CONFIG:
+      case authorization::CREATE_BLOCK_DISK:
+      case authorization::DESTROY_BLOCK_DISK:
+      case authorization::CREATE_MOUNT_DISK:
+      case authorization::DESTROY_MOUNT_DISK:
+      case authorization::DESTROY_RAW_DISK: {
         return getHierarchicalRoleApprover(subject, action);
       }
       case authorization::ACCESS_MESOS_LOG:
@@ -1144,6 +1220,9 @@ public:
       case authorization::TEARDOWN_FRAMEWORK:
       case authorization::UNRESERVE_RESOURCES:
       case authorization::UPDATE_MAINTENANCE_SCHEDULE:
+      case authorization::DRAIN_AGENT:
+      case authorization::DEACTIVATE_AGENT:
+      case authorization::REACTIVATE_AGENT:
       case authorization::VIEW_CONTAINER:
       case authorization::VIEW_EXECUTOR:
       case authorization::VIEW_FLAGS:
@@ -1153,6 +1232,8 @@ public:
       case authorization::WAIT_NESTED_CONTAINER:
       case authorization::WAIT_STANDALONE_CONTAINER:
       case authorization::MODIFY_RESOURCE_PROVIDER_CONFIG:
+      case authorization::MARK_RESOURCE_PROVIDER_GONE:
+      case authorization::VIEW_RESOURCE_PROVIDER:
       case authorization::UNKNOWN: {
         Result<vector<GenericACL>> genericACLs =
           createGenericACLs(action, acls);
@@ -1431,6 +1512,40 @@ private:
         }
 
         return acls_;
+
+      case authorization::DRAIN_AGENT:
+        foreach (const ACL::DrainAgent& acl,
+                 acls.drain_agents()) {
+          GenericACL acl_;
+          acl_.subjects = acl.principals();
+          acl_.objects = acl.agents();
+
+          acls_.push_back(acl_);
+        }
+
+        return acls_;
+      case authorization::DEACTIVATE_AGENT:
+        foreach (const ACL::DeactivateAgent& acl,
+                 acls.deactivate_agents()) {
+          GenericACL acl_;
+          acl_.subjects = acl.principals();
+          acl_.objects = acl.agents();
+
+          acls_.push_back(acl_);
+        }
+
+        return acls_;
+      case authorization::REACTIVATE_AGENT:
+        foreach (const ACL::ReactivateAgent& acl,
+                 acls.reactivate_agents()) {
+          GenericACL acl_;
+          acl_.subjects = acl.principals();
+          acl_.objects = acl.agents();
+
+          acls_.push_back(acl_);
+        }
+
+        return acls_;
       case authorization::MARK_AGENT_GONE:
         foreach (const ACL::MarkAgentGone& acl,
                  acls.mark_agents_gone()) {
@@ -1508,6 +1623,29 @@ private:
         }
 
         return acls_;
+      case authorization::MARK_RESOURCE_PROVIDER_GONE:
+        foreach (const ACL::MarkResourceProvidersGone& acl,
+                 acls.mark_resource_providers_gone()) {
+          GenericACL acl_;
+          acl_.subjects = acl.principals();
+          acl_.objects = acl.resource_providers();
+
+          acls_.push_back(acl_);
+        }
+
+        return acls_;
+      case authorization::VIEW_RESOURCE_PROVIDER:
+        foreach (
+            const ACL::ViewResourceProvider& acl,
+            acls.view_resource_providers()) {
+          GenericACL acl_;
+          acl_.subjects = acl.principals();
+          acl_.objects = acl.resource_providers();
+
+          acls_.push_back(acl_);
+        }
+
+        return acls_;
       case authorization::PRUNE_IMAGES:
         foreach (const ACL::PruneImages& acl, acls.prune_images()) {
           GenericACL acl_;
@@ -1520,13 +1658,20 @@ private:
         return acls_;
       case authorization::REGISTER_FRAMEWORK:
       case authorization::CREATE_VOLUME:
+      case authorization::RESIZE_VOLUME:
       case authorization::RESERVE_RESOURCES:
       case authorization::UPDATE_WEIGHT:
       case authorization::VIEW_ROLE:
       case authorization::GET_QUOTA:
       case authorization::UPDATE_QUOTA:
+      case authorization::UPDATE_QUOTA_WITH_CONFIG:
       case authorization::LAUNCH_NESTED_CONTAINER_SESSION:
       case authorization::LAUNCH_NESTED_CONTAINER:
+      case authorization::CREATE_BLOCK_DISK:
+      case authorization::DESTROY_BLOCK_DISK:
+      case authorization::CREATE_MOUNT_DISK:
+      case authorization::DESTROY_MOUNT_DISK:
+      case authorization::DESTROY_RAW_DISK:
         return Error("Extracting ACLs for " + stringify(action) + " requires "
                      "a specialized function");
       case authorization::UNKNOWN:
@@ -1599,7 +1744,7 @@ Option<Error> LocalAuthorizer::validate(const ACLs& acls)
   foreach (const ACL::GetEndpoint& acl, acls.get_endpoints()) {
     if (acl.paths().type() == ACL::Entity::SOME) {
       foreach (const string& path, acl.paths().values()) {
-        if (!AUTHORIZABLE_ENDPOINTS.contains(path)) {
+        if (!authorization::AUTHORIZABLE_ENDPOINTS.contains(path)) {
           return Error("Path: '" + path + "' is not an authorizable path");
         }
       }
@@ -1644,8 +1789,25 @@ Option<Error> LocalAuthorizer::validate(const ACLs& acls)
   foreach (const ACL::GetMaintenanceStatus& acl,
            acls.get_maintenance_statuses()) {
     if (acl.machines().type() == ACL::Entity::SOME) {
-      return Error(
-          "ACL.GetMaintenanceStatus type must be either NONE or ANY");
+      return Error("ACL.GetMaintenanceStatus type must be either NONE or ANY");
+    }
+  }
+
+  foreach (const ACL::DrainAgent& acl, acls.drain_agents()) {
+    if (acl.agents().type() == ACL::Entity::SOME) {
+      return Error("ACL.DrainAgent type must be either NONE or ANY");
+    }
+  }
+
+  foreach (const ACL::DeactivateAgent& acl, acls.deactivate_agents()) {
+    if (acl.agents().type() == ACL::Entity::SOME) {
+      return Error("ACL.DeactivateAgent type must be either NONE or ANY");
+    }
+  }
+
+  foreach (const ACL::ReactivateAgent& acl, acls.reactivate_agents()) {
+    if (acl.agents().type() == ACL::Entity::SOME) {
+      return Error("ACL.ReactivateAgent type must be either NONE or ANY");
     }
   }
 
@@ -1686,6 +1848,21 @@ Option<Error> LocalAuthorizer::validate(const ACLs& acls)
     if (acl.users().type() == ACL::Entity::SOME) {
       return Error(
           "ACL.ViewStandaloneContainer type must be either NONE or ANY");
+    }
+  }
+
+  foreach (const ACL::MarkResourceProvidersGone& acl,
+           acls.mark_resource_providers_gone()) {
+    if (acl.resource_providers().type() == ACL::Entity::SOME) {
+      return Error(
+          "ACL.MarkResourceProvidersGone type must be either NONE or ANY");
+    }
+  }
+
+  foreach (const ACL::ViewResourceProvider& acl,
+           acls.view_resource_providers()) {
+    if (acl.resource_providers().type() == ACL::Entity::SOME) {
+      return Error("ACL.ViewResourceProvider type must be either NONE or ANY");
     }
   }
 

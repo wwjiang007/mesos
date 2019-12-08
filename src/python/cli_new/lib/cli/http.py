@@ -19,27 +19,39 @@ A collection of http related functions used by the CLI and its Plugins.
 """
 
 import json
-import urllib2
+import urllib.request
+import urllib.error
+import urllib.parse
 import time
+
+import cli
 
 from cli.exceptions import CLIException
 
 
-def read_endpoint(addr, endpoint):
+def read_endpoint(addr, endpoint, query=None):
     """
     Read the specified endpoint and return the results.
     """
     try:
-        url = "http://{addr}/{endpoint}".format(addr=addr, endpoint=endpoint)
-
-        http_response = urllib2.urlopen(url).read().decode("utf-8")
+        addr = cli.util.sanitize_address(addr)
     except Exception as exception:
-        raise CLIException("{error}".format(error=str(exception)))
+        raise CLIException("Unable to sanitize address '{addr}': {error}"
+                           .format(addr=addr, error=str(exception)))
+
+    try:
+        url = "{addr}/{endpoint}".format(addr=addr, endpoint=endpoint)
+        if query is not None:
+            url += "?{query}".format(query=urllib.parse.urlencode(query))
+        http_response = urllib.request.urlopen(url).read().decode("utf-8")
+    except Exception as exception:
+        raise CLIException("Unable to open url '{url}': {error}"
+                           .format(url=url, error=str(exception)))
 
     return http_response
 
 
-def get_json(addr, endpoint, condition=None, timeout=5):
+def get_json(addr, endpoint, condition=None, timeout=5, query=None):
     """
     Return the contents of the 'endpoint' at 'addr' as JSON data
     subject to the condition specified in 'condition'. If we are
@@ -52,7 +64,7 @@ def get_json(addr, endpoint, condition=None, timeout=5):
         data = None
 
         try:
-            data = read_endpoint(addr, endpoint)
+            data = read_endpoint(addr, endpoint, query)
         except Exception as exception:
             pass
 
@@ -70,8 +82,7 @@ def get_json(addr, endpoint, condition=None, timeout=5):
                 return data
 
         if time.time() - start_time > timeout:
-            raise CLIException("Failed to get data within {seconds} seconds:"
-                               " {error}"
-                               .format(seconds=str(timeout), error=exception))
+            raise CLIException("Failed to get data within {seconds} seconds"
+                               .format(seconds=str(timeout)))
 
         time.sleep(0.1)

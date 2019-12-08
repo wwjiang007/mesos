@@ -122,9 +122,11 @@ namespace internal {
 
 inline Try<Nothing> checkpoint(
     const std::string& path,
-    const std::string& message)
+    const std::string& message,
+    bool sync,
+    bool downgradeResources)
 {
-  return ::os::write(path, message);
+  return ::os::write(path, message, sync);
 }
 
 
@@ -133,44 +135,58 @@ template <
     typename std::enable_if<
         std::is_convertible<T*, google::protobuf::Message*>::value,
         int>::type = 0>
-inline Try<Nothing> checkpoint(const std::string& path, T message)
+inline Try<Nothing> checkpoint(
+    const std::string& path,
+    T message,
+    bool sync,
+    bool downgrade)
 {
-  // If the `Try` from `downgradeResources` returns an `Error`, we currently
-  // continue to checkpoint the resources in a partially downgraded state.
-  // This implies that an agent with refined reservations cannot be downgraded
-  // to versions before reservation refinement support, which was introduced
-  // in 1.4.0.
-  //
-  // TODO(mpark): Do something smarter with the result once
-  // something like an agent recovery capability is introduced.
-  downgradeResources(&message);
-  return ::protobuf::write(path, message);
+  if (downgrade) {
+    // If the `Try` from `downgradeResources` returns an `Error`, we currently
+    // continue to checkpoint the resources in a partially downgraded state.
+    // This implies that an agent with refined reservations cannot be downgraded
+    // to versions before reservation refinement support, which was introduced
+    // in 1.4.0.
+    //
+    // TODO(mpark): Do something smarter with the result once
+    // something like an agent recovery capability is introduced.
+    downgradeResources(&message);
+  }
+
+  return ::protobuf::write(path, message, sync);
 }
 
 
 inline Try<Nothing> checkpoint(
     const std::string& path,
-    google::protobuf::RepeatedPtrField<Resource> resources)
+    google::protobuf::RepeatedPtrField<Resource> resources,
+    bool sync,
+    bool downgrade)
 {
-  // If the `Try` from `downgradeResources` returns an `Error`, we currently
-  // continue to checkpoint the resources in a partially downgraded state.
-  // This implies that an agent with refined reservations cannot be downgraded
-  // to versions before reservation refinement support, which was introduced
-  // in 1.4.0.
-  //
-  // TODO(mpark): Do something smarter with the result once
-  // something like an agent recovery capability is introduced.
-  downgradeResources(&resources);
-  return ::protobuf::write(path, resources);
+  if (downgrade) {
+    // If the `Try` from `downgradeResources` returns an `Error`, we currently
+    // continue to checkpoint the resources in a partially downgraded state.
+    // This implies that an agent with refined reservations cannot be downgraded
+    // to versions before reservation refinement support, which was introduced
+    // in 1.4.0.
+    //
+    // TODO(mpark): Do something smarter with the result once
+    // something like an agent recovery capability is introduced.
+    downgradeResources(&resources);
+  }
+
+  return ::protobuf::write(path, resources, sync);
 }
 
 
 inline Try<Nothing> checkpoint(
     const std::string& path,
-    const Resources& resources)
+    const Resources& resources,
+    bool sync,
+    bool downgrade)
 {
   const google::protobuf::RepeatedPtrField<Resource>& messages = resources;
-  return checkpoint(path, messages);
+  return checkpoint(path, messages, sync, downgrade);
 }
 
 }  // namespace internal {
@@ -187,14 +203,23 @@ inline Try<Nothing> checkpoint(
 //
 // NOTE: We provide atomic (all-or-nothing) semantics here by always
 // writing to a temporary file first then using os::rename to atomically
-// move it to the desired path.
+// move it to the desired path. If `sync` is set to true, this call succeeds
+// only if `fsync` is supported and successfully commits the changes to the
+// filesystem for the checkpoint file and each created directory.
+//
+// TODO(chhsiao): Consider enabling syncing by default after evaluating its
+// performance impact.
 template <typename T>
-Try<Nothing> checkpoint(const std::string& path, const T& t)
+Try<Nothing> checkpoint(
+    const std::string& path,
+    const T& t,
+    bool sync = false,
+    bool downgrade = true)
 {
   // Create the base directory.
   std::string base = Path(path).dirname();
 
-  Try<Nothing> mkdir = os::mkdir(base);
+  Try<Nothing> mkdir = os::mkdir(base, true, sync);
   if (mkdir.isError()) {
     return Error("Failed to create directory '" + base + "': " + mkdir.error());
   }
@@ -211,7 +236,8 @@ Try<Nothing> checkpoint(const std::string& path, const T& t)
   }
 
   // Now checkpoint the instance of T to the temporary file.
-  Try<Nothing> checkpoint = internal::checkpoint(temp.get(), t);
+  Try<Nothing> checkpoint =
+    internal::checkpoint(temp.get(), t, sync, downgrade);
   if (checkpoint.isError()) {
     // Try removing the temporary file on error.
     os::rm(temp.get());
@@ -221,7 +247,7 @@ Try<Nothing> checkpoint(const std::string& path, const T& t)
   }
 
   // Rename the temporary file to the path.
-  Try<Nothing> rename = os::rename(temp.get(), path);
+  Try<Nothing> rename = os::rename(temp.get(), path, sync);
   if (rename.isError()) {
     // Try removing the temporary file on error.
     os::rm(temp.get());
@@ -271,7 +297,8 @@ struct RunState
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
       const ContainerID& containerId,
-      bool strict);
+      bool strict,
+      bool rebooted);
 
   Option<ContainerID> id;
   hashmap<TaskID, TaskState> tasks;
@@ -298,7 +325,8 @@ struct ExecutorState
       const SlaveID& slaveId,
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
-      bool strict);
+      bool strict,
+      bool rebooted);
 
   ExecutorID id;
   Option<ExecutorInfo> info;
@@ -316,7 +344,8 @@ struct FrameworkState
       const std::string& rootDir,
       const SlaveID& slaveId,
       const FrameworkID& frameworkId,
-      bool strict);
+      bool strict,
+      bool rebooted);
 
   FrameworkID id;
   Option<FrameworkInfo> info;
@@ -351,11 +380,20 @@ struct SlaveState
   static Try<SlaveState> recover(
       const std::string& rootDir,
       const SlaveID& slaveId,
-      bool strict);
+      bool strict,
+      bool rebooted);
 
   SlaveID id;
   Option<SlaveInfo> info;
   hashmap<FrameworkID, FrameworkState> frameworks;
+
+  // `operations` will be `None()` if the agent that checkpointed the
+  // state didn't support checkpointing operations.
+  Option<std::vector<Operation>> operations;
+
+  // The drain state of the agent, if any.
+  Option<DrainConfig> drainConfig;
+
   unsigned int errors;
 };
 

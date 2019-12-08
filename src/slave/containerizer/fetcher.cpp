@@ -406,9 +406,22 @@ Future<Nothing> FetcherProcess::fetch(
   // entry.
   hashmap<CommandInfo::URI, Option<Future<shared_ptr<Cache::Entry>>>> entries;
 
+  // When we create new entries, we need to track whether we already have
+  // a entry for the corresponding URI value. This handles the case where
+  // multiple entries have the same URI value (but hash differently because
+  // they differ in other fields). If we see the same URI value multiple
+  // times, then we simply add references the initial entry.
+  hashmap<string, shared_ptr<Cache::Entry>> newEntries;
+
   foreach (const CommandInfo::URI& uri, commandInfo.uris()) {
     if (!uri.cache()) {
       entries[uri] = None();
+      continue;
+    }
+
+    if (newEntries.contains(uri.value())) {
+      newEntries[uri.value()]->reference();
+      entries[uri] = newEntries.at(uri.value());
       continue;
     }
 
@@ -429,6 +442,7 @@ Future<Nothing> FetcherProcess::fetch(
       shared_ptr<Cache::Entry> newEntry =
         cache.create(cacheDirectory, commandUser, uri);
 
+      newEntries.put(uri.value(), newEntry);
       newEntry->reference();
 
       entries[uri] =
@@ -462,7 +476,7 @@ Future<Nothing> FetcherProcess::_fetch(
 {
   // Get out all of the futures we need to wait for so we can wait on
   // them together via 'await'.
-  list<Future<shared_ptr<Cache::Entry>>> futures;
+  vector<Future<shared_ptr<Cache::Entry>>> futures;
 
   foreachvalue (const Option<Future<shared_ptr<Cache::Entry>>>& entry,
                 entries) {
@@ -585,7 +599,7 @@ Future<Nothing> FetcherProcess::__fetch(
       return future; // Always propagate the failure!
     })
     // Call to `operator` here forces the conversion on MSVC. This is implicit
-    // on clang an gcc.
+    // on clang and gcc.
     .operator std::function<process::Future<Nothing>(
         const process::Future<Nothing> &)>())
     .then(defer(self(), [=]() {
@@ -861,8 +875,8 @@ Future<Nothing> FetcherProcess::run(
 
   environment["MESOS_FETCHER_INFO"] = stringify(JSON::protobuf(info));
 
-  if (!flags.hadoop_home.empty()) {
-    environment["HADOOP_HOME"] = flags.hadoop_home;
+  if (flags.hadoop_home.isSome()) {
+    environment["HADOOP_HOME"] = flags.hadoop_home.get();
   }
 
   // TODO(jieyu): This is to make sure the libprocess of the fetcher
@@ -931,7 +945,7 @@ void FetcherProcess::kill(const ContainerID& containerId)
   if (subprocessPids.contains(containerId)) {
     VLOG(1) << "Killing the fetcher for container '" << containerId << "'";
     // Best effort kill the entire fetcher tree.
-    os::killtree(subprocessPids.get(containerId).get(), SIGKILL);
+    os::killtree(subprocessPids.at(containerId), SIGKILL);
 
     subprocessPids.erase(containerId);
   }
@@ -1013,6 +1027,22 @@ FetcherProcess::Cache::get(
 
   Option<shared_ptr<Entry>> entry = table.get(key);
   if (entry.isSome()) {
+    // The FetcherProcess will always remove a failed download
+    // synchronously after marking this future as failed.
+    CHECK(!entry.get()->completion().isFailed());
+
+    // Validate the cache file, if it has been downloaded.
+    if (entry.get()->completion().isReady()) {
+      Try<Nothing> validation = validate(entry.get());
+      if (validation.isError()) {
+        LOG(WARNING) << "Validation failed: '" + validation.error() +
+                        "'. Removing cache entry...";
+
+        remove(entry.get());
+        return None();
+      }
+    }
+
     // Refresh the cache entry by moving it to the back of lruSortedEntries.
     lruSortedEntries.remove(entry.get());
     lruSortedEntries.push_back(entry.get());
@@ -1027,7 +1057,7 @@ bool FetcherProcess::Cache::contains(
     const string& uri) const
 {
   const string key = cacheKey(user, uri);
-  return table.get(key).isSome();
+  return table.contains(key);
 }
 
 
@@ -1048,6 +1078,7 @@ bool FetcherProcess::Cache::contains(
 //   (1) We failed to determine its prospective cache file size.
 //   (2) We failed to download it when invoking the mesos-fetcher.
 //   (3) We're evicting it to make room for another entry.
+//   (4) We failed to validate the cache file.
 //
 // In (1) and (2) the contract is that we'll have failed the entry's
 // future before we call remove, so the entry's future should no
@@ -1058,6 +1089,9 @@ bool FetcherProcess::Cache::contains(
 // currently downloading it, because it should have a non-zero
 // reference count and therefore the future must either be ready or
 // failed in which case this is just case (1) above.
+//
+// In (4) we explicitly only validate a cache file if the future is
+// ready (i.e., the file has been downloaded).
 //
 // NOTE: It is not necessarily the case that this cache entry has
 // zero references because there might be some waiters on the
@@ -1158,6 +1192,26 @@ Try<Nothing> FetcherProcess::Cache::reserve(
   }
 
   return Nothing();
+}
+
+
+Try<Nothing> FetcherProcess::Cache::validate(
+    const std::shared_ptr<Cache::Entry>& entry)
+{
+    VLOG(1) << "Validating cache entry '" << entry->key
+            << "' with filename: " << entry->filename;
+
+    if (!os::exists(entry->path().string())) {
+      return Error("Cache file does not exist: " + entry->filename);
+    }
+
+    // TODO(abudnik): Consider adding validation of the cache file by either:
+    //   1. Comparing a known file checksum with the actual checksum of the file
+    //      stored on disk.
+    //   2. Reading the whole file by chunks. Many filesystems detect data
+    //      corruptions when reading file's data. As a positive side effect,
+    //      the file's data will be loaded into the page cache.
+    return Nothing();
 }
 
 

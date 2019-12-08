@@ -43,6 +43,195 @@ We categorize the changes as follows:
   </thead>
 <tr>
   <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Version-->
+  1.10.x
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Mesos Core-->
+    <ul style="padding-left:10px;">
+      <li>D <a href="#1-10-x-ssl-env-var-rename">Renamed LIBPROCESS_SSL_VERIFY_CERT and LIBPROCESS_SSL_REQUIRE_CERT environment variables.</a></li>
+    </ul>
+ </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Flags-->
+    <ul style="padding-left:10px;">
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Framework API-->
+    <ul style="padding-left:10px;">
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Module API-->
+    <ul style="padding-left:10px;">
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Endpoints-->
+    <ul style="padding-left:10px;">
+    </ul>
+  </td>
+</tr>
+
+<tr>
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Version-->
+  1.9.x
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Mesos Core-->
+    <ul style="padding-left:10px;">
+      <li>A <a href="#1-9-x-quota-guarantees">Quota Limits</a></li>
+      <li>A <a href="#1-9-x-linux-nnp-isolator">Linux NNP isolator</a></li>
+      <li>A <a href="#1-9-x-hostname-validation-scheme">hostname_validation_scheme</a></li>
+      <li>C <a href="#1-9-x-client-certificate-verification">TLS certificate verification behaviour</a></li>
+      <li>C <a href="#1-9-x-configurable-ipc">Configurable IPC namespace and /dev/shm</a></li>
+      <li>A <a href="#1-9-x-automatic-agent-draining">Automatic Agent Draining</a></li>
+    </ul>
+ </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Flags-->
+    <ul style="padding-left:10px;">
+      <li>A <a href="#1-9-x-docker-ignore-runtime">docker_ignore_runtime</a></li>
+      <li>A <a href="#1-9-x-configurable-ipc">disallow_sharing_agent_ipc_namespace</a></li>
+      <li>A <a href="#1-9-x-configurable-ipc">default_container_shm_size</a></li>
+      <li>C <a href="#1-9-x-agent-features">agent_features</a></li>
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Framework API-->
+    <ul style="padding-left:10px;">
+      <li>A <a href="#1-9-x-configurable-ipc">LinuxInfo.ipc_mode and LinuxInfo.shm_size</a></li>
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Module API-->
+    <ul style="padding-left:10px;">
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Endpoints-->
+    <ul style="padding-left:10px;">
+      <li>D <a href="#1-9-x-update-quota">SET_QUOTA and REMOVE QUOTA deprecated
+            in favor of UPDATE_QUOTA</a></li>
+      <li>D <a href="#1-9-x-quota-guarantees">Quota guarantees deprecated in favor
+            of using quota limits</a></li>
+    </ul>
+  </td>
+</tr>
+<tr>
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Version-->
+  1.8.x
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Mesos Core-->
+    <ul style="padding-left:10px;">
+      <li>A <a href="#1-8-x-linux-seccomp-isolator">Linux Seccomp isolator</a></li>
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Flags-->
+    <ul style="padding-left:10px;">
+      <li>A <a href="#1-8-x-linux-seccomp-isolator">seccomp_config_dir</a></li>
+      <li>A <a href="#1-8-x-linux-seccomp-isolator">seccomp_profile_name</a></li>
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Framework API-->
+    <ul style="padding-left:10px;">
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Module API-->
+    <ul style="padding-left:10px;">
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Endpoints-->
+    <ul style="padding-left:10px;">
+    </ul>
+  </td>
+</tr>
+<tr>
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Version-->
+  1.7.x
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Mesos Core-->
+    <ul style="padding-left:10px;">
+      <li>A <a href="#1-7-x-linux-devices-isolator">Linux devices isolator</a></li>
+      <li>A <a href="#1-7-x-auto-load-subsystems">Automatically load local enabled cgroups subsystems</a></li>
+      <li>A <a href="#1-7-x-container-specific-cgroups-mounts">Container-specific cgroups mounts</a></li>
+      <li>A <a href="#1-7-x-volume-mode-support">Volume mode support</a></li>
+      <li>A <a href="#1-7-x-resource-provider-acls">Resource Provider ACLs</a></li>
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Flags-->
+    <ul style="padding-left:10px;">
+      <li>A <a href="#1-7-x-enforce-container-ports">enforce_container_ports</a></li>
+      <li>A <a href="#1-7-x-gc-non-executor-container-sandboxes">gc_non_executor_container_sandboxes</a></li>
+      <li>A <a href="#1-7-x-network-cni-root-dir-persist">network_cni_root_dir_persist</a></li>
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Framework API-->
+    <ul style="padding-left:10px;">
+      <li>C <a href="#1-7-x-create-disk">`CREATE_DISK` and `DESTROY_DISK` operations and ACLs</a></li>
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Module API-->
+    <ul style="padding-left:10px;">
+      <li>C <a href="#1-7-x-container-logger">ContainerLogger module interface changes</a></li>
+      <li>C <a href="#1-7-x-isolator-recover">Isolator::recover module interface changes</a></li>
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Endpoints-->
+    <ul style="padding-left:10px;">
+      <li>C <a href="#1-7-x-json-serialization">JSON serialization changes</a></li>
+    </ul>
+  </td>
+</tr>
+<tr>
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Version-->
+  1.6.x
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Mesos Core-->
+    <ul style="padding-left:10px;">
+      <li>C <a href="#1-6-x-grpc-requirement">Requirement for gRPC library</a></li>
+      <li>C <a href="#1-6-x-csi-support">CSI v0.2 Support</a></li>
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Flags-->
+    <ul style="padding-left:10px;">
+      <li>A <a href="#1-6-x-fetcher-stall-timeout">fetcher_stall_timeout</a></li>
+    </ul>
+    <ul style="padding-left:10px;">
+      <li>A <a href="#1-6-x-xfs-kill-containers">xfs_kill_containers</a></li>
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Framework API-->
+    <ul style="padding-left:10px;">
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Module API-->
+    <ul style="padding-left:10px;">
+      <li>C <a href="#1-6-x-disk-profile-adaptor">Disk profile adaptor module changes</a></li>
+    </ul>
+  </td>
+
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Endpoints-->
+    <ul style="padding-left:10px;">
+    </ul>
+  </td>
+</tr>
+<tr>
+  <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Version-->
   1.5.x
   </td>
 
@@ -95,6 +284,7 @@ We categorize the changes as follows:
       <li>A <a href="#1-4-x-bounding-capabilities">Support for explicit bounding capabilities</a></li>
       <li>C <a href="#1-4-x-agent-recovery">Agent recovery post reboot</a></li>
       <li>C <a href="#1-4-x-xfs-no-enforce">XFS disk isolator support for not enforcing disk limits</a></li>
+      <li>C <a href="#1-4-x-update-minimal-docker-version">Update the minimal supported Docker version</a></li>
     </ul>
   </td>
 
@@ -360,6 +550,157 @@ We categorize the changes as follows:
 </tr>
 </table>
 
+## Upgrading from 1.9.x to 1.10.x ##
+
+<a name="1-10-x-ssl-env-var-rename"></a>
+
+* The canonical name for the environment variable `LIBPROCESS_SSL_VERIFY_CERT` was changed to `LIBPROCESS_SSL_VERIFY_SERVER_CERT`.
+  The canonical name for the environment variable `LIBPROCESS_SSL_REQUIRE_CERT` was changed to `LIBPROCESS_SSL_REQUIRE_CLIENT_CERT`.
+  The old names will continue to work as before, but operators are encouraged to update their configuration to reduce confusion.
+
+## Upgrading from 1.8.x to 1.9.x ##
+
+<a name="1-9-x-automatic-agent-draining"></a>
+
+* A new `DRAINING` state has been added to Mesos agents. Once an agent is draining, all tasks running on that agent are gracefully
+  killed and no offers for that agent are sent to schedulers, preventing the launching of new tasks.
+  Operators can put an agent into `DRAINING` state by using the `DRAIN_AGENT` operator API call.
+  See [`docs/maintenance`](maintenance.md) for details.
+
+<a name="1-9-x-agent-features"></a>
+
+* The Mesos agent now requires the new `AGENT_DRAINING` feature. This capability is set by default, but if the `--agent_features` flag is specified explicitly, `AGENT_DRAINING` must be included.
+
+<a name="1-9-x-linux-nnp-isolator"></a>
+
+* A new [`linux/nnp`](isolators/linux-nnp.md) isolator has been added. The isolator supports setting of the `no_new_privs` bit in the container, preventing tasks from acquiring additional privileges.
+
+<a name="1-9-x-docker-ignore-runtime"></a>
+
+* A new [`--docker_ignore_runtime`](configuration/agent.md#docker_ignore_runtime) flag has been added. This causes the agent to ignore any runtime configuration present in Docker images.
+
+<a name="1-9-x-hostname-validation-scheme"></a>
+
+* A new libprocess TLS flag `--hostname_validation_scheme` along with the corresponding environment variable `LIBPROCESS_SSL_HOSTNAME_VALIDATION_SCHEME`
+  has been added. Using this flag, users can configure the way libprocess performs hostname validation for TLS connections.
+  See [`docs/ssl`](ssl.md) for details.
+
+<a name="1-9-x-client-certificate-verification"></a>
+
+* The semantics of the libprocess environment variables `LIBPROCESS_SSL_VERIFY_CERT` and `LIBPROCESS_SSL_REQUIRE_CERT` have been slightly updated such that
+  the former now only applies to client-mode and the latter only to server-mode connections. As part of this re-adjustment, the following two changes have
+  been introduced that might require changes for operators running Mesos in unusual TLS configurations.
+  * Anonymous ciphers can not be used anymore when `LIBPROCESS_SSL_VERIFY_CERT` is set to true. This is because the use of anonymous ciphers enables
+    a malicious attacker to bypass certificate verification by choosing a certificate-less cipher.
+    Users that rely on anonymous ciphers being available should make sure that `LIBPROCESS_SSL_VERIFY_CERT` is set to false.
+  * For incoming connections, certificates are not verified unless `LIBPROCESS_SSL_REQUIRE_CERT` is set to true.
+    This is because verifying the certificate can lead to false negatives, where a connection is aborted even though presenting no certificate at all
+    would have been successfull. Users that rely on incoming connection requests presenting valid TLS certificates should make sure that
+    the `LIBPROCESS_SSL_REQUIRE_CERT` option is set to true.
+
+<a name="1-9-x-configurable-ipc"></a>
+
+* The Mesos containerizer now supports configurable IPC namespace and /dev/shm. Container can be configured to have a private IPC namespace and /dev/shm or share them from its parent via the field `LinuxInfo.ipc_mode`, and the size of its private /dev/shm is also configurable via the field `LinuxInfo.shm_size`. Operators can control whether it is allowed to share host's IPC namespace and /dev/shm with top level containers via the agent flag `--disallow_sharing_agent_ipc_namespace`, and specify the default size of the /dev/shm for the container which has a private /dev/shm via the agent flag `--default_container_shm_size`.
+
+<a name="1-9-x-update-quota"></a>
+
+* The `SET_QUOTA` and `REMOVE QUOTA` master calls are deprecated in favor of a new `UPDATE_QUOTA` master call.
+
+<a name="1-9-x-quota-guarantees"></a>
+
+* Prior to Mesos 1.9, the quota related APIs only exposed quota "guarantees" which ensured a minimum amount of resources would be available to a role. Setting guarantees also set implicit quota limits. In Mesos 1.9+, quota limits are now exposed directly.
+  * Quota guarantees are now deprecated in favor of using only quota limits. Enforcement of quota guarantees required that Mesos holds back enough resources to meet all of the unsatisfied quota guarantees. Since Mesos is moving towards an optimistic offer model (to improve multi-role / multi- scheduler scalability, see MESOS-1607), it will become no longer possible to enforce quota guarantees by holding back resources. In such a model, quota limits are simple to enforce, but quota guarantees would require a complex "effective limit" propagation model to leave space for unsatisfied guarantees.
+  * For these reasons, quota guarantees, while still functional in Mesos 1.9, are now deprecated. A combination of limits and priority based preemption will be simpler in an optimistic offer model.
+
+## Upgrading from 1.7.x to 1.8.x ##
+
+<a name="1-8-x-linux-seccomp-isolator"></a>
+
+* A new [`linux/seccomp`](isolators/linux-seccomp.md) isolator has been added. The isolator supports the following new agent flags:
+  * `--seccomp_config_dir` specifies the directory path of the Seccomp profiles.
+  * `--seccomp_profile_name` specifies the path of the default Seccomp profile relative to the `seccomp_config_dir`.
+
+## Upgrading from 1.6.x to 1.7.x ##
+
+<a name="1-7-x-linux-devices-isolator"></a>
+
+* A new [`linux/devices`](isolators/linux-devices.md) isolator has been
+  added. This isolator automatically populates containers with devices
+  that have been whitelisted with the `--allowed_devices` agent flag.
+
+<a name="1-7-x-auto-load-subsystems"></a>
+
+* A new option `cgroups/all` has been added to the agent flag `--isolation`. This allows cgroups isolator to automatically load all the local enabled cgroups subsystems. If this option is specified in the agent flag `--isolation` along with other cgroups related options (e.g., `cgroups/cpu`), those options will be just ignored.
+
+<a name="1-7-x-container-specific-cgroups-mounts"></a>
+
+* Added container-specific cgroups mounts under `/sys/fs/cgroup` to containers with image launched by Mesos containerizer.
+
+<a name="1-7-x-volume-mode-support"></a>
+
+* Previously the `HOST_PATH`, `SANDBOX_PATH`, `IMAGE`, `SECRET`, and `DOCKER_VOLUME` volumes were always mounted for container in read-write mode, i.e., the `Volume.mode` field was not honored. Now we will mount these volumes based on the `Volume.mode` field so framework can choose to mount the volume for the container in either read-write mode or read-only mode.
+
+<a name="1-7-x-create-disk"></a>
+
+* To simplify the API for CSI-backed disk resources, the following operations and corresponding ACLs have been introduced to replace the experimental `CREATE_VOLUME`, `CREATE_BLOCK`, `DESTROY_VOLUME` and `DESTROY_BLOCK` operations:
+  * `CREATE_DISK` to create a `MOUNT` or `BLOCK` disk resource from a `RAW` disk resource. The `CreateMountDisk` and `CreateBlockDisk` ACLs control which principals are allowed to create `MOUNT` or `BLOCK` disks for which roles.
+  * `DESTROY_DISK` to reclaim a `MOUNT` or `BLOCK` disk resource back to a `RAW` disk resource. The `DestroyMountDisk` and `DestroyBlockDisk` ACLs control which principals are allowed to reclaim `MOUNT` or `BLOCK` disks for which roles.
+
+<a name="1-7-x-resource-provider-acls"></a>
+
+* A new `ViewResourceProvider` ACL has been introduced to control which principals are allowed to call the `GET_RESOURCE_PROVIDERS` agent API.
+
+<a name="1-7-x-enforce-container-ports"></a>
+
+* A new [`--enforce_container_ports`](configuration/agent.md#enforce_container_ports) flag has been added to toggle whether the [`network/ports`](isolators/network-ports.md) isolator should enforce TCP ports usage limits.
+
+<a name="1-7-x-gc-non-executor-container-sandboxes"></a>
+
+* A new [`--gc_non_executor_container_sandboxes`](configuration/agent.md#gc_non_executor_container_sandboxes)
+  agent flag has been added to garbage collect the sandboxes of nested
+  containers, which includes the tasks groups launched by the default executor.
+  We recommend enabling the flag if you have frameworks that launch multiple
+  task groups on the same default executor instance.
+
+<a name="1-7-x-network-cni-root-dir-persist"></a>
+
+* A new [`--network_cni_root_dir_persist`](configuration/agent.md#network_cni_root_dir_persist) flag has been added to toggle whether the [`network/cni`](cni.md) isolator should persist the network information across reboots.
+
+<a name="1-7-x-container-logger"></a>
+
+* `ContainerLogger` module interface has been changed. The `prepare()` method now takes `ContainerID` and `ContainerConfig` instead.
+
+<a name="1-7-x-isolator-recover"></a>
+
+* `Isolator::recover()` has been updated to take an `std::vector` instead of `std::list` of container states.
+
+<a name="1-7-x-json-serialization"></a>
+
+* As a result of adapting rapidjson for performance improvement, all JSON endpoints serialize differently while still conforming to the ECMA-404 spec for JSON. This means that if a client has a JSON de-serializer that conforms to ECMA-404 they will see no change. Otherwise, they may break. As an example, Mesos would previously serialize '/' as '\/', but the spec does not require the escaping and rapidjson does not escape '/'.
+
+## Upgrading from 1.5.x to 1.6.x ##
+
+<a name="1-6-x-grpc-requirement"></a>
+
+* gRPC version 1.10+ is required to build Mesos when enabling gRPC-related features. Please upgrade your gRPC library if you are using an unbundled one.
+
+<a name="1-6-x-csi-support"></a>
+
+* CSI v0.2 is now supported as experimental. Due to the incompatibility between CSI v0.1 and v0.2, the experimental support for CSI v0.1 is removed, and the operator must remove all storage local resource providers within an agent before upgrading the agent. NOTE: This is a **breaking change** for storage local resource providers.
+
+<a name="1-6-x-fetcher-stall-timeout"></a>
+
+* A new agent flag `--fetcher_stall_timeout` has been added. This flag specifies the amount of time for the container image and artifact fetchers to wait before aborting a stalled download (i.e., the speed keeps below one byte per second). NOTE: This flag only applies when downloading data from the net and does not apply to HDFS.
+
+<a name="1-6-x-disk-profile-adaptor"></a>
+
+* The disk profile adaptor module has been changed to support CSI v0.2, and its header file has been renamed to be consistent with other modules. See `disk_profile_adaptor.hpp` for interface changes.
+
+<a name="1-6-x-xfs-kill-containers"></a>
+
+* A new agent flag `--xfs_kill_containers` has been added. By setting this flag, the [`disk/xfs`](isolators/disk-xfs.md) isolator
+  will now kill containers that exceed the disk limit.
+
 ## Upgrading from 1.4.x to 1.5.x ##
 
 <a name="1-5-x-task-starting"></a>
@@ -382,7 +723,7 @@ We categorize the changes as follows:
 
 * A new [`network/ports`](isolators/network-ports.md) isolator has been added. The isolator supports the following new agent flags:
   * `--container_ports_watch_interval` specifies the interval at which the isolator reconciles port assignments.
-  * `--check_agent_port_range_only` excludes ports outside the agent's range from port reconcilation.
+  * `--check_agent_port_range_only` excludes ports outside the agent's range from port reconciliation.
 
 <a name="1-5-x-executor-secret-key"></a>
 
@@ -420,7 +761,7 @@ We categorize the changes as follows:
 
 <a name="1-4-x-bounding-capabilities"></a>
 
-* Explicitly setting the bounding capabilities of a task independently of the effective capabilities is now supported. Frameworks can specifiy the task bounding capabilities by using the `LinuxInfo.bounding_capabilities` message. Operators can specify the default bounding capabilities using the agent `--bounding_capabilities` flag. This flag also specifies the maximum bounding set that a framework is allowed to specify.
+* Explicitly setting the bounding capabilities of a task independently of the effective capabilities is now supported. Frameworks can specify the task bounding capabilities by using the `LinuxInfo.bounding_capabilities` message. Operators can specify the default bounding capabilities using the agent `--bounding_capabilities` flag. This flag also specifies the maximum bounding set that a framework is allowed to specify.
 
 <a name="1-4-x-agent-recovery"></a>
 
@@ -451,6 +792,10 @@ We categorize the changes as follows:
 
 * The `Resources` class in the internal Mesos C++ library changed its behavior to only support post-`RESERVATION_REFINEMENT` format. If a framework is using this internal utility, it is likely to break if the `RESERVATION_REFINEMENT` capability is not enabled.
 
+<a name="1-4-x-update-minimal-docker-version"></a>
+
+* To specify the `--type=container` option for the `docker inspect <container_name>` command, the minimal supported Docker version has been updated from 1.0.0 to 1.8.0 since Docker supported `--type=container` for the `docker inspect` command starting from 1.8.0.
+
 ## Upgrading from 1.2.x to 1.3.x ##
 
 <a name="1-3-x-disallow-old-agents"></a>
@@ -465,6 +810,7 @@ We categorize the changes as follows:
 
 * Support for deprecated ACL `shutdown_frameworks` has been removed from the local authorizer. Before upgrading the Mesos binaries, replace all instances of the ACL `shutdown_frameworks` with the newer ACL `teardown_frameworks`. After updating the ACLs, the binaries can be safely replaced.
 
+<a name="1-3-x-multi-role-support"></a>
 <a name="1-3-x-framework-info-role"></a>
 
 * Support for multi-role frameworks deprecates the `FrameworkInfo.role` field in favor of `FrameworkInfo.roles` and the `MULTI_ROLE` capability. Frameworks using the new field can continue to use a single role.
@@ -565,7 +911,7 @@ In order to upgrade a running cluster:
 
 <a name="1-1-x-allocator-updateallocation"></a>
 
-* Mesos 1.1 adds an `offeredResources` argument to the `Allocator::updateAllocation()` method. It is used to indicate the resources that the operations passed to `updateAllocation()` are applied to. [MESOS-4431](https://issues.apache.org/jira/browse/MESOS-4431) (paticularly [/r/45961/](https://reviews.apache.org/r/45961/)) has more details on the motivation.
+* Mesos 1.1 adds an `offeredResources` argument to the `Allocator::updateAllocation()` method. It is used to indicate the resources that the operations passed to `updateAllocation()` are applied to. [MESOS-4431](https://issues.apache.org/jira/browse/MESOS-4431) (particularly [/r/45961/](https://reviews.apache.org/r/45961/)) has more details on the motivation.
 
 ## Upgrading from 0.28.x to 1.0.x ##
 
@@ -653,7 +999,7 @@ In order to upgrade a running cluster:
 <a name="1-0-x-quota-acls"></a>
 
 * The `SetQuota` and `RemoveQuota` ACLs have been deprecated. To replace these, a new ACL `UpdateQuota` have been introduced. In addition, a new ACL `GetQuota` have been added; these control which principals are allowed to query quota information for which roles. These changes affect the `--acls` flag for the local authorizer in the following ways:
-  * The `update_quotas` ACL cannot be used in combination with either the `set_quotas` or `remove_quotas` ACL. The local authorizor will produce an error in such a case;
+  * The `update_quotas` ACL cannot be used in combination with either the `set_quotas` or `remove_quotas` ACL. The local authorizer will produce an error in such a case;
   * When upgrading a Mesos cluster that uses the `set_quotas` or `remove_quotas` ACLs, the operator should first upgrade the Mesos binaries. At this point, the deprecated ACLs will still be enforced. After the upgrade has been verified, the operator should replace deprecated values for `set_quotas` and `remove_quotas` with equivalent values for `update_quotas`;
   * If desired, the operator can use the `get_quotas` ACL after the upgrade to control which principals are allowed to query quota information.
 
@@ -674,7 +1020,7 @@ In order to upgrade a running cluster:
 
 <a name="1-0-x-http-authentication-flags"></a>
 
-* The `--authenticate_http` flag has been deprecated in favor of `--authenticate_http_readwrite`. Setting `--authenticate_http_readwrite` will now enable authentication for all endpoints which previously had authentication support. These happen to be the endpoints which allow modifiication of the cluster state, or "read-write" endpoints. Note that `/logging/toggle`, `/profiler/start`, `/profiler/stop`, `/maintenance/schedule`, `/machine/up`, and `/machine/down` previously did not have authentication support, but in 1.0 if either `--authenticate_http` or `--authenticate_http_readwrite` is set, those endpoints will now require authentication. A new flag has also been introduced, `--authenticate_http_readonly`, which enables authentication for endpoints which support authentication and do not allow modification of the state of the cluster, like `/state` or `/flags`.
+* The `--authenticate_http` flag has been deprecated in favor of `--authenticate_http_readwrite`. Setting `--authenticate_http_readwrite` will now enable authentication for all endpoints which previously had authentication support. These happen to be the endpoints which allow modification of the cluster state, or "read-write" endpoints. Note that `/logging/toggle`, `/profiler/start`, `/profiler/stop`, `/maintenance/schedule`, `/machine/up`, and `/machine/down` previously did not have authentication support, but in 1.0 if either `--authenticate_http` or `--authenticate_http_readwrite` is set, those endpoints will now require authentication. A new flag has also been introduced, `--authenticate_http_readonly`, which enables authentication for endpoints which support authentication and do not allow modification of the state of the cluster, like `/state` or `/flags`.
 
 <a name="1-0-x-endpoint-authorization"></a>
 

@@ -14,8 +14,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <list>
-
 #include <gmock/gmock.h>
 
 #include <mesos/authentication/secret_generator.hpp>
@@ -38,6 +36,7 @@ using mesos::master::detector::MasterDetector;
 using mesos::internal::slave::Containerizer;
 using mesos::internal::slave::GarbageCollector;
 using mesos::internal::slave::TaskStatusUpdateManager;
+using mesos::internal::slave::VolumeGidManager;
 
 using mesos::slave::ContainerTermination;
 using mesos::slave::ResourceEstimator;
@@ -103,6 +102,8 @@ MockSlave::MockSlave(
     ResourceEstimator* resourceEstimator,
     QoSController* qosController,
     SecretGenerator* secretGenerator,
+    VolumeGidManager* volumeGidManager,
+    PendingFutureTracker* futureTracker,
     const Option<Authorizer*>& authorizer)
   // It is necessary to explicitly call `ProcessBase` constructor here even
   // though the direct parent `Slave` already does this. This is because
@@ -121,6 +122,8 @@ MockSlave::MockSlave(
         resourceEstimator,
         qosController,
         secretGenerator,
+        volumeGidManager,
+        futureTracker,
         authorizer)
 {
   // Set up default behaviors, calling the original methods.
@@ -136,6 +139,8 @@ MockSlave::MockSlave(
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked_runTaskGroup));
   EXPECT_CALL(*this, killTask(_, _))
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked_killTask));
+  EXPECT_CALL(*this, authenticate(_, _))
+    .WillRepeatedly(Invoke(this, &MockSlave::unmocked_authenticate));
   EXPECT_CALL(*this, removeFramework(_))
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked_removeFramework));
   EXPECT_CALL(*this, __recover(_))
@@ -150,6 +155,8 @@ MockSlave::MockSlave(
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked_shutdownExecutor));
   EXPECT_CALL(*this, _shutdownExecutor(_, _))
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked__shutdownExecutor));
+  EXPECT_CALL(*this, applyOperation(_))
+    .WillRepeatedly(Invoke(this, &MockSlave::unmocked_applyOperation));
 }
 
 
@@ -158,8 +165,8 @@ void MockSlave::unmocked____run(
     const FrameworkID& frameworkId,
     const ExecutorID& executorId,
     const ContainerID& containerId,
-    const list<TaskInfo>& tasks,
-    const list<TaskGroupInfo>& taskGroups)
+    const vector<TaskInfo>& tasks,
+    const vector<TaskGroupInfo>& taskGroups)
 {
   slave::Slave::___run(
       future,
@@ -253,6 +260,14 @@ void MockSlave::unmocked_killTask(
 }
 
 
+void MockSlave::unmocked_authenticate(
+    Duration minTimeout,
+    Duration maxTimeout)
+{
+  slave::Slave::authenticate(minTimeout, maxTimeout);
+}
+
+
 void MockSlave::unmocked_removeFramework(slave::Framework* framework)
 {
   slave::Slave::removeFramework(framework);
@@ -302,6 +317,11 @@ void MockSlave::unmocked__shutdownExecutor(
   slave::Slave::_shutdownExecutor(framework, executor);
 }
 
+
+void MockSlave::unmocked_applyOperation(const ApplyOperationMessage& message)
+{
+  slave::Slave::applyOperation(message);
+}
 
 } // namespace tests {
 } // namespace internal {

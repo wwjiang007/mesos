@@ -61,27 +61,40 @@ This guide describes the process of doing an official release of Mesos.
 
 ## Preparation
 
-1. Go to [Apache JIRA](https://issues.apache.org/jira/browse/MESOS) and make
+1. If this is a regular release, create a new release branch (<major>.<minor>.x)
+   based off the current master.
+
+        $ git checkout origin/master -b X.Y.x
+
+   Now, update master branch to the *next*  minor version in `configure.ac`:
+   change `AC_INIT([mesos], [X.Y.Z]))`, as well as in `CMakeLists.txt`:
+   change `set(MESOS_MAJOR_VERSION X)`, `set(MESOS_MINOR_VERSION Y)`,
+   `set(MESOS_PATCH_VERSION Z)` and then commit.
+
+   If this is a patch release, use the existing release branch.
+
+2. Go to [Apache JIRA](https://issues.apache.org/jira/browse/MESOS) and make
    sure that the `CHANGELOG` for the release version is up to date.
 
-   **NOTE:** You should move all **Unresolved** tickets marked with `Fix Version`
-   or `Target Version` as the release version to the next release version.
+   **NOTE:** For all **Unresolved** tickets marked with `Fix Version` or
+   `Target Version` as the release version, try to negotiate with the
+   ticket owner or shepherd if the release should wait for the ticket to
+   be resolved or if the `Fix Version` should be bumped to the next version.
 
    **PROTIP:** Use a JIRA dashboard
    [(example)](https://issues.apache.org/jira/secure/Dashboard.jspa?selectPageId=12329720)
    to track the progress of targeted issues as the release date approaches. This
    JIRA filter may be useful (`<X.Y.Z>` is the release version):
    `project = MESOS AND "Target Version/s" = <X.Y.Z> AND (fixVersion != <X.Y.Z> OR fixVersion = EMPTY)`
+   Note, you may need to request permission to create shared dashboard and filters by opening
+   an Apache INFRA ticket.
 
    **PROTIP:** Use `bulk edit` option in JIRA to move the tickets and make sure
    to **uncheck** the option that emails everyone about the move to avoid
    spamming.
 
-2. Checkout the correct branch for the release. For regular releases this is the
-   "master" branch. For patch releases this would be the corresponding release
-   branch (e.g., 1.0.x).
-
-3. Update and commit the `CHANGELOG` for the release.
+3. Update and commit the `CHANGELOG` for the release, on both the **master**
+   and the release branch.
 
    For regular releases:
 
@@ -112,33 +125,35 @@ This guide describes the process of doing an official release of Mesos.
    `Target Version` set but not `Fix Version`. Also check for any Unresolved
    or `Duplicate`/`Invalid` tickets that incorrectly set the `Fix Version`.
 
-   For patch releases update the `CHANGELOG` on master branch and then cherry
-   pick onto the release branch.
+   Update the `CHANGELOG` on master branch and then cherry pick onto the release
+   branch to ensure both versions stay in sync.
 
 4. Ensure version in `configure.ac` and `CMakeLists.txt` is correctly set for
    the release. Do not forget to remove "(WIP)" suffix from the release notes'
    title.
 
-5. Run `make && support/generate-endpoint-help.py` and commit any resulting
-   changes.
+5. Update and commit `docs/configuration.md` to reflect the current state of
+   the master, agent, and configure flags. Update it on master branch and then
+   cherry pick onto the release branch.
 
-6. Update and commit `docs/configuration.md` to reflect the current state of
-   the master, agent, and configure flags. If this is a patch release, update
-   it on master branch and then cherry pick onto the release branch.
-
-7. If this is a regular release, update and commit `docs/upgrades.md` with
+6. If this is a regular release, update and commit `docs/upgrades.md` with
    instructions about how to upgrade a live cluster from the previous release
-   version to this release version.
+   version to this release version. Update it on master branch and then cherry
+   pick onto the release branch.
 
-8. If this is a regular release, please ensure that user documentation has been
+7. If this is a regular release, please ensure that user documentation has been
    added for any new features.
 
-9. Make sure that for any updates of the API, specifically the scheduler API,
+8. Make sure that for any updates of the API, specifically the scheduler API,
    the public mesos protobuf definitions are part of both, `include/mesos` as
    well as `include/mesos/v1`.
 
    **NOTE:** This might actually demand code updates if any omissions were
    identified.
+
+9. Push your changes on master branch and the new release branch if this is a
+   regular release, push your changes on the existing release branch if this is
+   a patch release.
 
 
 ## Tagging and Voting the Release Candidate
@@ -160,7 +175,7 @@ This guide describes the process of doing an official release of Mesos.
    scheme. `R` is release candidate version that starts with 1.
 
 4. Tag the release externally and deploy the corresponding JAR to the
-   [Apache maven repository](https://repository.apache.org). It is recommended
+   [Apache Maven repository](https://repository.apache.org). It is recommended
    to use the `support/vote.sh` script to accomplish this.
 
         $ ./support/vote.sh X.Y.Z R
@@ -178,21 +193,12 @@ This guide describes the process of doing an official release of Mesos.
    we allow a longer vote, to allow more time for integration testing.
 
 
-6. If this is a regular release, create a new release branch (<major>.<minor>.x)
-   from this tag.
-
-        $ git checkout -b X.Y.x
-
-   Now, update master branch to the *next*  minor version in `configure.ac`:
-   change `AC_INIT([mesos], [X.Y.Z]))`, as well as in `CMakeLists.txt`:
-   change `set(MESOS_MAJOR_VERSION X)`, `set(MESOS_MINOR_VERSION Y)`,
-   `set(MESOS_PATCH_VERSION Z)` and then commit.
-
-
 ## Preparing a New Release Candidate
 
-1. If the vote does not pass (any -1s or showstopper bugs), track the issues
-   as new JIRAs for the release.
+1. If the vote does not pass (any -1s or showstopper bugs)
+   1. Send a reply to the original VOTE email with subject "[RESULT][VOTE] Release Apache Mesos X.Y.Z (rcN)" and mention that the vote is canceled.
+   2. Go to [Apache Maven staging repositories](https://repository.apache.org/#stagingRepositories) and "Drop" the staging repository containing the JAR (you can find the exact link to the staging repository in the original VOTE email).
+   3. Track the issues as new JIRAs for the release.
 
 2. When all known issues are resolved, update the `CHANGELOG` with the newly
    fixed JIRAs.
@@ -204,7 +210,7 @@ This guide describes the process of doing an official release of Mesos.
         $ git checkout X.Y.x
         $ git cherry-pick abcdefgh...
 
-4. Now go back up to the "Tagging the Release Candidate" section and repeat.
+4. Now go back up to the "Tagging and Voting the Release Candidate" section and repeat.
 
 
 ## Releasing the Release Candidate
@@ -247,6 +253,10 @@ This guide describes the process of doing an official release of Mesos.
      `git log --pretty=format:%an <tagX>..<tagY> | sort | uniq | awk '{print}' ORS=', '`
 
    * Mention the blog post in `site/data/releases.yml`.
+
+5. Post a tweet from the https://twitter.com/apachemesos account, please contact
+   the PMC if you need the account password (or want someone to post the tweet on
+   your behalf).
 
 
 ## Removing Old Releases from svn
@@ -298,3 +308,43 @@ Update the Mesos Homebrew package.
 2. Submit a PR to the [Homebrew repo](https://github.com/Homebrew/homebrew-core).
 
 3. Once accepted, verify that `brew install mesos` works.
+
+Upload the binary RPM packages to Bintray:
+
+1. If you haven't done so, sign up for bintray and request membership in the apache organization.
+   Get your API key by clicking on `Edit profile` and then `API Key` on Bintray
+
+2. Go to the [Bintray package](https://bintray.com/apache/mesos/mesos) and click the `Add a version` button.
+   Enter the version number as `Name`, set the appropriate release date and click `Create`.
+
+3. Go to [Apache Jenkins](https://builds.apache.org/job/Mesos/job/Packaging/job/CentosRPMs) and start a
+   manual run of the `CentosRPMs` job to generate official binary packages for this version.
+
+4. Upload the files generated in step 3 to Bintray. Note that you cannot use the web interface
+   for this step, since it has a file size limit of 250MiB as of the time of this writing.
+
+   To upload, use a command like this, replacing file name and version number where necessary:
+
+    curl                                            \
+      -u<username>:<api-key>                        \
+      -H Content-Type:application/json              \
+      -H Accept:application/json                    \
+      -T ./mesos-debuginfo-1.8.1-1.el7.x86_64.rpm   \
+      -H X-Bintray-Package:mesos                    \
+      -H X-Bintray-Version:1.8.1                    \
+      -H X-Bintray-Publish:0                        \
+      https://api.bintray.com/content/apache/mesos/el7/x86_64/mesos-debuginfo-1.8.1-1.el7.x86_64.rpm
+
+  (NOTE: The correct upload URL for the package is `apache/mesos/` whereas the web UI is at `apache/mesos/mesos/`.)
+
+5. Go back to the bintray web interface, verify that you uploaded the correct files to the correct location
+   and finally click on `Publish all`.
+
+Update Wikipedia:
+
+1. Update the [Wikipedia article](https://en.wikipedia.org/wiki/Apache_Mesos) to mention the
+   latest stable release in the info box.
+
+Update Reddit: (optional)
+
+1. Add a post for the Release to the [Mesos Reddit](https://www.reddit.com/r/mesos/).

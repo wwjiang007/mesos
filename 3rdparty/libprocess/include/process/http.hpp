@@ -27,6 +27,7 @@
 #include <boost/functional/hash.hpp>
 
 #include <process/address.hpp>
+#include <process/clock.hpp>
 #include <process/future.hpp>
 #include <process/owned.hpp>
 #include <process/pid.hpp>
@@ -116,9 +117,8 @@ void unsetCallbacks();
 
 } // namespace authorization {
 
-// Status code reason strings, from the HTTP1.1 RFC:
-// http://www.w3.org/Protocols/rfc2616/rfc2616-sec6.html
-extern hashmap<uint16_t, std::string>* statuses;
+// Checks if the given status code is defined by RFC 2616.
+bool isValidStatus(uint16_t code);
 
 // Represents a Uniform Resource Locator:
 //   scheme://domain|ip:port/path?query#fragment
@@ -332,7 +332,8 @@ public:
       CLOSED,
     };
 
-    explicit Reader(const std::shared_ptr<Data>& _data) : data(_data) {}
+    explicit Reader(const std::shared_ptr<Data>& _data)
+      : data(_data) {}
 
     std::shared_ptr<Data> data;
   };
@@ -373,12 +374,14 @@ public:
       FAILED,
     };
 
-    explicit Writer(const std::shared_ptr<Data>& _data) : data(_data) {}
+    explicit Writer(const std::shared_ptr<Data>& _data)
+      : data(_data) {}
 
     std::shared_ptr<Data> data;
   };
 
-  Pipe() : data(new Data()) {}
+  Pipe()
+    : data(new Data()) {}
 
   Reader reader() const;
   Writer writer() const;
@@ -390,8 +393,7 @@ private:
   struct Data
   {
     Data()
-      : readEnd(Reader::OPEN),
-        writeEnd(Writer::OPEN) {}
+      : readEnd(Reader::OPEN), writeEnd(Writer::OPEN) {}
 
     // Rather than use a process to serialize access to the pipe's
     // internal data we use a 'std::atomic_flag'.
@@ -432,7 +434,7 @@ public:
     : authScheme_(authScheme),
       authParam_(authParam) {}
 
-  static Try<WWWAuthenticate> create(const std::string& value);
+  static Try<WWWAuthenticate> create(const std::string& input);
 
   std::string authScheme();
   hashmap<std::string, std::string> authParam();
@@ -518,7 +520,7 @@ public:
 struct Request
 {
   Request()
-    : keepAlive(false), type(BODY) {}
+    : keepAlive(false), type(BODY), received(Clock::now()) {}
 
   std::string method;
 
@@ -563,6 +565,8 @@ struct Request
   std::string body;
   Option<Pipe::Reader> reader;
 
+  Time received;
+
   /**
    * Returns whether the encoding is considered acceptable in the
    * response. See RFC 2616 section 14.3 for details.
@@ -595,8 +599,7 @@ private:
 struct Response
 {
   Response()
-    : type(NONE)
-  {}
+    : type(NONE) {}
 
   Response(uint16_t _code)
     : type(NONE), code(_code)
@@ -605,11 +608,11 @@ struct Response
   }
 
   explicit Response(
-      const std::string& _body,
+      std::string _body,
       uint16_t _code,
       const std::string& contentType = "text/plain; charset=utf-8")
     : type(BODY),
-      body(_body),
+      body(std::move(_body)),
       code(_code)
   {
     headers["Content-Length"] = stringify(body.size());
@@ -661,15 +664,17 @@ struct Response
 
 struct OK : Response
 {
-  OK() : Response(Status::OK) {}
+  OK()
+    : Response(Status::OK) {}
 
   explicit OK(const char* body)
     : Response(std::string(body), Status::OK) {}
 
-  explicit OK(const std::string& body) : Response(body, Status::OK) {}
+  explicit OK(std::string body)
+    : Response(std::move(body), Status::OK) {}
 
-  explicit OK(const std::string& body, const std::string& contentType)
-    : Response(body, Status::OK, contentType) {}
+  explicit OK(std::string body, const std::string& contentType)
+    : Response(std::move(body), Status::OK, contentType) {}
 
   OK(const JSON::Value& value, const Option<std::string>& jsonp = None());
 
@@ -679,10 +684,11 @@ struct OK : Response
 
 struct Accepted : Response
 {
-  Accepted() : Response(Status::ACCEPTED) {}
+  Accepted()
+    : Response(Status::ACCEPTED) {}
 
-  explicit Accepted(const std::string& body)
-    : Response(body, Status::ACCEPTED) {}
+  explicit Accepted(std::string body)
+    : Response(std::move(body), Status::ACCEPTED) {}
 };
 
 
@@ -698,29 +704,23 @@ struct TemporaryRedirect : Response
 
 struct BadRequest : Response
 {
-  BadRequest() : Response(Status::BAD_REQUEST) {}
+  BadRequest()
+    : BadRequest("400 Bad Request.") {}
 
-  explicit BadRequest(const std::string& body)
-    : Response(body, Status::BAD_REQUEST) {}
+  explicit BadRequest(std::string body)
+    : Response(std::move(body), Status::BAD_REQUEST) {}
 };
 
 
 struct Unauthorized : Response
 {
   explicit Unauthorized(const std::vector<std::string>& challenges)
-    : Response(Status::UNAUTHORIZED)
-  {
-    // TODO(arojas): Many HTTP client implementations do not support
-    // multiple challenges within a single 'WWW-Authenticate' header.
-    // Once MESOS-3306 is fixed, we can use multiple entries for the
-    // same header.
-    headers["WWW-Authenticate"] = strings::join(", ", challenges);
-  }
+    : Unauthorized(challenges, "401 Unauthorized.") {}
 
   Unauthorized(
       const std::vector<std::string>& challenges,
-      const std::string& body)
-    : Response(body, Status::UNAUTHORIZED)
+      std::string body)
+    : Response(std::move(body), Status::UNAUTHORIZED)
   {
     // TODO(arojas): Many HTTP client implementations do not support
     // multiple challenges within a single 'WWW-Authenticate' header.
@@ -733,19 +733,21 @@ struct Unauthorized : Response
 
 struct Forbidden : Response
 {
-  Forbidden() : Response(Status::FORBIDDEN) {}
+  Forbidden()
+    : Forbidden("403 Forbidden.") {}
 
-  explicit Forbidden(const std::string& body)
-    : Response(body, Status::FORBIDDEN) {}
+  explicit Forbidden(std::string body)
+    : Response(std::move(body), Status::FORBIDDEN) {}
 };
 
 
 struct NotFound : Response
 {
-  NotFound() : Response(Status::NOT_FOUND) {}
+  NotFound()
+    : NotFound("404 Not Found.") {}
 
-  explicit NotFound(const std::string& body)
-    : Response(body, Status::NOT_FOUND) {}
+  explicit NotFound(std::string body)
+    : Response(std::move(body), Status::NOT_FOUND) {}
 };
 
 
@@ -754,16 +756,9 @@ struct MethodNotAllowed : Response
   // According to RFC 2616, "An Allow header field MUST be present in a
   // 405 (Method Not Allowed) response".
 
-  explicit MethodNotAllowed(
-      const std::initializer_list<std::string>& allowedMethods)
-    : Response(Status::METHOD_NOT_ALLOWED)
-  {
-    headers["Allow"] = strings::join(", ", allowedMethods);
-  }
-
   MethodNotAllowed(
       const std::initializer_list<std::string>& allowedMethods,
-      const std::string& requestMethod)
+      const Option<std::string>& requestMethod = None())
     : Response(
         constructBody(allowedMethods, requestMethod),
         Status::METHOD_NOT_ALLOWED)
@@ -774,74 +769,86 @@ struct MethodNotAllowed : Response
 private:
   static std::string constructBody(
       const std::initializer_list<std::string>& allowedMethods,
-      const std::string& requestMethod)
+      const Option<std::string>& requestMethod)
   {
-    return "Expecting one of { '" + strings::join("', '", allowedMethods) +
-           "' }, but received '" + requestMethod + "'";
+    return
+        "405 Method Not Allowed. Expecting one of { '" +
+        strings::join("', '", allowedMethods) + "' }" +
+        (requestMethod.isSome()
+           ? ", but received '" + requestMethod.get() + "'"
+           : "") +
+        ".";
   }
 };
 
 
 struct NotAcceptable : Response
 {
-  NotAcceptable() : Response(Status::NOT_ACCEPTABLE) {}
+  NotAcceptable()
+    : NotAcceptable("406 Not Acceptable.") {}
 
-  explicit NotAcceptable(const std::string& body)
-    : Response(body, Status::NOT_ACCEPTABLE) {}
+  explicit NotAcceptable(std::string body)
+    : Response(std::move(body), Status::NOT_ACCEPTABLE) {}
 };
 
 
 struct Conflict : Response
 {
-  Conflict() : Response(Status::CONFLICT) {}
+  Conflict()
+    : Conflict("409 Conflict.") {}
 
-  explicit Conflict(const std::string& body)
-    : Response(body, Status::CONFLICT) {}
+  explicit Conflict(std::string body)
+    : Response(std::move(body), Status::CONFLICT) {}
 };
 
 
 struct PreconditionFailed : Response
 {
-  PreconditionFailed() : Response(Status::PRECONDITION_FAILED) {}
+  PreconditionFailed()
+    : PreconditionFailed("412 Precondition Failed.") {}
 
-  explicit PreconditionFailed(const std::string& body)
-    : Response(body, Status::PRECONDITION_FAILED) {}
+  explicit PreconditionFailed(std::string body)
+    : Response(std::move(body), Status::PRECONDITION_FAILED) {}
 };
 
 
 struct UnsupportedMediaType : Response
 {
-  UnsupportedMediaType() : Response(Status::UNSUPPORTED_MEDIA_TYPE) {}
+  UnsupportedMediaType()
+    : UnsupportedMediaType("415 Unsupported Media Type.") {}
 
-  explicit UnsupportedMediaType(const std::string& body)
-    : Response(body, Status::UNSUPPORTED_MEDIA_TYPE) {}
+  explicit UnsupportedMediaType(std::string body)
+    : Response(std::move(body), Status::UNSUPPORTED_MEDIA_TYPE) {}
 };
 
 
 struct InternalServerError : Response
 {
-  InternalServerError() : Response(Status::INTERNAL_SERVER_ERROR) {}
+  InternalServerError()
+    : InternalServerError("500 Internal Server Error.") {}
 
-  explicit InternalServerError(const std::string& body)
-    : Response(body, Status::INTERNAL_SERVER_ERROR) {}
+  explicit InternalServerError(std::string body)
+    : Response(std::move(body), Status::INTERNAL_SERVER_ERROR) {}
 };
 
 
 struct NotImplemented : Response
 {
-  NotImplemented() : Response(Status::NOT_IMPLEMENTED) {}
+  NotImplemented()
+    : NotImplemented("501 Not Implemented.") {}
 
-  explicit NotImplemented(const std::string& body)
-    : Response(body, Status::NOT_IMPLEMENTED) {}
+  explicit NotImplemented(std::string body)
+    : Response(std::move(body), Status::NOT_IMPLEMENTED) {}
 };
 
 
 struct ServiceUnavailable : Response
 {
-  ServiceUnavailable() : Response(Status::SERVICE_UNAVAILABLE) {}
+  ServiceUnavailable()
+    : ServiceUnavailable("503 Service Unavailable.") {}
 
-  explicit ServiceUnavailable(const std::string& body)
-    : Response(body, Status::SERVICE_UNAVAILABLE) {}
+  explicit ServiceUnavailable(std::string body)
+    : Response(std::move(body), Status::SERVICE_UNAVAILABLE) {}
 };
 
 
@@ -979,7 +986,9 @@ private:
       const network::Address& _peerAddress);
 
   friend Future<Connection> connect(
-      const network::Address& address, Scheme scheme);
+      const network::Address& address,
+      Scheme scheme,
+      const Option<std::string>& peer_hostname);
   friend Future<Connection> connect(const URL&);
 
   // Forward declaration.
@@ -987,6 +996,12 @@ private:
 
   std::shared_ptr<Data> data;
 };
+
+
+Future<Connection> connect(
+    const network::Address& address,
+    Scheme scheme,
+    const Option<std::string>& peer_hostname);
 
 
 Future<Connection> connect(const network::Address& address, Scheme scheme);

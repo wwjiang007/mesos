@@ -45,7 +45,10 @@ extern "C" {
 #include <stout/os.hpp>
 #include <stout/try.hpp>
 
+#include "common/protobuf_utils.hpp"
+
 #include "linux/cgroups.hpp"
+#include "linux/fs.hpp"
 
 #include "slave/flags.hpp"
 
@@ -58,6 +61,8 @@ extern "C" {
 #include "slave/containerizer/mesos/isolators/gpu/allocator.hpp"
 #include "slave/containerizer/mesos/isolators/gpu/isolator.hpp"
 #include "slave/containerizer/mesos/isolators/gpu/nvml.hpp"
+
+#include "slave/containerizer/mesos/paths.hpp"
 
 using cgroups::devices::Entry;
 
@@ -104,38 +109,48 @@ Try<Isolator*> NvidiaGpuIsolatorProcess::create(
     const Flags& flags,
     const NvidiaComponents& components)
 {
-  // Make sure both the 'cgroups/devices' isolator and the
-  // 'filesystem/linux' isolators are present and precede the GPU
-  // isolator.
+  // Make sure both the 'cgroups/devices' (or 'cgroups/all')
+  // and the 'filesystem/linux' isolators are present.
   vector<string> tokens = strings::tokenize(flags.isolation, ",");
 
   auto gpuIsolator =
     std::find(tokens.begin(), tokens.end(), "gpu/nvidia");
+
   auto devicesIsolator =
     std::find(tokens.begin(), tokens.end(), "cgroups/devices");
+
+  auto cgroupsAllIsolator =
+    std::find(tokens.begin(), tokens.end(), "cgroups/all");
+
   auto filesystemIsolator =
     std::find(tokens.begin(), tokens.end(), "filesystem/linux");
 
   CHECK(gpuIsolator != tokens.end());
 
-  if (devicesIsolator == tokens.end()) {
-    return Error("The 'cgroups/devices' isolator must be enabled in"
-                 " order to use the 'gpu/nvidia' isolator");
+  if (cgroupsAllIsolator != tokens.end()) {
+    // The reason that we need to check if `devices` cgroups subsystem is
+    // enabled is, when `cgroups/all` is specified in the `--isolation` agent
+    // flag, cgroups isolator will only load the enabled subsystems. So if
+    // `cgroups/all` is specified but `devices` is not enabled, cgroups isolator
+    // will not load `devices` subsystem in which case we should error out.
+    Try<bool> result = cgroups::enabled("devices");
+    if (result.isError()) {
+      return Error(
+          "Failed to check if the `devices` cgroups subsystem"
+          " is enabled by kernel: " + result.error());
+    } else if (!result.get()) {
+      return Error(
+          "The `devices` cgroups subsystem is not enabled by the kernel");
+    }
+  } else if (devicesIsolator == tokens.end()) {
+    return Error(
+        "The 'cgroups/devices' or 'cgroups/all' isolator must be"
+        " enabled in order to use the 'gpu/nvidia' isolator");
   }
 
   if (filesystemIsolator == tokens.end()) {
     return Error("The 'filesystem/linux' isolator must be enabled in"
                  " order to use the 'gpu/nvidia' isolator");
-  }
-
-  if (devicesIsolator > gpuIsolator) {
-    return Error("'cgroups/devices' must precede 'gpu/nvidia'"
-                 " in the --isolation flag");
-  }
-
-  if (filesystemIsolator > gpuIsolator) {
-    return Error("'filesystem/linux' must precede 'gpu/nvidia'"
-                 " in the --isolation flag");
   }
 
   // Retrieve the cgroups devices hierarchy.
@@ -237,10 +252,10 @@ bool NvidiaGpuIsolatorProcess::supportsStandalone()
 
 
 Future<Nothing> NvidiaGpuIsolatorProcess::recover(
-    const list<ContainerState>& states,
+    const vector<ContainerState>& states,
     const hashset<ContainerID>& orphans)
 {
-  list<Future<Nothing>> futures;
+  vector<Future<Nothing>> futures;
 
   foreach (const ContainerState& state, states) {
     const ContainerID& containerId = state.container_id();
@@ -253,22 +268,7 @@ Future<Nothing> NvidiaGpuIsolatorProcess::recover(
 
     const string cgroup = path::join(flags.cgroups_root, containerId.value());
 
-    Try<bool> exists = cgroups::exists(hierarchy, cgroup);
-    if (exists.isError()) {
-      foreachvalue (Info* info, infos) {
-        delete info;
-      }
-
-      infos.clear();
-
-      return Failure(
-          "Failed to check the existence of the cgroup "
-          "'" + cgroup + "' in hierarchy '" + hierarchy + "' "
-          "for container " + stringify(containerId) +
-          ": " + exists.error());
-    }
-
-    if (!exists.get()) {
+    if (!cgroups::exists(hierarchy, cgroup)) {
       // This may occur if the executor has exited and the isolator
       // has destroyed the cgroup but the slave dies before noticing
       // this. This will be detected when the containerizer tries to
@@ -333,7 +333,7 @@ Future<Option<ContainerLaunchInfo>> NvidiaGpuIsolatorProcess::prepare(
     // mount the necessary Nvidia libraries into the container (since
     // we live in a different mount namespace than our parent). We
     // directly call `_prepare()` to do this for us.
-    return _prepare(containerConfig);
+    return _prepare(containerId, containerConfig);
   }
 
   if (infos.contains(containerId)) {
@@ -363,6 +363,7 @@ Future<Option<ContainerLaunchInfo>> NvidiaGpuIsolatorProcess::prepare(
   return update(containerId, containerConfig.resources())
     .then(defer(PID<NvidiaGpuIsolatorProcess>(this),
                 &NvidiaGpuIsolatorProcess::_prepare,
+                containerId,
                 containerConfig));
 }
 
@@ -371,6 +372,7 @@ Future<Option<ContainerLaunchInfo>> NvidiaGpuIsolatorProcess::prepare(
 // host file system, then we need to prepare a script to inject our
 // `NvidiaVolume` into the container (if required).
 Future<Option<ContainerLaunchInfo>> NvidiaGpuIsolatorProcess::_prepare(
+    const ContainerID& containerId,
     const mesos::slave::ContainerConfig& containerConfig)
 {
   if (!containerConfig.has_rootfs()) {
@@ -387,10 +389,6 @@ Future<Option<ContainerLaunchInfo>> NvidiaGpuIsolatorProcess::_prepare(
   ContainerLaunchInfo launchInfo;
 
   // Inject the Nvidia volume into the container.
-  //
-  // TODO(klueska): Inject the Nvidia devices here as well once we
-  // have a way to pass them to `fs:enter()` instead of hardcoding
-  // them in `fs::createStandardDevices()`.
   if (!containerConfig.docker().has_manifest()) {
      return Failure("The 'ContainerConfig' for docker is missing a manifest");
   }
@@ -409,15 +407,66 @@ Future<Option<ContainerLaunchInfo>> NvidiaGpuIsolatorProcess::_prepare(
           " '" + target + "': " + mkdir.error());
     }
 
-    ContainerMountInfo* mount = launchInfo.add_mounts();
-    mount->set_source(volume.HOST_PATH());
-    mount->set_target(target);
-    mount->set_flags(MS_RDONLY | MS_BIND | MS_REC);
+    *launchInfo.add_mounts() = protobuf::slave::createContainerMount(
+        volume.HOST_PATH(), target, MS_RDONLY | MS_BIND | MS_REC);
 
-    // NOTE: MS_REMOUNT is needed to make a bind mount read only.
-    mount = launchInfo.add_mounts();
-    mount->set_target(target);
-    mount->set_flags(MS_RDONLY | MS_REMOUNT | MS_BIND | MS_REC);
+    // TODO(chhsiao): As a workaround, we append `NvidiaVolume` paths into the
+    // `PATH` and `LD_LIBRARY_PATH` environment variables so the binaries and
+    // libraries can be found. However these variables might be overridden by
+    // users, and `LD_LIBRARY_PATH` might get cleared across exec calls. Instead
+    // of injecting `NvidiaVolume`, we could leverage libnvidia-container in the
+    // future. See MESOS-9595.
+    if (containerConfig.has_task_info()) {
+      // Command executor.
+      *launchInfo.mutable_task_environment() = volume.ENV(manifest);
+    } else {
+      // Default executor, custom executor, or nested container.
+      *launchInfo.mutable_environment() = volume.ENV(manifest);
+    }
+  }
+
+  const string devicesDir = containerizer::paths::getContainerDevicesPath(
+      flags.runtime_dir, containerId);
+
+  // The `filesystem/linux` isolator is responsible for creating the
+  // devices directory and ordered to run before we do. Here, we can
+  // just assert that the devices directory is still present.
+  if (!os::exists(devicesDir)) {
+    return Failure("Missing container devices directory '" + devicesDir + "'");
+  }
+
+  // Glob all Nvidia GPU devices on the system and add them to the
+  // list of devices injected into the chroot environment.
+  Try<list<string>> nvidia = os::glob("/dev/nvidia*");
+  if (nvidia.isError()) {
+    return Failure("Failed to glob /dev/nvidia*: " + nvidia.error());
+  }
+
+  foreach (const string& device, nvidia.get()) {
+    const string devicePath = path::join(
+        devicesDir, strings::remove(device, "/dev/", strings::PREFIX), device);
+
+    Try<Nothing> mknod =
+      fs::chroot::copyDeviceNode(device, devicePath);
+    if (mknod.isError()) {
+      return Failure(
+          "Failed to copy device '" + device + "': " + mknod.error());
+    }
+
+    // Since we are adding the GPU devices to the container, make
+    // them read/write to guarantee that they are accessible inside
+    // the container.
+    Try<Nothing> chmod = os::chmod(devicePath, 0666);
+    if (chmod.isError()) {
+      return Failure(
+          "Failed to set permissions on device '" + device + "': " +
+          chmod.error());
+    }
+
+    *launchInfo.add_mounts() = protobuf::slave::createContainerMount(
+        devicePath,
+        path::join(containerConfig.rootfs(), device),
+        MS_BIND);
   }
 
   return launchInfo;

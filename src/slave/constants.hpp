@@ -48,6 +48,9 @@ constexpr Duration MAX_EXECUTOR_REREGISTRATION_TIMEOUT = Seconds(15);
 // shut down before destroying the container.
 constexpr Duration DEFAULT_EXECUTOR_SHUTDOWN_GRACE_PERIOD = Seconds(5);
 
+// The default amount of time between heartbeats sent to HTTP executors.
+constexpr Duration DEFAULT_EXECUTOR_HEARTBEAT_INTERVAL = Minutes(30);
+
 constexpr Duration RECOVERY_TIMEOUT = Minutes(15);
 
 // TODO(gkleiman): Move this to a different file once `TaskStatusUpdateManager`
@@ -65,12 +68,17 @@ constexpr Duration DEFAULT_REGISTRATION_BACKOFF_FACTOR = Seconds(1);
 // recovery and when it times out slave re-registration.
 constexpr Duration REGISTER_RETRY_INTERVAL_MAX = Minutes(1);
 
-// The maximum interval the slave waits before retrying authentication.
-constexpr Duration AUTHENTICATION_RETRY_INTERVAL_MAX = Minutes(1);
-
-// Default backoff interval used by the slave to wait after failed
-// authentication.
+// Default value for `--authentication_backoff_factor`. The backoff interval
+// factor affects the agent timeout interval after failed authentications.
 constexpr Duration DEFAULT_AUTHENTICATION_BACKOFF_FACTOR = Seconds(1);
+
+// Default value for `--authentication_timeout_min`. The minimum timeout
+// interval the agent waits before retrying authentication.
+constexpr Duration DEFAULT_AUTHENTICATION_TIMEOUT_MIN = Seconds(5);
+
+// Default value for `--authentication_timeout_max`. The maximum timeout
+// interval the agent waits before retrying authentication.
+constexpr Duration DEFAULT_AUTHENTICATION_TIMEOUT_MAX = Minutes(1);
 
 constexpr Duration GC_DELAY = Weeks(1);
 constexpr Duration DISK_WATCH_INTERVAL = Minutes(1);
@@ -84,6 +92,10 @@ constexpr size_t MAX_COMPLETED_FRAMEWORKS = 50;
 // Default maximum number of completed executors per framework
 // to store in memory.
 constexpr size_t DEFAULT_MAX_COMPLETED_EXECUTORS_PER_FRAMEWORK = 150;
+
+// Maximum number of a container id length, according to the
+// max entry length for directory names on AUFS.
+constexpr size_t MAX_CONTAINER_ID_LENGTH = 242;
 
 // Maximum number of completed tasks per executor to store in memory.
 //
@@ -167,6 +179,10 @@ constexpr char READWRITE_HTTP_AUTHENTICATION_REALM[] = "mesos-agent-readwrite";
 // Name of the agent HTTP authentication realm for HTTP executors.
 constexpr char EXECUTOR_HTTP_AUTHENTICATION_REALM[] = "mesos-agent-executor";
 
+// Name of the agent HTTP authentication realm for HTTP resource providers.
+constexpr char RESOURCE_PROVIDER_HTTP_AUTHENTICATION_REALM[] =
+  "mesos-agent-resource-provider";
+
 // Default maximum storage space to be used by the fetcher cache.
 constexpr Bytes DEFAULT_FETCHER_CACHE_SIZE = Gigabytes(2);
 
@@ -180,9 +196,15 @@ Duration DEFAULT_MASTER_PING_TIMEOUT();
 // Name of the executable for default executor.
 #ifdef __WINDOWS__
 constexpr char MESOS_DEFAULT_EXECUTOR[] = "mesos-default-executor.exe";
+constexpr char MESOS_EXECUTOR[] = "mesos-executor.exe";
 #else
 constexpr char MESOS_DEFAULT_EXECUTOR[] = "mesos-default-executor";
+constexpr char MESOS_EXECUTOR[] = "mesos-executor";
 #endif // __WINDOWS__
+
+// Name of the component used for describing pending futures.
+constexpr char COMPONENT_NAME_CONTAINERIZER[] = "containerizer";
+
 
 // Virtual path on which agent logs are mounted in `/files/` endpoint.
 constexpr char AGENT_LOG_VIRTUAL_PATH[] = "/slave/log";

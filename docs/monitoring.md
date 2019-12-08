@@ -410,7 +410,7 @@ unhealthy or that they are not able to connect to the elected master.
 </tr>
 <tr>
   <td>
-  <code>master/slaves_inactive</code>
+  <code>master/slaves_unreachable</code>
   </td>
   <td>Number of unreachable agents. Unreachable agents are periodically
       garbage collected from the registry, which will cause this value to
@@ -462,6 +462,115 @@ registered or that it is misbehaving.
   <code>master/outstanding_offers</code>
   </td>
   <td>Number of outstanding resource offers</td>
+  <td>Gauge</td>
+</tr>
+</table>
+
+The following metrics are added for each framework which registers with the
+master, in order to provide detailed information about the behavior of the
+framework. The framework name is percent-encoded before creating these metrics;
+the actual name can be recovered by percent-decoding.
+
+<table class="table table-striped">
+<thead>
+<tr><th>Metric</th><th>Description</th><th>Type</th>
+</thead>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/subscribed</code>
+  </td>
+  <td>Whether or not this framework is currently subscribed</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/calls</code>
+  </td>
+  <td>Total number of calls sent by this framework</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/calls/&lt;CALL_TYPE&gt;</code>
+  </td>
+  <td>Number of each type of call sent by this framework</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/events</code>
+  </td>
+  <td>Total number of events sent to this framework</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/events/&lt;EVENT_TYPE&gt;</code>
+  </td>
+  <td>Number of each type of event sent to this framework</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/operations</code>
+  </td>
+  <td>Total number of offer operations performed by this framework</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/operations/&lt;OPERATION_TYPE&gt;</code>
+  </td>
+  <td>Number of each type of offer operation performed by this framework</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/tasks/active/&lt;TASK_STATE&gt;</code>
+  </td>
+  <td>Number of this framework's tasks currently in each active task state</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/tasks/terminal/&lt;TASK_STATE&gt;</code>
+  </td>
+  <td>Number of this framework's tasks which have transitioned into each terminal task state</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/offers/sent</code>
+  </td>
+  <td>Number of offers sent to this framework</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/offers/accepted</code>
+  </td>
+  <td>Number of offers accepted by this framework</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/offers/declined</code>
+  </td>
+  <td>Number of offers explicitly declined by this framework</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/offers/rescinded</code>
+  </td>
+  <td>Number of offers sent to this framework which were subsequently rescinded</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>master/frameworks/&lt;ENCODED_FRAMEWORK_NAME&gt;/&lt;FRAMEWORK_ID&gt;/roles/&lt;ROLE_NAME&gt;/suppressed</code>
+  </td>
+  <td>For each of the framework's subscribed roles, whether or not offers for that role are currently suppressed</td>
   <td>Gauge</td>
 </tr>
 </table>
@@ -545,6 +654,67 @@ The task states listed here match those of the task state machine.
   </td>
   <td>Number of unreachable tasks</td>
   <td>Gauge</td>
+</tr>
+</table>
+
+#### Operations
+
+The following metrics provide information about offer operations on the master.
+
+Below, `OPERATION_TYPE` refers to any one of `reserve`, `unreserve`, `create`,
+`destroy`, `grow_volume`, `shrink_volume`, `create_disk` or `destroy_disk`.
+
+NOTE: The counter for terminal operation states can over-count over time. In
+particular if an agent contained unacknowledged terminal status updates when
+it was marked gone or marked unreachable, these operations will be double-counted
+as both their original state and `OPERATION_GONE`/`OPERATION_UNREACHABLE`.
+
+<table class="table table-striped">
+<thead>
+<tr><th>Metric</th><th>Description</th><th>Type</th>
+</thead>
+<tr>
+  <td>
+  <code>master/operations/total</code>
+  </td>
+  <td>Total number of operations known to this master</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/operations/&lt;OPERATION_STATE&gt;</code>
+  </td>
+  <td>Number of operations in the given non-terminal state (`pending`, `recovering` or `unreachable`)</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/operations/&lt;OPERATION_STATE&gt;</code>
+  </td>
+  <td>Number of operations in the given terminal state (`finished`, `error`, `dropped` or `gone_by_operator`)</td>
+  <td>Counter</td>
+</tr>
+
+<tr>
+  <td>
+  <code>master/operations/&lt;OPERATION_TYPE&gt;/total</code>
+  </td>
+  <td>Total number of operations with the given type known to this master</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/operations/&lt;OPERATION_TYPE&gt;/&lt;OPERATION_STATE&gt;</code>
+  </td>
+  <td>Number of operations with the given type in the given non-terminal state (`pending`, `recovering` or `unreachable`)</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/operations/&lt;OPERATION_TYPE&gt;/&lt;OPERATION_STATE&gt;</code>
+  </td>
+  <td>Number of operations with the given type in the given state (`finished`, `error`, `dropped` or `gone_by_operator`)</td>
+  <td>Counter</td>
 </tr>
 </table>
 
@@ -661,6 +831,13 @@ messages may indicate that there is a problem with the network.
   <code>master/messages_operation_status_update_acknowledgement</code>
   </td>
   <td>Number of operation status update acknowledgement messages</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>master/messages_reconcile_operations</code>
+  </td>
+  <td>Number of reconcile operations messages</td>
   <td>Counter</td>
 </tr>
 <tr>
@@ -861,6 +1038,13 @@ event queue.
   <code>master/event_queue_messages</code>
   </td>
   <td>Number of messages in the event queue</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/operator_event_stream_subscribers</code>
+  </td>
+  <td>Number of subscribers to the operator event stream</td>
   <td>Gauge</td>
 </tr>
 </table>
@@ -1139,9 +1323,9 @@ and resource allocations in the allocator.
 </tr>
 <tr>
   <td>
-  <code>allocator/mesos/roles/&lt;role&gt;/shares/dominant</code>
+  <code>allocator/mesos/roles/<i>&lt;role&gt;</i>/shares/dominant</code>
   </td>
-  <td>Dominant resource share for the role, exposed as a percentage (0.0-1.0)</td>
+  <td>Dominant <i>resource</i> share for the <i>role</i>, exposed as a percentage (0.0-1.0)</td>
   <td>Gauge</td>
 </tr>
 <tr>
@@ -1153,24 +1337,24 @@ and resource allocations in the allocator.
 </tr>
 <tr>
   <td>
-  <code>allocator/mesos/offer_filters/roles/&lt;role&gt;/active</code>
+  <code>allocator/mesos/offer_filters/roles/<i>&lt;role&gt;</i>/active</code>
   </td>
-  <td>Number of active offer filters for all frameworks within the role</td>
+  <td>Number of active offer filters for all frameworks within the <i>role</i></td>
   <td>Gauge</td>
 </tr>
 <tr>
   <td>
-  <code>allocator/mesos/quota/roles/&lt;role&gt;/resources/&lt;resource&gt;/offered_or_allocated</code>
+  <code>allocator/mesos/quota/roles/<i>&lt;role&gt;</i>/resources/<i>&lt;resource&gt;</i>/offered_or_allocated</code>
   </td>
-  <td>Amount of resources considered offered or allocated towards
-      a role's quota guarantee</td>
+  <td>Amount of <i>resource</i>s considered offered or allocated towards
+      a <i>role</i>'s quota guarantee</td>
   <td>Gauge</td>
 </tr>
 <tr>
   <td>
-  <code>allocator/mesos/quota/roles/&lt;role&gt;/resources/&lt;resource&gt;/guarantee</code>
+  <code>allocator/mesos/quota/roles/<i>&lt;role&gt;</i>/resources/<i>&lt;resource&gt;</i>/guarantee</code>
   </td>
-  <td>Amount of resources guaranteed for a role via quota</td>
+  <td>Amount of <i>resource</i>s guaranteed for a <i>role</i> via quota</td>
   <td>Gauge</td>
 </tr>
 <tr>
@@ -1478,6 +1662,20 @@ the agent and their current usage.
   <td>Allocated revocable memory in MB</td>
   <td>Gauge</td>
 </tr>
+<tr>
+  <td>
+  <code>volume_gid_manager/volume_gids_total</code>
+  </td>
+  <td>Number of gids configured for volume gid manager</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>volume_gid_manager/volume_gids_free</code>
+  </td>
+  <td>Number of free gids available for volume gid manager</td>
+  <td>Gauge</td>
+</tr>
 </table>
 
 #### Agent
@@ -1754,6 +1952,313 @@ the master it is registered with.
   <code>slave/valid_status_updates</code>
   </td>
   <td>Number of valid status updates</td>
+  <td>Counter</td>
+</tr>
+</table>
+
+#### Containerizers
+
+The following metrics provide information about both Mesos and Docker
+containerizers.
+
+<table class="table table-striped">
+<thead>
+<tr><th>Metric</th><th>Description</th><th>Type</th>
+</thead>
+<tr>
+  <td>
+  <code>containerizer/docker/image_pull_ms</code>
+  </td>
+  <td>Docker containerizer image pull latency in ms </td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/docker/image_pull_ms/count</code>
+  </td>
+  <td>Number of Docker containerizer image pulls</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/docker/image_pull_ms/max</code>
+  </td>
+  <td>Maximum Docker containerizer image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/docker/image_pull_ms/min</code>
+  </td>
+  <td>Minimum Docker containerizer image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/docker/image_pull_ms/p50</code>
+  </td>
+  <td>Median Docker containerizer image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/docker/image_pull_ms/p90</code>
+  </td>
+  <td>90th percentile Docker containerizer image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/docker/image_pull_ms/p95</code>
+  </td>
+  <td>95th percentile Docker containerizer image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/docker/image_pull_ms/p99</code>
+  </td>
+  <td>99th percentile Docker containerizer image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/docker/image_pull_ms/p999</code>
+  </td>
+  <td>99.9th percentile Docker containerizer image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/docker/image_pull_ms/p9999</code>
+  </td>
+  <td>99.99th percentile Docker containerizer image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/mesos/disk/project_ids_free</code>
+  </td>
+  <td>Number of free project IDs available to the XFS Disk isolator</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/mesos/disk/project_ids_total</code>
+  </td>
+  <td>Number of project IDs configured for the XFS Disk isolator</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/mesos/provisioner/docker_store/image_pull_ms</code>
+  </td>
+  <td>Mesos containerizer docker image pull latency in ms </td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/mesos/provisioner/docker_store/image_pull_ms/count</code>
+  </td>
+  <td>Number of Mesos containerizer docker image pulls</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/mesos/provisioner/docker_store/image_pull_ms/max</code>
+  </td>
+  <td>Maximum Mesos containerizer docker image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/mesos/provisioner/docker_store/image_pull_ms/min</code>
+  </td>
+  <td>Minimum Mesos containerizer docker image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/mesos/provisioner/docker_store/image_pull_ms/p50</code>
+  </td>
+  <td>Median Mesos containerizer docker image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/mesos/provisioner/docker_store/image_pull_ms/p90</code>
+  </td>
+  <td>90th percentile Mesos containerizer docker image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/mesos/provisioner/docker_store/image_pull_ms/p95</code>
+  </td>
+  <td>95th percentile Mesos containerizer docker image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/mesos/provisioner/docker_store/image_pull_ms/p99</code>
+  </td>
+  <td>99th percentile Mesos containerizer docker image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/mesos/provisioner/docker_store/image_pull_ms/p999</code>
+  </td>
+  <td>99.9th percentile Mesos containerizer docker image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>containerizer/mesos/provisioner/docker_store/image_pull_ms/p9999</code>
+  </td>
+  <td>99.99th percentile Mesos containerizer docker image pull latency in ms</td>
+  <td>Gauge</td>
+</tr>
+</table>
+
+#### Resource Providers
+
+The following metrics provide information about ongoing and completed
+[operations](operations.md) that apply to resources provided by a
+[resource provider](resource-provider.md) with the given _type_ and _name_. In
+the following metrics, the _operation_ placeholder refers to the name of a
+particular operation type, which is described in the list of
+[supported operation types](#supported-operation-types).
+
+<table class="table table-striped">
+<thead>
+<tr><th>Metric</th><th>Description</th><th>Type</th>
+</thead>
+<tr>
+  <td>
+  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/operations/<i>&lt;operation&gt;</i>/pending</code>
+  </td>
+  <td>Number of ongoing <i>operation</i>s</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/operations/<i>&lt;operation&gt;</i>/finished</code>
+  </td>
+  <td>Number of finished <i>operation</i>s</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/operations/<i>&lt;operation&gt;</i>/failed</code>
+  </td>
+  <td>Number of failed <i>operation</i>s</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/operations/<i>&lt;operation&gt;</i>/dropped</code>
+  </td>
+  <td>Number of dropped <i>operation</i>s</td>
+  <td>Counter</td>
+</tr>
+</table>
+
+##### Supported Operation Types
+
+Since the supported operation types may vary among different resource providers,
+the following is a comprehensive list of operation types and the corresponding
+resource providers that support them. Note that the name column is for the
+_operation_ placeholder in the above metrics.
+
+<table class="table table-striped">
+<thead>
+<tr><th>Type</th><th>Name</th><th>Supported Resource Provider Types</th>
+</thead>
+<tr>
+  <td><code><a href="reservation.md">RESERVE</a></code></td>
+  <td><code>reserve</code></td>
+  <td>All</td>
+</tr>
+<tr>
+  <td><code><a href="reservation.md">UNRESERVE</a></code></td>
+  <td><code>unreserve</code></td>
+  <td>All</td>
+</tr>
+<tr>
+  <td><code><a href="persistent-volume.md#-offer-operation-create-">CREATE</a></code></td>
+  <td><code>create</code></td>
+  <td><code>org.apache.mesos.rp.local.storage</code></td>
+</tr>
+<tr>
+  <td><code><a href="persistent-volume.md#-offer-operation-destroy-">DESTROY</a></code></td>
+  <td><code>destroy</code></td>
+  <td><code>org.apache.mesos.rp.local.storage</code></td>
+</tr>
+<tr>
+  <td><code><a href="csi.md#-create_disk-operation">CREATE_DISK</a></code></td>
+  <td><code>create_disk</code></td>
+  <td><code>org.apache.mesos.rp.local.storage</code></td>
+</tr>
+<tr>
+  <td><code><a href="csi.md#-destroy_disk-operation">DESTROY_DISK</a></code></td>
+  <td><code>destroy_disk</code></td>
+  <td><code>org.apache.mesos.rp.local.storage</code></td>
+</tr>
+</table>
+
+For example, cluster operators can monitor the number of successful
+`CREATE_VOLUME` operations that are applied to the resource provider with type
+`org.apache.mesos.rp.local.storage` and name `lvm` through the
+`resource_providers/org.apache.mesos.rp.local.storage.lvm/operations/create_disk/finished`
+metric.
+
+#### CSI Plugins
+
+Storage resource providers in Mesos are backed by
+[CSI plugins](csi.md#standalone-containers-for-csi-plugins) running in
+[standalone containers](standalone-container.md). To monitor the health of these
+CSI plugins for a storage resource provider with _type_ and _name_, the
+following metrics provide information about plugin terminations and ongoing and
+completed CSI calls made to the plugin.
+
+<table class="table table-striped">
+<thead>
+<tr><th>Metric</th><th>Description</th><th>Type</th>
+</thead>
+<tr>
+  <td>
+  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/csi_plugin/container_terminations</code>
+  </td>
+  <td>Number of terminated CSI plugin containers</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/csi_plugin/rpcs_pending</code>
+  </td>
+  <td>Number of ongoing CSI calls</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/csi_plugin/rpcs_finished</code>
+  </td>
+  <td>Number of successful CSI calls</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/csi_plugin/rpcs_failed</code>
+  </td>
+  <td>Number of failed CSI calls</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/csi_plugin/rpcs_cancelled</code>
+  </td>
+  <td>Number of cancelled CSI calls</td>
   <td>Counter</td>
 </tr>
 </table>

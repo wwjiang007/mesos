@@ -180,10 +180,13 @@ Verify if your container is running by launching a redis client:
 
 Image provisioner uses [Docker v2 registry
 API](https://docs.docker.com/registry/spec/api/) to fetch Docker
-images/layers. The fetching is based on `curl`, therefore SSL is
-automatically handled. For private registries, the operator needs to
-configure `curl` accordingly so that it knows where to find the
-additional certificate files.
+images/layers. Both docker manifest
+[v2 schema1](https://docs.docker.com/registry/spec/manifest-v2-1/)
+and [v2 schema2](https://docs.docker.com/registry/spec/manifest-v2-2/)
+are supported (v2 schema2 is supported starting from 1.8.0). The
+fetching is based on `curl`, therefore SSL is automatically handled.
+For private registries, the operator needs to configure `curl`
+with the location of required CA certificates.
 
 Fetching requiring authentication is supported through the
 `--docker_config` agent flag. Starting from 1.0, operators can use
@@ -226,7 +229,10 @@ example, the operator can put a `busybox:latest.tar` (the result of
 `/tmp/mesos/images/docker` and launch the agent by specifying
 `--docker_registry=/tmp/mesos/images/docker`. Then the framework can
 launch a Docker container by specifying `busybox:latest` as the name
-of the Docker image.
+of the Docker image. This flag can also point to an HDFS URI
+(*experimental* in Mesos 1.7) (e.g., `hdfs://localhost:8020/archives/`)
+to fetch images from HDFS if the `hadoop` command is available on the
+agent.
 
 If the `--switch_user` flag is set on the agent and the framework
 specifies a user (either `CommandInfo.user` or `FrameworkInfo.user`),
@@ -424,7 +430,7 @@ or as a JSON object,
     --image_gc_config="{ \
       \"image_disk_headroom\": 0.1, \
       \"image_disk_watch_interval\": { \
-        \"nano_seconds\": 3600 \
+        \"nanoseconds\": 3600000000000 \
         }, \
       \"excluded_images\": \[ \] \
     }"

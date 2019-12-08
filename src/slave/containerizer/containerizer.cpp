@@ -34,6 +34,7 @@
 #include "hook/manager.hpp"
 
 #include "slave/flags.hpp"
+#include "slave/gc.hpp"
 #include "slave/slave.hpp"
 
 #include "slave/containerizer/composing.hpp"
@@ -216,7 +217,10 @@ Try<Containerizer*> Containerizer::create(
     const Flags& flags,
     bool local,
     Fetcher* fetcher,
-    SecretResolver* secretResolver)
+    GarbageCollector* gc,
+    SecretResolver* secretResolver,
+    VolumeGidManager* volumeGidManager,
+    PendingFutureTracker* futureTracker)
 {
   // Get the set of containerizer types.
   const vector<string> _types = strings::split(flags.containerizers, ",");
@@ -286,7 +290,15 @@ Try<Containerizer*> Containerizer::create(
   foreach (const string& type, containerizerTypes) {
     if (type == "mesos") {
       Try<MesosContainerizer*> containerizer = MesosContainerizer::create(
-          flags, local, fetcher, secretResolver, nvidia);
+          flags,
+          local,
+          fetcher,
+          gc,
+          secretResolver,
+          nvidia,
+          volumeGidManager,
+          futureTracker);
+
       if (containerizer.isError()) {
         return Error("Could not create MesosContainerizer: " +
                      containerizer.error());

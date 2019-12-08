@@ -114,6 +114,15 @@ message ACL {
     required Entity creator_principals = 2;
   }
 
+  // Specifies which roles a principal can resize volumes for.
+  message ResizeVolume {
+    // Subjects: Framework principal or Operator username.
+    required Entity principals = 1;
+
+    // Objects: The principal(s) can resize volumes for these roles.
+    required Entity roles = 2;
+  }
+
   // Which principals are authorized to see quotas for the given roles.
   message GetQuota {
     // Subjects: Operator username.
@@ -124,6 +133,8 @@ message ACL {
   }
 
   // Which principals are authorized to update quotas for the given roles.
+  // This ACL is currently used for two authorizatble actions:
+  // `UPDATE_QUOTA` and `UPDATE_QUOTA_WITH_CONFIG`.
   message UpdateQuota {
     // Subjects: Operator username.
     required Entity principals = 1;
@@ -408,6 +419,33 @@ message ACL {
     required Entity machines = 2;
   }
 
+  message DrainAgent {
+    // Subjects: HTTP Username.
+    required Entity principals = 1;
+
+    // Objects: Given implicitly. Use Entity type ANY or NONE to allow or deny
+    // access.
+    required Entity agents = 2;
+  }
+
+  message DeactivateAgent {
+    // Subjects: HTTP Username.
+    required Entity principals = 1;
+
+    // Objects: Given implicitly. Use Entity type ANY or NONE to allow or deny
+    // access.
+    required Entity agents = 2;
+  }
+
+  message ReactivateAgent {
+    // Subjects: HTTP Username.
+    required Entity principals = 1;
+
+    // Objects: Given implicitly. Use Entity type ANY or NONE to allow or deny
+    // access.
+    required Entity agents = 2;
+  }
+
   // Which principals are authorized to mark an agent as gone.
   message MarkAgentGone {
     // Subjects: HTTP Username.
@@ -485,6 +523,16 @@ message ACL {
     required Entity users = 2;
   }
 
+  // Which principals are authorized to mark resource providers as gone.
+  message MarkResourceProvidersGone {
+    // Subjects: HTTP Username.
+    required Entity principals = 1;
+
+    // Objects: Given implicitly.
+    // Use Entity type ANY or NONE to allow or deny access.
+    required Entity resource_providers = 2;
+  }
+
   // Which principals are authorized to add, update and remove resource
   // provider config files.
   message ModifyResourceProviderConfig {
@@ -510,6 +558,61 @@ message ACL {
     // TODO(zhitao): Consider allowing granular permission to act upon
     // SOME image reference.
     required Entity images = 2;
+  }
+
+  // Which principals are authorized to create block disks.
+  message CreateBlockDisk {
+    // Subjects: Framework principal.
+    required Entity principals = 1;
+
+    // Objects: The list of roles for which block disks can be created.
+    required Entity roles = 2;
+  }
+
+  // Which principals are authorized to destroy block disks.
+  message DestroyBlockDisk {
+    // Subjects: Framework principal.
+    required Entity principals = 1;
+
+    // Objects: The list of roles for which block disks can be destroyed.
+    required Entity roles = 2;
+  }
+
+  // Which principals are authorized to create mount disks.
+  message CreateMountDisk {
+    // Subjects: Framework principal.
+    required Entity principals = 1;
+
+    // Objects: The list of roles for which mount disks can be created.
+    required Entity roles = 2;
+  }
+
+  // Which principals are authorized to destroy mount disks.
+  message DestroyMountDisk {
+    // Subjects: Framework principal.
+    required Entity principals = 1;
+
+    // Objects: The list of roles for which volume disks can be destroyed.
+    required Entity roles = 2;
+  }
+
+  // Which principals are authorized to destroy raw disks.
+  message DestroyRawDisk {
+    // Subjects: Framework principal.
+    required Entity principals = 1;
+
+    // Objects: The list of roles for which volume disks can be destroyed.
+    required Entity roles = 2;
+  }
+
+  // Which principals are authorized to access resource provider information.
+  message ViewResourceProvider {
+    // Subjects: HTTP Username.
+    required Entity principals = 1;
+
+    // Objects: Given implicitly. Use Entity type ANY or NONE to allow or deny
+    // access.
+    required Entity resource_providers = 2;
   }
 }
 
@@ -581,6 +684,9 @@ message ACLs {
   repeated ACL.StartMaintenance start_maintenances = 37;
   repeated ACL.StopMaintenance stop_maintenances = 38;
   repeated ACL.GetMaintenanceStatus get_maintenance_statuses = 39;
+  repeated ACL.DrainAgent drain_agents = 56;
+  repeated ACL.DeactivateAgent deactivate_agents = 57;
+  repeated ACL.ReactivateAgent reactivate_agents = 58;
   repeated ACL.MarkAgentGone mark_agents_gone = 40;
   repeated ACL.LaunchStandaloneContainer launch_standalone_containers = 41;
   repeated ACL.KillStandaloneContainer kill_standalone_containers = 42;
@@ -588,5 +694,13 @@ message ACLs {
   repeated ACL.RemoveStandaloneContainer remove_standalone_containers = 44;
   repeated ACL.ViewStandaloneContainer view_standalone_containers = 46;
   repeated ACL.ModifyResourceProviderConfig modify_resource_provider_configs = 45;
+  repeated ACL.MarkResourceProvidersGone mark_resource_providers_gone = 54;
+  repeated ACL.ViewResourceProvider view_resource_providers = 53;
   repeated ACL.PruneImages prune_images = 47;
+  repeated ACL.ResizeVolume resize_volumes = 48;
+  repeated ACL.CreateBlockDisk create_block_disks = 49;
+  repeated ACL.DestroyBlockDisk destroy_block_disks = 50;
+  repeated ACL.CreateMountDisk create_mount_disks = 51;
+  repeated ACL.DestroyMountDisk destroy_mount_disks = 52;
+  repeated ACL.DestroyRawDisk destroy_raw_disks = 55;
 }

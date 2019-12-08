@@ -21,6 +21,12 @@
 #include <utility>
 #include <vector>
 
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/descriptor.pb.h>
+#include <google/protobuf/message.h>
+#include <google/protobuf/reflection.h>
+#include <google/protobuf/repeated_field.h>
+
 #include <mesos/attributes.hpp>
 #include <mesos/http.hpp>
 #include <mesos/resources.hpp>
@@ -32,6 +38,7 @@
 #include <mesos/quota/quota.hpp>
 
 #include <process/authenticator.hpp>
+#include <process/clock.hpp>
 #include <process/collect.hpp>
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
@@ -47,6 +54,7 @@
 
 #include <stout/os/permissions.hpp>
 
+#include "common/authorization.hpp"
 #include "common/http.hpp"
 
 #include "messages/messages.hpp"
@@ -94,18 +102,6 @@ ostream& operator<<(ostream& stream, ContentType contentType)
 
 namespace internal {
 
-// Set of endpoint whose access is protected with the authorization
-// action `GET_ENDPOINTS_WITH_PATH`.
-hashset<string> AUTHORIZABLE_ENDPOINTS{
-    "/containers",
-    "/files/debug",
-    "/files/debug.json",
-    "/logging/toggle",
-    "/metrics/snapshot",
-    "/monitor/statistics",
-    "/monitor/statistics.json"};
-
-
 string serialize(
     ContentType contentType,
     const google::protobuf::Message& message)
@@ -140,6 +136,290 @@ bool streamingMediaType(ContentType contentType)
   }
 
   UNREACHABLE();
+}
+
+
+string lowerSlaveToAgent(string s)
+{
+  size_t index = 0;
+
+  while (true) {
+    index = s.find("slave", index);
+    if (index == std::string::npos) break;
+    s.replace(index, 5, "agent");
+    index += 5;
+  }
+
+  return s;
+}
+
+
+string upperSlaveToAgent(string s)
+{
+  size_t index = 0;
+
+  while (true) {
+    index = s.find("SLAVE", index);
+    if (index == std::string::npos) break;
+    s.replace(index, 5, "AGENT");
+    index += 5;
+  }
+
+  return s;
+}
+
+
+// This is a copy of the version in stout:
+//
+//   https://github.com/apache/mesos/blob/1.9.0/3rdparty/
+//     stout/include/stout/protobuf.hpp#L816
+//
+// Except that we remap "slave" to "agent" in field names and
+// enum values.
+//
+// Therefore, this is pretty brittle! If we change the one in
+// stout we'll likely not realize this one should get a similar
+// change. Note however that this can be removed if we were to
+// keep up-to-date v1 state related objects in the master per
+// MESOS-10040.
+//
+// Hopefully keeping a copy of the stout code doesn't prove
+// too big of an issue since the stout version is pretty
+// stable. Tickets to change the stout code (MESOS-3449,
+// MESOS-6568, and MESOS-8727 have been updated with a note
+// to change this copy as well).
+void json(JSON::ObjectWriter* writer, const asV1Protobuf& protobuf)
+{
+  using google::protobuf::FieldDescriptor;
+
+  const google::protobuf::Message& message = protobuf;
+
+  const google::protobuf::Descriptor* descriptor = message.GetDescriptor();
+  const google::protobuf::Reflection* reflection = message.GetReflection();
+
+  // We first look through all the possible fields to determine both the set
+  // fields __and__ the optional fields with a default that are not set.
+  // `Reflection::ListFields()` alone will only include set fields and
+  // is therefore insufficient.
+  int fieldCount = descriptor->field_count();
+  std::vector<const FieldDescriptor*> fields;
+  fields.reserve(fieldCount);
+  for (int i = 0; i < fieldCount; ++i) {
+    const FieldDescriptor* field = descriptor->field(i);
+    if (field->is_repeated()) { // Repeated or Map.
+      if (reflection->FieldSize(message, field) > 0) {
+        // Has repeated field with members, output as JSON.
+        fields.push_back(field);
+      }
+    } else if (
+        reflection->HasField(message, field) ||
+        (field->has_default_value() && !field->options().deprecated())) {
+      // Field is set or has default, output as JSON.
+      fields.push_back(field);
+    }
+  }
+
+  foreach (const FieldDescriptor* field, fields) {
+    if (field->is_repeated() && !field->is_map()) {
+      writer->field(
+          lowerSlaveToAgent(field->name()),
+          [&field, &reflection, &message](JSON::ArrayWriter* writer) {
+            int fieldSize = reflection->FieldSize(message, field);
+            for (int i = 0; i < fieldSize; ++i) {
+              switch (field->cpp_type()) {
+                case FieldDescriptor::CPPTYPE_BOOL:
+                  writer->element(
+                      reflection->GetRepeatedBool(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_INT32:
+                  writer->element(
+                      reflection->GetRepeatedInt32(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_INT64:
+                  writer->element(
+                      reflection->GetRepeatedInt64(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_UINT32:
+                  writer->element(
+                      reflection->GetRepeatedUInt32(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_UINT64:
+                  writer->element(
+                      reflection->GetRepeatedUInt64(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_FLOAT:
+                  writer->element(
+                      reflection->GetRepeatedFloat(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_DOUBLE:
+                  writer->element(
+                      reflection->GetRepeatedDouble(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_MESSAGE:
+                  writer->element(
+                      asV1Protobuf(
+                          reflection->GetRepeatedMessage(message, field, i)));
+                  break;
+                case FieldDescriptor::CPPTYPE_ENUM:
+                  writer->element(
+                      upperSlaveToAgent(
+                          reflection->GetRepeatedEnum(message, field, i)
+                            ->name()));
+                  break;
+                case FieldDescriptor::CPPTYPE_STRING:
+                  const std::string& s = reflection->GetRepeatedStringReference(
+                      message, field, i, nullptr);
+                  if (field->type() == FieldDescriptor::TYPE_BYTES) {
+                    writer->element(base64::encode(s));
+                  } else {
+                    writer->element(s);
+                  }
+                  break;
+              }
+            }
+          });
+    } else { // field->is_map() || !field->is_repeated()
+      auto writeField = [&writer](
+                            const std::string& fieldName,
+                            const google::protobuf::Reflection* reflection,
+                            const google::protobuf::Message& message,
+                            const FieldDescriptor* field) {
+        switch (field->cpp_type()) {
+          case FieldDescriptor::CPPTYPE_BOOL:
+            writer->field(fieldName, reflection->GetBool(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_INT32:
+            writer->field(fieldName, reflection->GetInt32(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_INT64:
+            writer->field(fieldName, reflection->GetInt64(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_UINT32:
+            writer->field(fieldName, reflection->GetUInt32(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_UINT64:
+            writer->field(fieldName, reflection->GetUInt64(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_FLOAT:
+            writer->field(fieldName, reflection->GetFloat(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_DOUBLE:
+            writer->field(fieldName, reflection->GetDouble(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_MESSAGE:
+            writer->field(
+                fieldName,
+                asV1Protobuf(reflection->GetMessage(message, field)));
+            break;
+          case FieldDescriptor::CPPTYPE_ENUM:
+            writer->field(
+                fieldName,
+                upperSlaveToAgent(reflection->GetEnum(message, field)->name()));
+            break;
+          case FieldDescriptor::CPPTYPE_STRING:
+            const std::string& s =
+              reflection->GetStringReference(message, field, nullptr);
+            if (field->type() == FieldDescriptor::TYPE_BYTES) {
+              writer->field(fieldName, base64::encode(s));
+            } else {
+              writer->field(fieldName, s);
+            }
+            break;
+        }
+      };
+
+      if (!field->is_repeated()) { // Singular field.
+        writeField(
+            lowerSlaveToAgent(field->name()), reflection, message, field);
+      } else { // Map field.
+        CHECK(field->is_map());
+        writer->field(
+            lowerSlaveToAgent(field->name()),
+            [&field, &reflection, &message, &writeField](
+                JSON::ObjectWriter* writer) {
+              foreach (
+                  const auto& mapEntry,
+                  reflection->GetRepeatedFieldRef<google::protobuf::Message>(
+                      message, field)) {
+                const google::protobuf::Descriptor* mapEntryDescriptor =
+                  mapEntry.GetDescriptor();
+                const google::protobuf::Reflection* mapEntryReflection =
+                  mapEntry.GetReflection();
+
+                // Map entry must contain exactly two fields: `key` and `value`.
+                CHECK_EQ(mapEntryDescriptor->field_count(), 2);
+
+                const FieldDescriptor* keyField = mapEntryDescriptor->field(0);
+                const FieldDescriptor* valueField =
+                  mapEntryDescriptor->field(1);
+
+                switch (keyField->cpp_type()) {
+                  case FieldDescriptor::CPPTYPE_BOOL:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetBool(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_INT32:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetInt32(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_INT64:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetInt64(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_UINT32:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetUInt32(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_UINT64:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetUInt64(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_STRING:
+                    if (keyField->type() == FieldDescriptor::TYPE_BYTES) {
+                      LOG(FATAL)
+                        << "Unexpected key field type in protobuf Map: "
+                        << keyField->type_name();
+                    }
+
+                    writeField(
+                        mapEntryReflection->GetStringReference(
+                            mapEntry, keyField, nullptr),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_FLOAT:
+                  case FieldDescriptor::CPPTYPE_DOUBLE:
+                  case FieldDescriptor::CPPTYPE_MESSAGE:
+                  case FieldDescriptor::CPPTYPE_ENUM:
+                    LOG(FATAL) << "Unexpected key field type in protobuf Map: "
+                               << keyField->cpp_type_name();
+                }
+              }
+            });
+      }
+    }
+  }
 }
 
 
@@ -503,21 +783,8 @@ JSON::Object model(const FileInfo& fileInfo)
   return file;
 }
 
-
-JSON::Object model(const quota::QuotaInfo& quotaInfo)
-{
-  JSON::Object object;
-
-  object.values["guarantee"] = model(quotaInfo.guarantee());
-  object.values["role"] = quotaInfo.role();
-  if (quotaInfo.has_principal()) {
-    object.values["principal"] = quotaInfo.principal();
-  }
-
-  return object;
-}
-
 }  // namespace internal {
+
 
 void json(JSON::ObjectWriter* writer, const Attributes& attributes)
 {
@@ -585,13 +852,46 @@ static void json(JSON::ObjectWriter* writer, const ContainerStatus& status)
 }
 
 
+static void json(
+    JSON::ObjectWriter* writer,
+    const DomainInfo::FaultDomain::RegionInfo& regionInfo)
+{
+  writer->field("name", regionInfo.name());
+}
+
+
+static void json(
+    JSON::ObjectWriter* writer,
+    const DomainInfo::FaultDomain::ZoneInfo& zoneInfo)
+{
+  writer->field("name", zoneInfo.name());
+}
+
+
+static void json(
+    JSON::ObjectWriter* writer,
+    const DomainInfo::FaultDomain& faultDomain)
+{
+    writer->field("region", faultDomain.region());
+    writer->field("zone", faultDomain.zone());
+}
+
+
+void json(JSON::ObjectWriter* writer, const DomainInfo& domainInfo)
+{
+  if (domainInfo.has_fault_domain()) {
+    writer->field("fault_domain", domainInfo.fault_domain());
+  }
+}
+
+
 void json(JSON::ObjectWriter* writer, const ExecutorInfo& executorInfo)
 {
   writer->field("executor_id", executorInfo.executor_id().value());
   writer->field("name", executorInfo.name());
   writer->field("framework_id", executorInfo.framework_id().value());
   writer->field("command", executorInfo.command());
-  writer->field("resources", Resources(executorInfo.resources()));
+  writer->field("resources", executorInfo.resources());
 
   // Resources may be empty for command executors.
   if (!executorInfo.resources().empty()) {
@@ -612,11 +912,40 @@ void json(JSON::ObjectWriter* writer, const ExecutorInfo& executorInfo)
 }
 
 
+void json(
+    JSON::StringWriter* writer,
+    const FrameworkInfo::Capability& capability)
+{
+  writer->set(FrameworkInfo::Capability::Type_Name(capability.type()));
+}
+
+
 void json(JSON::ArrayWriter* writer, const Labels& labels)
 {
   foreach (const Label& label, labels.labels()) {
     writer->element(JSON::Protobuf(label));
   }
+}
+
+
+void json(JSON::ObjectWriter* writer, const MasterInfo& info)
+{
+  writer->field("id", info.id());
+  writer->field("pid", info.pid());
+  writer->field("port", info.port());
+  writer->field("hostname", info.hostname());
+
+  if (info.has_domain()) {
+    writer->field("domain", info.domain());
+  }
+}
+
+
+void json(
+    JSON::StringWriter* writer,
+    const MasterInfo::Capability& capability)
+{
+  writer->set(MasterInfo::Capability::Type_Name(capability.type()));
 }
 
 
@@ -653,14 +982,30 @@ static void json(JSON::ObjectWriter* writer, const NetworkInfo& info)
 }
 
 
-void json(JSON::ObjectWriter* writer, const Resources& resources)
+void json(JSON::ObjectWriter* writer, const Offer& offer)
+{
+  writer->field("id", offer.id().value());
+  writer->field("framework_id", offer.framework_id().value());
+  writer->field("allocation_info", JSON::Protobuf(offer.allocation_info()));
+  writer->field("slave_id", offer.slave_id().value());
+  writer->field("resources", offer.resources());
+}
+
+
+template <typename ResourceIterable>
+void json(
+    JSON::ObjectWriter* writer,
+    ResourceIterable begin,
+    ResourceIterable end)
 {
   hashmap<string, double> scalars =
     {{"cpus", 0}, {"gpus", 0}, {"mem", 0}, {"disk", 0}};
   hashmap<string, Value::Ranges> ranges;
   hashmap<string, Value::Set> sets;
 
-  foreach (const Resource& resource, resources) {
+  for (auto it = begin; it != end; ++it) {
+    const Resource& resource = *it;
+
     string name =
       resource.name() + (Resources::isRevocable(resource) ? "_revocable" : "");
     switch (resource.type()) {
@@ -673,14 +1018,65 @@ void json(JSON::ObjectWriter* writer, const Resources& resources)
       case Value::SET:
         sets[name] += resource.set();
         break;
-      default:
-        LOG(FATAL) << "Unexpected Value type: " << resource.type();
+      case Value::TEXT:
+        break;
     }
   }
 
   json(writer, scalars);
   json(writer, ranges);
   json(writer, sets);
+}
+
+
+void json(JSON::ObjectWriter* writer, const Resources& resources)
+{
+  json(writer, resources.begin(), resources.end());
+}
+
+
+void json(
+    JSON::ObjectWriter* writer,
+    const google::protobuf::RepeatedPtrField<Resource>& resources)
+{
+  json(writer, resources.begin(), resources.end());
+}
+
+
+void json(JSON::ObjectWriter* writer, const ResourceQuantities& quantities)
+{
+  foreachpair (const string& name, const Value::Scalar& scalar, quantities) {
+    writer->field(name, scalar.value());
+  }
+}
+
+
+void json(JSON::ObjectWriter* writer, const ResourceLimits& limits)
+{
+  foreachpair (const string& name, const Value::Scalar& scalar, limits) {
+    writer->field(name, scalar.value());
+  }
+}
+
+
+void json(JSON::ObjectWriter* writer, const SlaveInfo& slaveInfo)
+{
+  writer->field("id", slaveInfo.id().value());
+  writer->field("hostname", slaveInfo.hostname());
+  writer->field("port", slaveInfo.port());
+  writer->field("attributes", Attributes(slaveInfo.attributes()));
+
+  if (slaveInfo.has_domain()) {
+    writer->field("domain", slaveInfo.domain());
+  }
+}
+
+
+void json(
+    JSON::StringWriter* writer,
+    const SlaveInfo::Capability& capability)
+{
+  writer->set(SlaveInfo::Capability::Type_Name(capability.type()));
 }
 
 
@@ -692,7 +1088,7 @@ void json(JSON::ObjectWriter* writer, const Task& task)
   writer->field("executor_id", task.executor_id().value());
   writer->field("slave_id", task.slave_id().value());
   writer->field("state", TaskState_Name(task.state()));
-  writer->field("resources", Resources(task.resources()));
+  writer->field("resources", task.resources());
 
   // Tasks are not allowed to mix resources allocated to
   // different roles, see MESOS-6636.
@@ -714,6 +1110,10 @@ void json(JSON::ObjectWriter* writer, const Task& task)
 
   if (task.has_container()) {
     writer->field("container", JSON::Protobuf(task.container()));
+  }
+
+  if (task.has_health_check()) {
+    writer->field("health_check", JSON::Protobuf(task.health_check()));
   }
 }
 
@@ -737,39 +1137,6 @@ void json(JSON::ObjectWriter* writer, const TaskStatus& status)
 }
 
 
-static void json(
-    JSON::ObjectWriter* writer,
-    const DomainInfo::FaultDomain::RegionInfo& regionInfo)
-{
-  writer->field("name", regionInfo.name());
-}
-
-
-static void json(
-    JSON::ObjectWriter* writer,
-    const DomainInfo::FaultDomain::ZoneInfo& zoneInfo)
-{
-  writer->field("name", zoneInfo.name());
-}
-
-
-static void json(
-    JSON::ObjectWriter* writer,
-    const DomainInfo::FaultDomain& faultDomain)
-{
-    writer->field("region", faultDomain.region());
-    writer->field("zone", faultDomain.zone());
-}
-
-
-void json(JSON::ObjectWriter* writer, const DomainInfo& domainInfo)
-{
-  if (domainInfo.has_fault_domain()) {
-    writer->field("fault_domain", domainInfo.fault_domain());
-  }
-}
-
-
 static void json(JSON::NumberWriter* writer, const Value::Scalar& scalar)
 {
   writer->set(scalar.value());
@@ -778,89 +1145,28 @@ static void json(JSON::NumberWriter* writer, const Value::Scalar& scalar)
 
 static void json(JSON::StringWriter* writer, const Value::Ranges& ranges)
 {
-  writer->append(stringify(ranges));
+  writer->set(stringify(ranges));
 }
 
 
 static void json(JSON::StringWriter* writer, const Value::Set& set)
 {
-  writer->append(stringify(set));
+  writer->set(stringify(set));
 }
 
 
 static void json(JSON::StringWriter* writer, const Value::Text& text)
 {
-  writer->append(text.value());
+  writer->set(text.value());
 }
 
-namespace authorization {
 
-const Option<authorization::Subject> createSubject(
-    const Option<Principal>& principal)
+void json(JSON::ObjectWriter* writer, const Quota& quota)
 {
-  if (principal.isSome()) {
-    authorization::Subject subject;
-
-    if (principal->value.isSome()) {
-      subject.set_value(principal->value.get());
-    }
-
-    foreachpair (const string& key, const string& value, principal->claims) {
-      Label* claim = subject.mutable_claims()->mutable_labels()->Add();
-      claim->set_key(key);
-      claim->set_value(value);
-    }
-
-    return subject;
-  }
-
-  return None();
+  writer->field("guarantees", quota.guarantees);
+  writer->field("limits", quota.limits);
 }
 
-} // namespace authorization {
-
-const AuthorizationCallbacks createAuthorizationCallbacks(
-    Authorizer* authorizer)
-{
-  typedef lambda::function<process::Future<bool>(
-      const process::http::Request& httpRequest,
-      const Option<Principal>& principal)> Callback;
-
-  AuthorizationCallbacks callbacks;
-
-  Callback getEndpoint = [authorizer](
-      const process::http::Request& httpRequest,
-      const Option<Principal>& principal) -> process::Future<bool> {
-        const string path = httpRequest.url.path;
-
-        if (!internal::AUTHORIZABLE_ENDPOINTS.contains(path)) {
-          return Failure(
-              "Endpoint '" + path + "' is not an authorizable endpoint.");
-        }
-
-        authorization::Request authRequest;
-        authRequest.set_action(mesos::authorization::GET_ENDPOINT_WITH_PATH);
-
-        Option<authorization::Subject> subject =
-          authorization::createSubject(principal);
-        if (subject.isSome()) {
-          authRequest.mutable_subject()->CopyFrom(subject.get());
-        }
-
-        authRequest.mutable_object()->set_value(path);
-
-        LOG(INFO) << "Authorizing principal '"
-                  << (principal.isSome() ? stringify(principal.get()) : "ANY")
-                  << "' to GET the endpoint '" << path << "'";
-
-        return authorizer->authorized(authRequest);
-      };
-
-  callbacks.insert(std::make_pair("/logging/toggle", getEndpoint));
-  callbacks.insert(std::make_pair("/metrics/snapshot", getEndpoint));
-
-  return callbacks;
-}
 
 Future<Owned<ObjectApprovers>> ObjectApprovers::create(
     const Option<Authorizer*>& authorizer,
@@ -888,12 +1194,12 @@ Future<Owned<ObjectApprovers>> ObjectApprovers::create(
         new ObjectApprovers(std::move(approvers), principal));
   }
 
-  return process::collect(lambda::map<std::list>(
+  return process::collect(lambda::map<vector>(
       [&](authorization::Action action) -> Future<Owned<ObjectApprover>> {
         return authorizer.get()->getObjectApprover(subject, action);
       },
       _actions))
-    .then([=](const std::list<Owned<ObjectApprover>>& _approvers) {
+    .then([=](const vector<Owned<ObjectApprover>>& _approvers) {
       return Owned<ObjectApprovers>(
           new ObjectApprovers(lambda::zip(_actions, _approvers), principal));
     });
@@ -920,7 +1226,7 @@ process::Future<bool> authorizeEndpoint(
     return Failure("Unexpected request method '" + method + "'");
   }
 
-  if (!internal::AUTHORIZABLE_ENDPOINTS.contains(endpoint)) {
+  if (!authorization::AUTHORIZABLE_ENDPOINTS.contains(endpoint)) {
     return Failure(
         "Endpoint '" + endpoint + "' is not an authorizable endpoint.");
   }
@@ -1106,6 +1412,20 @@ void logRequest(const process::http::Request& request)
             << (forwardedFor.isSome()
                 ? " with X-Forwarded-For='" + forwardedFor.get() + "'"
                 : "");
+}
+
+
+void logResponse(
+    const process::http::Request& request,
+    const process::http::Response& response)
+{
+  LOG(INFO) << "HTTP " << request.method << " for " << request.url
+            << (request.client.isSome()
+                ? " from " + stringify(request.client.get())
+                : "")
+            << ": '" << response.status << "'"
+            << " after " << (process::Clock::now() - request.received).ms()
+            << Milliseconds::units();
 }
 
 }  // namespace mesos {

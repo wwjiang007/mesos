@@ -57,6 +57,10 @@
 #include <stout/strings.hpp>
 
 #ifdef USE_SSL_SOCKET
+#include <stout/os/permissions.hpp>
+#endif // USE_SSL_SOCKET
+
+#ifdef USE_SSL_SOCKET
 #include "authentication/executor/jwt_secret_generator.hpp"
 #endif // USE_SSL_SOCKET
 
@@ -71,7 +75,7 @@
 #include "master/registrar.hpp"
 
 #include "master/allocator/mesos/hierarchical.hpp"
-#include "master/allocator/sorter/drf/sorter.hpp"
+#include "master/allocator/mesos/sorter/drf/sorter.hpp"
 
 #include "master/contender/standalone.hpp"
 
@@ -162,6 +166,7 @@ static vector<Fetcher*>* fetchers = nullptr;
 static vector<ResourceEstimator*>* resourceEstimators = nullptr;
 static vector<QoSController*>* qosControllers = nullptr;
 static vector<SecretGenerator*>* secretGenerators = nullptr;
+static vector<SecretResolver*>* secretResolvers = nullptr;
 
 
 PID<Master> launch(const Flags& flags, Allocator* _allocator)
@@ -371,6 +376,7 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
   resourceEstimators = new vector<ResourceEstimator*>();
   qosControllers = new vector<QoSController*>();
   secretGenerators = new vector<SecretGenerator*>();
+  secretResolvers = new vector<SecretResolver*>();
 
   vector<UPID> pids;
 
@@ -423,7 +429,7 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
         << slaveFlags.runtime_dir << "': " << mkdir.error();
     }
 
-    garbageCollectors->push_back(new GarbageCollector());
+    garbageCollectors->push_back(new GarbageCollector(slaveFlags.work_dir));
     taskStatusUpdateManagers->push_back(
         new TaskStatusUpdateManager(slaveFlags));
     fetchers->push_back(new Fetcher(slaveFlags));
@@ -500,10 +506,13 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
         << "Failed to initialize secret resolver: " << secretResolver.error();
     }
 
+    secretResolvers->push_back(secretResolver.get());
+
     Try<Containerizer*> containerizer = Containerizer::create(
         slaveFlags,
         true,
         fetchers->back(),
+        garbageCollectors->back(),
         secretResolver.get());
 
     if (containerizer.isError()) {
@@ -524,6 +533,8 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
         resourceEstimators->back(),
         qosControllers->back(),
         secretGenerators->back(),
+        nullptr,
+        nullptr,
         authorizer_); // Same authorizer as master.
 
     slaves[containerizer.get()] = slave;
@@ -595,6 +606,10 @@ void shutdown()
 
     delete fetchers;
     fetchers = nullptr;
+
+    foreach (SecretResolver* secretResolver, *secretResolvers) {
+      delete secretResolver;
+    }
 
     foreach (SecretGenerator* secretGenerator, *secretGenerators) {
       delete secretGenerator;

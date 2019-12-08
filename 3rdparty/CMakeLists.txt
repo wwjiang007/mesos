@@ -24,18 +24,25 @@ endif ()
 
 # TODO(andschwa): Move each URL to the dependency itself.
 set(BOOST_URL           ${FETCH_URL}/boost-${BOOST_VERSION}.tar.gz)
+set(BZIP2_URL           ${FETCH_URL}/bzip2-${BZIP2_VERSION}.tar.gz)
 set(CONCURRENTQUEUE_URL ${FETCH_URL}/concurrentqueue-${CONCURRENTQUEUE_VERSION}.tar.gz)
-set(CSI_URL             ${FETCH_URL}/csi-${CSI_VERSION}.tar.gz)
+set(CSI_V0_URL          ${FETCH_URL}/csi-${CSI_V0_VERSION}.tar.gz)
+set(CSI_V1_URL          ${FETCH_URL}/csi-${CSI_V1_VERSION}.tar.gz)
 set(ELFIO_URL           ${FETCH_URL}/elfio-${ELFIO_VERSION}.tar.gz)
 set(GLOG_URL            ${FETCH_URL}/glog-${GLOG_VERSION}.tar.gz)
 set(GOOGLETEST_URL      ${FETCH_URL}/googletest-release-${GOOGLETEST_VERSION}.tar.gz)
+set(GRPC_URL            ${FETCH_URL}/grpc-${GRPC_VERSION}.tar.gz)
 set(HTTP_PARSER_URL     ${FETCH_URL}/http-parser-${HTTP_PARSER_VERSION}.tar.gz)
 set(JEMALLOC_URL        ${FETCH_URL}/jemalloc-${JEMALLOC_VERSION}.tar.gz)
+set(LEVELDB_URL         ${FETCH_URL}/leveldb-${LEVELDB_VERSION}.tar.gz)
+set(LIBARCHIVE_URL      ${FETCH_URL}/libarchive-${LIBARCHIVE_VERSION}.tar.gz)
+set(LIBEV_URL           ${FETCH_URL}/libev-${LIBEV_VERSION}.tar.gz)
+set(LIBSECCOMP_URL      ${FETCH_URL}/libseccomp-${LIBSECCOMP_VERSION}.tar.gz)
+set(NVML_URL            ${FETCH_URL}/nvml-${NVML_VERSION}.tar.gz)
 set(PICOJSON_URL        ${FETCH_URL}/picojson-${PICOJSON_VERSION}.tar.gz)
 set(PROTOBUF_URL        ${FETCH_URL}/protobuf-${PROTOBUF_VERSION}.tar.gz)
-set(LEVELDB_URL         ${FETCH_URL}/leveldb-${LEVELDB_VERSION}.tar.gz)
-set(LIBEV_URL           ${FETCH_URL}/libev-${LIBEV_VERSION}.tar.gz)
-set(NVML_URL            ${FETCH_URL}/nvml-${NVML_VERSION}.tar.gz)
+set(RAPIDJSON_URL       ${FETCH_URL}/rapidjson-${RAPIDJSON_VERSION}.tar.gz)
+set(XZ_URL              ${FETCH_URL}/xz-${XZ_VERSION}-modified.tar.gz)
 set(ZOOKEEPER_URL       ${FETCH_URL}/zookeeper-${ZOOKEEPER_VERSION}.tar.gz)
 
 # NOTE: libevent doesn't come rebundled, so this URL is always the same. But,
@@ -46,14 +53,11 @@ if (WIN32)
   # NOTE: These dependencies are only rebundled on Windows because they
   # are available as installable packages on Linux; so they live
   # exclusively in the 3rdparty repo.
-  set(CURL_URL   ${3RDPARTY_DEPENDENCIES}/curl-${CURL_VERSION}.tar.gz)
-  set(LIBAPR_URL ${3RDPARTY_DEPENDENCIES}/libapr-${LIBAPR_VERSION}.tar.gz)
-  set(ZLIB_URL   ${3RDPARTY_DEPENDENCIES}/zlib-${ZLIB_VERSION}.tar.gz)
-  set(SASL2_URL  ${3RDPARTY_DEPENDENCIES}/cyrus-sasl-${SASL2_VERSION}.tar.gz)
-
-  # NOTE: The Windows version of Glog is patched and only available in the
-  # 3rdparty repo, not the local repo.
-  set(GLOG_URL   ${3RDPARTY_DEPENDENCIES}/glog-${GLOG_VERSION}.tar.gz)
+  set(CURL_URL    ${3RDPARTY_DEPENDENCIES}/curl-${CURL_VERSION}.tar.gz)
+  set(LIBAPR_URL  ${3RDPARTY_DEPENDENCIES}/libapr-${LIBAPR_VERSION}.tar.gz)
+  set(ZLIB_URL    ${3RDPARTY_DEPENDENCIES}/zlib-${ZLIB_VERSION}.tar.gz)
+  set(SASL2_URL   ${3RDPARTY_DEPENDENCIES}/cyrus-sasl-${SASL2_VERSION}.tar.gz)
+  set(WCLAYER_URL ${3RDPARTY_DEPENDENCIES}/wclayer.exe)
 endif ()
 
 if (NOT WIN32)
@@ -287,21 +291,45 @@ endif ()
 # CSI: Container Storage Interface Specification.
 # https://github.com/container-storage-interface/spec
 #####################################################
-EXTERNAL(csi ${CSI_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
-add_library(csi INTERFACE)
-add_dependencies(csi ${CSI_TARGET})
-target_include_directories(csi INTERFACE ${CSI_ROOT})
+EXTERNAL(csi_v0 ${CSI_V0_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+add_library(csi_v0 INTERFACE)
+add_dependencies(csi_v0 ${CSI_V0_TARGET})
+target_include_directories(csi_v0 INTERFACE ${CSI_V0_ROOT})
 
-# NOTE: We hard-code `csi.proto` as a byproduct since it exists in the tarball.
+EXTERNAL(csi_v1 ${CSI_V1_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+add_library(csi_v1 INTERFACE)
+add_dependencies(csi_v1 ${CSI_V1_TARGET})
+target_include_directories(csi_v1 INTERFACE ${CSI_V1_ROOT})
+
+# NOTE: To support multiple CSI versions, we move the CSI proto files to
+# version-qualified paths so `protoc` can find them.
+set(CSI_V0_CONFIG_CMD
+  ${CMAKE_COMMAND} -E make_directory ${CSI_V0_ROOT}/csi/v0 &&
+  ${CMAKE_COMMAND} -E rename ${CSI_V0_ROOT}/csi.proto ${CSI_V0_ROOT}/csi/v0/csi.proto)
+
+set(CSI_V1_CONFIG_CMD
+  ${CMAKE_COMMAND} -E make_directory ${CSI_V1_ROOT}/csi/v1 &&
+  ${CMAKE_COMMAND} -E rename ${CSI_V1_ROOT}/csi.proto ${CSI_V1_ROOT}/csi/v1/csi.proto)
+
 ExternalProject_Add(
-  ${CSI_TARGET}
-  PREFIX            ${CSI_CMAKE_ROOT}
-  BUILD_BYPRODUCTS  ${CSI_ROOT}/csi.proto
-  CONFIGURE_COMMAND ${CMAKE_NOOP}
+  ${CSI_V0_TARGET}
+  PREFIX            ${CSI_V0_CMAKE_ROOT}
+  BUILD_BYPRODUCTS  ${CSI_V0_ROOT}/csi/v0/csi.proto
+  CONFIGURE_COMMAND ${CSI_V0_CONFIG_CMD}
   BUILD_COMMAND     ${CMAKE_NOOP}
   INSTALL_COMMAND   ${CMAKE_NOOP}
-  URL               ${CSI_URL}
-  URL_HASH          ${CSI_HASH})
+  URL               ${CSI_V0_URL}
+  URL_HASH          ${CSI_V0_HASH})
+
+ExternalProject_Add(
+  ${CSI_V1_TARGET}
+  PREFIX            ${CSI_V1_CMAKE_ROOT}
+  BUILD_BYPRODUCTS  ${CSI_V1_ROOT}/csi/v1/csi.proto
+  CONFIGURE_COMMAND ${CSI_V1_CONFIG_CMD}
+  BUILD_COMMAND     ${CMAKE_NOOP}
+  INSTALL_COMMAND   ${CMAKE_NOOP}
+  URL               ${CSI_V1_URL}
+  URL_HASH          ${CSI_V1_HASH})
 
 
 # ELFIO: library for reading and generating ELF files.
@@ -334,9 +362,9 @@ add_dependencies(glog ${GLOG_TARGET})
 # On Windows, patch it to enable stack tracing.
 PATCH_CMD(GLOG_PATCH_CMD glog-${GLOG_VERSION}.patch)
 
-if (WIN32)
-  set(GLOG_INSTALL_CMD ${CMAKE_NOOP})
+set(GLOG_LIBRARY_NAME libglog)
 
+if (WIN32)
   # NOTE: Windows-specific workaround for a glog issue documented here[1].
   # Basically, Windows.h and glog/logging.h both define ERROR. Since we don't
   # need the Windows ERROR, we can use this flag to avoid defining it at all.
@@ -353,38 +381,49 @@ if (WIN32)
 
   set_target_properties(
     glog PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES ${GLOG_ROOT}/src/windows
     # TODO(andschwa): Remove this when glog is updated.
     IMPORTED_LINK_INTERFACE_LIBRARIES DbgHelp
     INTERFACE_COMPILE_DEFINITIONS "${GLOG_COMPILE_DEFINITIONS}")
 
-  if (CMAKE_GENERATOR MATCHES "Visual Studio")
-    set_target_properties(
-      glog PROPERTIES
-      IMPORTED_LOCATION_DEBUG ${GLOG_ROOT}-build/Debug/glog${LIBRARY_SUFFIX}
-      IMPORTED_LOCATION_RELEASE ${GLOG_ROOT}-build/Release/glog${LIBRARY_SUFFIX}
-      IMPORTED_IMPLIB_DEBUG ${GLOG_ROOT}-build/Debug/glog${CMAKE_IMPORT_LIBRARY_SUFFIX}
-      IMPORTED_IMPLIB_RELEASE ${GLOG_ROOT}-build/Release/glog${CMAKE_IMPORT_LIBRARY_SUFFIX})
-  else ()
-    set_target_properties(
-      glog PROPERTIES
-      IMPORTED_LOCATION ${GLOG_ROOT}-build/glog${LIBRARY_SUFFIX}
-      IMPORTED_IMPLIB ${GLOG_ROOT}-build/glog${CMAKE_IMPORT_LIBRARY_SUFFIX})
-  endif ()
+endif ()
+
+set(GLOG_INSTALL_DIR ${GLOG_ROOT}-install)
+
+if (CMAKE_GENERATOR MATCHES "Visual Studio")
+  set_target_properties(
+    glog PROPERTIES
+    IMPORTED_LOCATION_DEBUG ${GLOG_INSTALL_DIR}/lib/glogd${LIBRARY_SUFFIX}
+    IMPORTED_IMPLIB_DEBUG ${GLOG_INSTALL_DIR}/lib/glogd${CMAKE_IMPORT_LIBRARY_SUFFIX}
+    IMPORTED_LOCATION_RELEASE ${GLOG_INSTALL_DIR}/lib/glog${LIBRARY_SUFFIX}
+    IMPORTED_IMPLIB_RELEASE ${GLOG_INSTALL_DIR}/lib/glog${CMAKE_IMPORT_LIBRARY_SUFFIX}
+  )
 else ()
-  # TODO(andschwa): Build with CMake instead when glog is updated.
-  set(GLOG_CONFIG_CMD  ${GLOG_ROOT}/src/../configure --with-pic GTEST_CONFIG=no --prefix=${GLOG_ROOT}-build)
-  if (FREEBSD)
-    list(APPEND GLOG_CONFIG_CMD LDFLAGS=-lexecinfo)
+  # This is for single-configuration generators such as GNU Make.
+  if (CMAKE_BUILD_TYPE MATCHES Debug)
+    set(GLOG_SUFFIX d)
   endif ()
-  set(GLOG_BUILD_CMD   ${MAKE_PROGRAM})
-  set(GLOG_INSTALL_CMD ${MAKE_PROGRAM} install)
 
   set_target_properties(
     glog PROPERTIES
-    IMPORTED_LOCATION ${GLOG_ROOT}-build/lib/libglog${LIBRARY_SUFFIX}
-    INTERFACE_INCLUDE_DIRECTORIES ${GLOG_ROOT}-build/include)
+    IMPORTED_LOCATION ${GLOG_INSTALL_DIR}/lib/libglog${GLOG_SUFFIX}${LIBRARY_SUFFIX}
+    IMPORTED_IMPLIB ${GLOG_INSTALL_DIR}/lib/libglog${GLOG_SUFFIX}${CMAKE_IMPORT_LIBRARY_SUFFIX}
+  )
 endif ()
+
+set_target_properties(
+  glog PROPERTIES
+  INTERFACE_INCLUDE_DIRECTORIES ${GLOG_INSTALL_DIR}/include
+)
+
+set(
+  GLOG_CMAKE_ARGS
+  ${CMAKE_CXX_FORWARD_ARGS}
+  -DBUILD_TESTING=OFF
+  -DCMAKE_INSTALL_BINDIR=${GLOG_INSTALL_DIR}/bin
+  -DCMAKE_INSTALL_INCLUDEDIR=${GLOG_INSTALL_DIR}/include
+  -DCMAKE_INSTALL_LIBDIR=${GLOG_INSTALL_DIR}/lib
+  -DWITH_GFLAGS=OFF
+)
 
 MAKE_INCLUDE_DIR(glog)
 GET_BYPRODUCTS(glog)
@@ -394,10 +433,8 @@ ExternalProject_Add(
   PREFIX            ${GLOG_CMAKE_ROOT}
   BUILD_BYPRODUCTS  ${GLOG_BYPRODUCTS}
   PATCH_COMMAND     ${GLOG_PATCH_CMD}
-  CMAKE_ARGS        ${CMAKE_CXX_FORWARD_ARGS};-DBUILD_TESTING=OFF
-  CONFIGURE_COMMAND ${GLOG_CONFIG_CMD}
-  BUILD_COMMAND     ${GLOG_BUILD_CMD}
-  INSTALL_COMMAND   ${GLOG_INSTALL_CMD}
+  CMAKE_ARGS        ${GLOG_CMAKE_ARGS}
+  INSTALL_DIR       ${GLOG_INSTALL_DIR}
   URL               ${GLOG_URL}
   URL_HASH          ${GLOG_HASH})
 
@@ -410,24 +447,46 @@ add_library(picojson INTERFACE)
 add_dependencies(picojson ${PICOJSON_TARGET})
 target_include_directories(picojson INTERFACE ${PICOJSON_ROOT})
 
-# Enable the INT64 support for PicoJSON.
 # NOTE: PicoJson requires __STDC_FORMAT_MACROS to be defined before importing
 # 'inttypes.h'.  Since other libraries may also import this header, it must
 # be globally defined so that PicoJSON has access to the macros, regardless
 # of the order of inclusion.
 target_compile_definitions(
   picojson INTERFACE
-  PICOJSON_USE_INT64
   __STDC_FORMAT_MACROS)
+
+PATCH_CMD(PICOJSON_PATCH_CMD picojson-${PICOJSON_VERSION}.patch)
 
 ExternalProject_Add(
   ${PICOJSON_TARGET}
   PREFIX            ${PICOJSON_CMAKE_ROOT}
+  PATCH_COMMAND     ${PICOJSON_PATCH_CMD}
   CONFIGURE_COMMAND ${CMAKE_NOOP}
   BUILD_COMMAND     ${CMAKE_NOOP}
   INSTALL_COMMAND   ${CMAKE_NOOP}
   URL               ${PICOJSON_URL}
   URL_HASH          ${PICOJSON_HASH})
+
+
+# RapidJSON: JSON parser / serializer.
+# https://github.com/Tencent/rapidjson
+#####################################
+EXTERNAL(rapidjson ${RAPIDJSON_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+add_library(rapidjson INTERFACE)
+add_dependencies(rapidjson ${RAPIDJSON_TARGET})
+
+target_include_directories(
+    rapidjson INTERFACE
+    ${RAPIDJSON_ROOT}/include)
+
+ExternalProject_Add(
+  ${RAPIDJSON_TARGET}
+  PREFIX            ${RAPIDJSON_CMAKE_ROOT}
+  CONFIGURE_COMMAND ${CMAKE_NOOP}
+  BUILD_COMMAND     ${CMAKE_NOOP}
+  INSTALL_COMMAND   ${CMAKE_NOOP}
+  URL               ${RAPIDJSON_URL}
+  URL_HASH          ${RAPIDJSON_HASH})
 
 
 # NVML: NVIDIA Management Library.
@@ -505,58 +564,72 @@ if (ENABLE_LIBEVENT)
   # libevent: An event notification library.
   # http://libevent.org/
   ##########################################
-  EXTERNAL(libevent ${LIBEVENT_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
-  add_library(libevent ${LIBRARY_LINKAGE} IMPORTED)
-  add_dependencies(libevent ${LIBEVENT_TARGET})
+  if (NOT UNBUNDLED_LIBEVENT)
+    EXTERNAL(libevent ${LIBEVENT_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+    add_library(libevent ${LIBRARY_LINKAGE} IMPORTED)
+    add_dependencies(libevent ${LIBEVENT_TARGET})
 
-  set_target_properties(
-    libevent PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES "${LIBEVENT_ROOT}/include;${LIBEVENT_ROOT}-build/include")
+    set_target_properties(
+      libevent PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${LIBEVENT_ROOT}/include;${LIBEVENT_ROOT}-build/include")
 
-  if (WIN32)
-    if (CMAKE_GENERATOR MATCHES "Visual Studio")
-      set_target_properties(
-        libevent PROPERTIES
-        IMPORTED_LOCATION_DEBUG ${LIBEVENT_ROOT}-build/lib/Debug/event${LIBRARY_SUFFIX}
-        IMPORTED_LOCATION_RELEASE ${LIBEVENT_ROOT}-build/lib/Release/event${LIBRARY_SUFFIX})
+    if (WIN32)
+      if (CMAKE_GENERATOR MATCHES "Visual Studio")
+        set_target_properties(
+          libevent PROPERTIES
+          IMPORTED_LOCATION_DEBUG ${LIBEVENT_ROOT}-build/lib/Debug/event${LIBRARY_SUFFIX}
+          IMPORTED_LOCATION_RELEASE ${LIBEVENT_ROOT}-build/lib/Release/event${LIBRARY_SUFFIX})
+      else ()
+        set_target_properties(
+          libevent PROPERTIES
+          IMPORTED_LOCATION ${LIBEVENT_ROOT}-build/lib/event${LIBRARY_SUFFIX})
+      endif ()
     else ()
       set_target_properties(
         libevent PROPERTIES
-        IMPORTED_LOCATION ${LIBEVENT_ROOT}-build/lib/event${LIBRARY_SUFFIX})
+        IMPORTED_LOCATION ${LIBEVENT_ROOT}-build/lib/libevent${LIBRARY_SUFFIX})
     endif ()
+
+    set(LIBEVENT_CMAKE_FORWARD_ARGS
+      ${CMAKE_C_FORWARD_ARGS}
+      ${CMAKE_SSL_FORWARD_ARGS}
+      # NOTE: Libevent does not respect the BUILD_SHARED_LIBS global flag.
+      -DEVENT__BUILD_SHARED_LIBRARIES=${BUILD_SHARED_LIBS}
+      -DEVENT__DISABLE_OPENSSL=$<NOT:$<BOOL:${ENABLE_SSL}>>
+      -DEVENT__DISABLE_BENCHMARK=ON
+      -DEVENT__DISABLE_REGRESS=ON
+      -DEVENT__DISABLE_SAMPLES=ON
+      -DEVENT__DISABLE_TESTS=ON)
+
+    if (CMAKE_C_COMPILER_ID MATCHES GNU OR CMAKE_C_COMPILER_ID MATCHES Clang)
+      list(APPEND LIBEVENT_CMAKE_FORWARD_ARGS -DCMAKE_C_FLAGS=-fPIC)
+    endif ()
+
+    MAKE_INCLUDE_DIR(libevent)
+    GET_BYPRODUCTS(libevent)
+
+    ExternalProject_Add(
+      ${LIBEVENT_TARGET}
+      PREFIX            ${LIBEVENT_CMAKE_ROOT}
+      BUILD_BYPRODUCTS  ${LIBEVENT_BYPRODUCTS}
+      CMAKE_ARGS        ${LIBEVENT_CMAKE_FORWARD_ARGS}
+      INSTALL_COMMAND   ${CMAKE_NOOP}
+      URL               ${LIBEVENT_URL}
+      URL_HASH          ${LIBEVENT_HASH})
   else ()
-    set_target_properties(
-      libevent PROPERTIES
-      IMPORTED_LOCATION ${LIBEVENT_ROOT}-build/lib/libevent${LIBRARY_SUFFIX})
+    find_package(LIBEVENT REQUIRED)
+    add_library(libevent INTERFACE)
+
+    foreach (lib ${LIBEVENT_LIBS})
+      get_filename_component(LIBEVENT_LIB ${lib} NAME_WE)
+      add_library(${LIBEVENT_LIB} SHARED IMPORTED)
+      set_target_properties(${LIBEVENT_LIB} PROPERTIES
+        IMPORTED_LOCATION ${lib}
+        INTERFACE_INCLUDE_DIRECTORIES ${LIBEVENT_INCLUDE_DIR})
+      target_link_libraries(libevent INTERFACE ${LIBEVENT_LIB})
+    endforeach ()
   endif ()
-
-  set(LIBEVENT_CMAKE_FORWARD_ARGS
-    ${CMAKE_C_FORWARD_ARGS}
-    ${CMAKE_SSL_FORWARD_ARGS}
-    # NOTE: Libevent does not respect the BUILD_SHARED_LIBS global flag.
-    -DEVENT__BUILD_SHARED_LIBRARIES=${BUILD_SHARED_LIBS}
-    -DEVENT__DISABLE_OPENSSL=$<NOT:$<BOOL:${ENABLE_SSL}>>
-    -DEVENT__DISABLE_BENCHMARK=ON
-    -DEVENT__DISABLE_REGRESS=ON
-    -DEVENT__DISABLE_SAMPLES=ON
-    -DEVENT__DISABLE_TESTS=ON)
-
-  if (CMAKE_C_COMPILER_ID MATCHES GNU OR CMAKE_C_COMPILER_ID MATCHES Clang)
-    list(APPEND LIBEVENT_CMAKE_FORWARD_ARGS -DCMAKE_C_FLAGS=-fPIC)
-  endif ()
-
-  MAKE_INCLUDE_DIR(libevent)
-  GET_BYPRODUCTS(libevent)
-
-  ExternalProject_Add(
-    ${LIBEVENT_TARGET}
-    PREFIX            ${LIBEVENT_CMAKE_ROOT}
-    BUILD_BYPRODUCTS  ${LIBEVENT_BYPRODUCTS}
-    CMAKE_ARGS        ${LIBEVENT_CMAKE_FORWARD_ARGS}
-    INSTALL_COMMAND   ${CMAKE_NOOP}
-    URL               ${LIBEVENT_URL}
-    URL_HASH          ${LIBEVENT_HASH})
-else ()
+elseif (NOT WIN32) # Windows defaults to `libwinio`, a native implementation.
   # libev: Full-featured high-performance event loop.
   # https://github.com/enki/libev
   ###################################################
@@ -585,6 +658,45 @@ else ()
     INSTALL_COMMAND   ${MAKE_PROGRAM} install
     URL               ${LIBEV_URL}
     URL_HASH          ${LIBEV_HASH})
+endif ()
+
+
+# libseccomp: library, which provides a front-end for generating seccomp filters.
+# https://github.com/seccomp/libseccomp
+##################################################
+if (ENABLE_SECCOMP_ISOLATOR)
+  if (NOT UNBUNDLED_LIBSECCOMP)
+    EXTERNAL(libseccomp ${LIBSECCOMP_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+    add_library(libseccomp STATIC IMPORTED GLOBAL)
+    add_dependencies(libseccomp ${LIBSECCOMP_TARGET})
+
+    set_target_properties(
+      libseccomp PROPERTIES
+      IMPORTED_LOCATION ${LIBSECCOMP_ROOT}-build/src/.libs/libseccomp.a
+      INTERFACE_INCLUDE_DIRECTORIES "${LIBSECCOMP_ROOT}/include")
+
+    set(
+      LIBSECCOMP_CONFIGURE_COMMAND
+      ${LIBSECCOMP_ROOT}/configure --disable-shared --prefix=${LIBSECCOMP_ROOT}-build)
+
+    MAKE_INCLUDE_DIR(libseccomp)
+    GET_BYPRODUCTS(libseccomp)
+
+    ExternalProject_Add(
+      ${LIBSECCOMP_TARGET}
+      PREFIX            ${LIBSECCOMP_CMAKE_ROOT}
+      BUILD_BYPRODUCTS  ${LIBSECCOMP_BYPRODUCTS}
+      CONFIGURE_COMMAND ${LIBSECCOMP_CONFIGURE_COMMAND}
+      INSTALL_COMMAND   ${CMAKE_NOOP}
+      URL               ${LIBSECCOMP_URL}
+      URL_HASH          ${LIBSECCOMP_HASH})
+  else ()
+    find_package(LIBSECCOMP REQUIRED)
+    add_library(libseccomp SHARED IMPORTED GLOBAL)
+    set_target_properties(libseccomp PROPERTIES
+      IMPORTED_LOCATION ${LIBSECCOMP_LIBS}
+      INTERFACE_INCLUDE_DIRECTORIES ${LIBSECCOMP_INCLUDE_DIR})
+  endif ()
 endif ()
 
 
@@ -625,7 +737,7 @@ if (WIN32)
     URL               ${LIBAPR_URL}
     URL_HASH          ${LIBAPR_HASH})
 else ()
-  find_package(Apr REQUIRED)
+  find_package(APR REQUIRED)
   add_library(apr SHARED IMPORTED)
 
   set_target_properties(
@@ -641,7 +753,7 @@ endif ()
 if (NOT WIN32)
   # NOTE: This does not use `FindSubversion` because it finds the `svn`
   # executable, but we're looking for the library.
-  find_package(Svn REQUIRED)
+  find_package(SVN REQUIRED)
   add_library(svn INTERFACE)
   target_include_directories(svn INTERFACE ${SVN_INCLUDE_DIR})
 
@@ -703,19 +815,22 @@ if (WIN32)
 
     set_target_properties(
       curl PROPERTIES
-      IMPORTED_LOCATION_DEBUG ${CURL_ROOT}-build/src/Debug/curl-d.exe
+      IMPORTED_LOCATION_DEBUG ${CURL_ROOT}-build/src/Debug/curl.exe
       IMPORTED_LOCATION_RELEASE ${CURL_ROOT}-build/src/Release/curl.exe)
   else ()
+    # This is for single-configuration generators such as Ninja.
+    if (CMAKE_BUILD_TYPE MATCHES Debug)
+      set(CURL_SUFFIX "-d")
+    endif ()
+
     set_target_properties(
       libcurl PROPERTIES
-      # TODO(andschwa): Use generator expression to remove `-d` in Release.
-      IMPORTED_LOCATION ${CURL_ROOT}-build/lib/libcurl-d${LIBRARY_SUFFIX}
+      IMPORTED_LOCATION ${CURL_ROOT}-build/lib/libcurl${CURL_SUFFIX}${LIBRARY_SUFFIX}
       IMPORTED_IMPLIB ${CURL_ROOT}-build/lib/libcurl_imp${CMAKE_IMPORT_LIBRARY_SUFFIX})
 
     set_target_properties(
       curl PROPERTIES
-      # TODO(andschwa): Use generator expression to remove `-d` in Release.
-      IMPORTED_LOCATION ${CURL_ROOT}-build/src/curl-d.exe)
+      IMPORTED_LOCATION ${CURL_ROOT}-build/src/curl.exe)
   endif ()
 
   MAKE_INCLUDE_DIR(libcurl)
@@ -735,8 +850,11 @@ if (WIN32)
   # This copies the file `curl.exe` from the `3rdparty` build folder to
   # `build/src`, next to the other produced executables. This is necessary for
   # code that shells out to cURL on Windows.
-  add_custom_command(TARGET ${CURL_TARGET} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:curl> ${CMAKE_BINARY_DIR}/src/curl.exe)
+  #
+  # TODO(andschwa): Change this to an `INSTALL` step.
+  ExternalProject_Add_Step(${CURL_TARGET} copy
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:curl> ${CMAKE_BINARY_DIR}/src/curl.exe
+    DEPENDEES build)
 else ()
   find_package(CURL REQUIRED)
   add_library(libcurl SHARED IMPORTED)
@@ -747,6 +865,130 @@ else ()
     INTERFACE_INCLUDE_DIRECTORIES ${CURL_INCLUDE_DIRS})
 endif ()
 
+
+# wclayer: Command line tool for manipulating Windows Container
+# storage layers.
+# https://github.com/Microsoft/hcsshim/blob/master/cmd/wclayer/wclayer.go
+#########################################################################
+if (WIN32)
+  EXTERNAL(wclayer WIP ${CMAKE_CURRENT_BINARY_DIR})
+
+  add_executable(wclayer IMPORTED GLOBAL)
+  add_dependencies(wclayer ${WCLAYER_TARGET})
+
+  # TODO(liazha): Change this to wherever you need it placed.
+  set(WCLAYER_PATH ${CMAKE_BINARY_DIR}/src/wclayer.exe)
+  set_target_properties(
+    wclayer PROPERTIES
+    IMPORTED_LOCATION ${WCLAYER_PATH})
+
+  set(WCLAYER_INSTALL_CMD ${CMAKE_COMMAND} -E copy ${WCLAYER_CMAKE_ROOT}/src/wclayer.exe ${WCLAYER_PATH})
+
+  GET_BYPRODUCTS(wclayer)
+
+  ExternalProject_Add(
+    ${WCLAYER_TARGET}
+    PREFIX              ${WCLAYER_CMAKE_ROOT}
+    BUILD_BYPRODUCTS    ${WCLAYER_BYPRODUCTS}
+    CONFIGURE_COMMAND   ${CMAKE_NOOP}
+    BUILD_COMMAND       ${CMAKE_NOOP}
+    INSTALL_COMMAND     ${WCLAYER_INSTALL_CMD}
+    DOWNLOAD_NO_EXTRACT FALSE
+    URL                 ${WCLAYER_URL})
+endif ()
+
+# bzip2: A high-quality data compressor.
+# http://www.bzip.org
+########################################
+if (WIN32)
+  EXTERNAL(bzip2 ${BZIP2_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+  add_library(bzip2 STATIC IMPORTED)
+  add_dependencies(bzip2 ${BZIP2_TARGET})
+
+  set_target_properties(
+    bzip2 PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${BZIP2_ROOT};${BZIP2_ROOT}-build")
+
+  if (CMAKE_GENERATOR MATCHES "Visual Studio")
+    set_target_properties(
+      bzip2 PROPERTIES
+      IMPORTED_LOCATION_DEBUG ${BZIP2_ROOT}-build/Debug/bzip2${BZIP2_SHARED}${LIBRARY_SUFFIX}
+      IMPORTED_LOCATION_RELEASE ${BZIP2_ROOT}-build/Release/bzip2${BZIP2_SHARED}${LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB_DEBUG ${BZIP2_ROOT}-build/Debug/bzip2${CMAKE_IMPORT_LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB_RELEASE ${BZIP2_ROOT}-build/Release/bzip2${CMAKE_IMPORT_LIBRARY_SUFFIX})
+  else ()
+    set_target_properties(
+      bzip2 PROPERTIES
+      IMPORTED_LOCATION ${BZIP2_ROOT}-build/bzip2${BZIP2_SHARED}${LIBRARY_SUFFIX})
+  endif ()
+
+  PATCH_CMD(BZIP2_PATCH_CMD bzip2-${BZIP2_VERSION}.patch)
+
+  MAKE_INCLUDE_DIR(bzip2)
+  GET_BYPRODUCTS(bzip2)
+
+  set(BZIP2_CMAKE_ARGS
+    ${CMAKE_FORWARD_ARGS}
+    ${CMAKE_C_FORWARD_ARGS}
+    -DBZIP2_INSTALL_DIR=${BZIP2_ROOT}-lib)
+
+  ExternalProject_Add(
+    ${BZIP2_TARGET}
+    PREFIX            ${BZIP2_CMAKE_ROOT}
+    BUILD_BYPRODUCTS  ${BZIP2_BYPRODUCTS}
+    PATCH_COMMAND     ${BZIP2_PATCH_CMD}
+    CMAKE_ARGS        ${BZIP2_CMAKE_ARGS}
+    INSTALL_DIR       ${BZIP2_ROOT}-lib
+    URL               ${BZIP2_URL}
+    URL_HASH          ${BZIP2_HASH})
+endif ()
+
+# xz: A Massively Spiffy Yet Delicately Unobtrusive Compression Library.
+# https://tukaani.org/xz/
+########################################################################
+if (WIN32)
+  EXTERNAL(xz ${XZ_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+  add_library(xz STATIC IMPORTED)
+  add_dependencies(xz ${XZ_TARGET})
+
+  set_target_properties(
+    xz PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${XZ_ROOT};${XZ_ROOT}-build")
+
+
+  if (CMAKE_GENERATOR MATCHES "Visual Studio")
+    set_target_properties(
+      xz PROPERTIES
+      IMPORTED_LOCATION_DEBUG ${XZ_ROOT}-build/Debug/lzma${XZ_SHARED}${LIBRARY_SUFFIX}
+      IMPORTED_LOCATION_RELEASE ${XZ_ROOT}-build/Release/lzma${XZ_SHARED}${LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB_DEBUG ${XZ_ROOT}-build/Debug/lzma${CMAKE_IMPORT_LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB_RELEASE ${XZ_ROOT}-build/Release/lzma${CMAKE_IMPORT_LIBRARY_SUFFIX})
+  else ()
+    set_target_properties(
+      xz PROPERTIES
+      IMPORTED_LOCATION ${XZ_ROOT}-build/lzma${CMAKE_IMPORT_LIBRARY_SUFFIX})
+  endif ()
+
+  PATCH_CMD(XZ_PATCH_CMD xz-${XZ_VERSION}.patch)
+
+  MAKE_INCLUDE_DIR(xz)
+  GET_BYPRODUCTS(xz)
+
+  set(XZ_CMAKE_ARGS
+    ${CMAKE_FORWARD_ARGS}
+    ${CMAKE_C_FORWARD_ARGS}
+    -DXZ_INSTALL_DIR=${XZ_ROOT}-lib)
+
+  ExternalProject_Add(
+    ${XZ_TARGET}
+    PREFIX            ${XZ_CMAKE_ROOT}
+    BUILD_BYPRODUCTS  ${XZ_BYPRODUCTS}
+    PATCH_COMMAND     ${XZ_PATCH_CMD}
+    CMAKE_ARGS        ${XZ_CMAKE_ARGS}
+    INSTALL_DIR       ${XZ_ROOT}-lib
+    URL               ${XZ_URL}
+    URL_HASH          ${XZ_HASH})
+endif ()
 
 # zlib: A Massively Spiffy Yet Delicately Unobtrusive Compression Library.
 # https://zlib.net
@@ -766,23 +1008,33 @@ if (WIN32)
     set(ZLIB_SHARED 1)
   endif ()
 
+  # NOTE: We install Zlib under `${ZLIB_ROOT}-lib` so CMake's `FindZLIB` module
+  # can find all required headers and library files.
+  set(ZLIB_CMAKE_ARGS
+    ${CMAKE_C_FORWARD_ARGS}
+    -DCMAKE_INSTALL_PREFIX=${ZLIB_ROOT}-lib)
+
   set_target_properties(
     zlib PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES "${ZLIB_ROOT};${ZLIB_ROOT}-build")
+    INTERFACE_INCLUDE_DIRECTORIES ${ZLIB_ROOT}-lib/include)
 
   if (CMAKE_GENERATOR MATCHES "Visual Studio")
     set_target_properties(
       zlib PROPERTIES
-      IMPORTED_LOCATION_DEBUG ${ZLIB_ROOT}-build/Debug/zlib${ZLIB_STATIC}d${ZLIB_SHARED}${LIBRARY_SUFFIX}
-      IMPORTED_LOCATION_RELEASE ${ZLIB_ROOT}-build/Release/zlib${ZLIB_STATIC}${ZLIB_SHARED}${LIBRARY_SUFFIX}
-      IMPORTED_IMPLIB_DEBUG ${ZLIB_ROOT}-build/Debug/zlib${ZLIB_STATIC}d${CMAKE_IMPORT_LIBRARY_SUFFIX}
-      IMPORTED_IMPLIB_RELEASE ${ZLIB_ROOT}-build/Release/zlib${ZLIB_STATIC}${CMAKE_IMPORT_LIBRARY_SUFFIX})
+      IMPORTED_LOCATION_DEBUG ${ZLIB_ROOT}-lib/lib/zlib${ZLIB_STATIC}d${ZLIB_SHARED}${LIBRARY_SUFFIX}
+      IMPORTED_LOCATION_RELEASE ${ZLIB_ROOT}-lib/lib/zlib${ZLIB_STATIC}${ZLIB_SHARED}${LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB_DEBUG ${ZLIB_ROOT}-lib/lib/zlib${ZLIB_STATIC}d${CMAKE_IMPORT_LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB_RELEASE ${ZLIB_ROOT}-lib/lib/zlib${ZLIB_STATIC}${CMAKE_IMPORT_LIBRARY_SUFFIX})
   else ()
+    # This is for single-configuration generators such as Ninja.
+    if (CMAKE_BUILD_TYPE MATCHES Debug)
+      set(ZLIB_SUFFIX "d")
+    endif ()
+
     set_target_properties(
       zlib PROPERTIES
-      # TODO(andschwa): Use generator expression to remove `d` in Release.
-      IMPORTED_LOCATION ${ZLIB_ROOT}-build/zlib${ZLIB_STATIC}d${ZLIB_SHARED}${LIBRARY_SUFFIX}
-      IMPORTED_IMPLIB ${ZLIB_ROOT}-build/zlib${ZLIB_STATIC}d${CMAKE_IMPORT_LIBRARY_SUFFIX})
+      IMPORTED_LOCATION ${ZLIB_ROOT}-lib/lib/zlib${ZLIB_STATIC}${ZLIB_SUFFIX}${ZLIB_SHARED}${LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB ${ZLIB_ROOT}-lib/lib/zlib${ZLIB_STATIC}${ZLIB_SUFFIX}${CMAKE_IMPORT_LIBRARY_SUFFIX})
   endif ()
 
   MAKE_INCLUDE_DIR(zlib)
@@ -792,8 +1044,8 @@ if (WIN32)
     ${ZLIB_TARGET}
     PREFIX            ${ZLIB_CMAKE_ROOT}
     BUILD_BYPRODUCTS  ${ZLIB_BYPRODUCTS}
-    CMAKE_ARGS        ${CMAKE_C_FORWARD_ARGS}
-    INSTALL_COMMAND   ${CMAKE_NOOP}
+    CMAKE_ARGS        ${ZLIB_CMAKE_ARGS}
+    INSTALL_DIR       ${ZLIB_ROOT}-lib
     URL               ${ZLIB_URL}
     URL_HASH          ${ZLIB_HASH})
 else ()
@@ -810,6 +1062,89 @@ set_target_properties(
   zlib PROPERTIES
   INTERFACE_COMPILE_DEFINITIONS HAVE_LIBZ)
 
+# libarchive: Multi-format archive and compression library.
+# https://github.com/libarchive/libarchive
+###########################################################
+if (NOT UNBUNDLED_LIBARCHIVE)
+  EXTERNAL(libarchive ${LIBARCHIVE_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+
+  add_library(libarchive STATIC IMPORTED GLOBAL)
+  add_dependencies(libarchive ${LIBARCHIVE_TARGET})
+
+  set(LIBARCHIVE_CMAKE_ARGS
+    ${CMAKE_FORWARD_ARGS}
+    ${CMAKE_C_FORWARD_ARGS}
+    -DENABLE_ACL=OFF
+    -DENABLE_CNG=OFF
+    -DENABLE_CPIO=OFF
+    -DENABLE_EXPAT=OFF
+    -DENABLE_ICONV=OFF
+    -DENABLE_LibGCC=OFF
+    -DENABLE_LIBXML2=OFF
+    -DENABLE_LZO=OFF
+    -DENABLE_NETTLE=OFF
+    -DENABLE_OPENSSL=OFF
+    -DENABLE_PCREPOSIX=OFF
+    -DENABLE_TEST=OFF
+    -DCMAKE_PREFIX_PATH=${ZLIB_ROOT}-lib@@${BZIP2_ROOT}-lib@@${XZ_ROOT}-lib
+    -DCMAKE_INSTALL_PREFIX=${LIBARCHIVE_ROOT}-build)
+
+  PATCH_CMD(LIBARCHIVE_PATCH_CMD libarchive-${LIBARCHIVE_VERSION}.patch)
+
+  # NOTE: On Windows, libarchive is linked against several compression
+  # libraries included in the build chain, such as bzip2, xz, and zlib.
+  # On other platforms, libarchive links to zlib only, as bzip2 and xz
+  # are not in the build chain.
+  if (WIN32)
+    set_target_properties(
+      libarchive PROPERTIES
+      INTERFACE_COMPILE_DEFINITIONS LIBARCHIVE_STATIC
+      # NOTE: The install step avoids the need for separate DEBUG and
+      # RELEASE paths.
+      IMPORTED_LOCATION ${LIBARCHIVE_ROOT}-build/lib/archive_static${LIBRARY_SUFFIX}
+      INTERFACE_INCLUDE_DIRECTORIES ${LIBARCHIVE_ROOT}-build/include
+      INTERFACE_LINK_LIBRARIES "bzip2;xz;zlib")
+    set(LIBARCHIVE_DEPENDS bzip2 xz zlib)
+
+    # Make libarchive link against the same zlib the rest of the build
+    # links to. This is necessary because the zlib project
+    # unconditionally builds both shared and static libraries, and we
+    # need to be consistent about which is linked.
+    list(APPEND LIBARCHIVE_CMAKE_ARGS
+      -DZLIB_LIBRARY=$<TARGET_FILE:zlib>)
+  else ()
+    list(APPEND LIBARCHIVE_CMAKE_ARGS
+      -DENABLE_BZip2=OFF
+      -DENABLE_LZMA=OFF)
+
+    set_target_properties(
+      libarchive PROPERTIES
+      IMPORTED_LOCATION ${LIBARCHIVE_ROOT}-build/lib/libarchive${CMAKE_STATIC_LIBRARY_SUFFIX}
+      INTERFACE_INCLUDE_DIRECTORIES ${LIBARCHIVE_ROOT}-build/include
+      INTERFACE_LINK_LIBRARIES "zlib")
+    set(LIBARCHIVE_DEPENDS zlib)
+  endif ()
+
+  MAKE_INCLUDE_DIR(libarchive)
+  GET_BYPRODUCTS(libarchive)
+
+  ExternalProject_Add(
+    ${LIBARCHIVE_TARGET}
+    DEPENDS           ${LIBARCHIVE_DEPENDS}
+    PREFIX            ${LIBARCHIVE_CMAKE_ROOT}
+    BUILD_BYPRODUCTS  ${LIBARCHIVE_BYPRODUCTS}
+    PATCH_COMMAND     ${LIBARCHIVE_PATCH_CMD}
+    LIST_SEPARATOR    @@
+    CMAKE_ARGS        ${LIBARCHIVE_CMAKE_ARGS}
+    URL               ${LIBARCHIVE_URL}
+    URL_HASH          ${LIBARCHIVE_HASH})
+else ()
+  find_package(LIBARCHIVE REQUIRED)
+  add_library(libarchive SHARED IMPORTED GLOBAL)
+  set_target_properties(libarchive PROPERTIES
+    IMPORTED_LOCATION ${LIBARCHIVE_LIBS}
+    INTERFACE_INCLUDE_DIRECTORIES ${LIBARCHIVE_INCLUDE_DIR})
+endif ()
 
 # Google Test: Google's C++ test framework (GoogleTest and GoogleMock).
 # https://github.com/google/googletest
@@ -836,10 +1171,15 @@ set_target_properties(
 set(GOOGLETEST_CMAKE_FORWARD_ARGS ${CMAKE_CXX_FORWARD_ARGS})
 
 if (WIN32)
+  set(GOOGLETEST_COMPILE_DEFINITIONS
+    # Silence deprecation warning in the interface of Google Test.
+    _SILENCE_TR1_NAMESPACE_DEPRECATION_WARNING
+    # Build in C++11 mode.
+    GTEST_LANG_CXX11=1)
+
   set_target_properties(
     gtest PROPERTIES
-    # Silence deprecation warning in the interface of Google Test.
-    INTERFACE_COMPILE_DEFINITIONS _SILENCE_TR1_NAMESPACE_DEPRECATION_WARNING)
+    INTERFACE_COMPILE_DEFINITIONS "${GOOGLETEST_COMPILE_DEFINITIONS}")
 
   if (CMAKE_GENERATOR MATCHES "Visual Studio")
     set_target_properties(
@@ -876,6 +1216,8 @@ else ()
     IMPORTED_LOCATION ${GOOGLETEST_ROOT}-build/googlemock/gtest/libgtest${CMAKE_STATIC_LIBRARY_SUFFIX})
 endif ()
 
+PATCH_CMD(GOOGLETEST_PATCH_CMD googletest-release-${GOOGLETEST_VERSION}.patch)
+
 MAKE_INCLUDE_DIR(gmock)
 MAKE_INCLUDE_DIR(gtest)
 GET_BYPRODUCTS(gmock)
@@ -892,6 +1234,7 @@ ExternalProject_Add(
   ${GOOGLETEST_TARGET}
   PREFIX            ${GOOGLETEST_CMAKE_ROOT}
   BUILD_BYPRODUCTS  ${GMOCK_BYPRODUCTS};${GTEST_BYPRODUCTS}
+  PATCH_COMMAND     ${GOOGLETEST_PATCH_CMD}
   CMAKE_ARGS        ${GOOGLETEST_CMAKE_FORWARD_ARGS}
   INSTALL_COMMAND   ${CMAKE_NOOP}
   URL               ${GOOGLETEST_URL}
@@ -935,10 +1278,14 @@ if (WIN32)
       IMPORTED_LOCATION_DEBUG ${PROTOBUF_ROOT}-build/Debug/protoc.exe
       IMPORTED_LOCATION_RELEASE ${PROTOBUF_ROOT}-build/Release/protoc.exe)
   else ()
+    # This is for single-configuration generators such as Ninja.
+    if (CMAKE_BUILD_TYPE MATCHES Debug)
+      set(PROTOBUF_SUFFIX "d")
+    endif ()
+
     set_target_properties(
       protobuf PROPERTIES
-      # TODO(andschwa): Use generator expression to remove `d` in Release.
-      IMPORTED_LOCATION ${PROTOBUF_ROOT}-build/libprotobufd${LIBRARY_SUFFIX})
+      IMPORTED_LOCATION ${PROTOBUF_ROOT}-build/libprotobuf${PROTOBUF_SUFFIX}${LIBRARY_SUFFIX})
 
     set_target_properties(
       protoc PROPERTIES
@@ -974,28 +1321,166 @@ ExternalProject_Add(
   URL_HASH          ${PROTOBUF_HASH})
 
 
+# gRPC: Google's high performance, open-source universal RPC framework.
+# https://grpc.io/
+#######################################################################
+EXTERNAL(grpc ${GRPC_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+
+add_library(libgpr ${LIBRARY_LINKAGE} IMPORTED)
+add_dependencies(libgpr ${GRPC_TARGET})
+add_library(libgrpc ${LIBRARY_LINKAGE} IMPORTED)
+add_dependencies(libgrpc ${GRPC_TARGET})
+add_library(libgrpc++ ${LIBRARY_LINKAGE} IMPORTED)
+add_dependencies(libgrpc++ ${GRPC_TARGET})
+
+add_library(grpc INTERFACE)
+target_link_libraries(grpc INTERFACE libgrpc++ libgrpc libgpr)
+
+# TODO(chhsiao): Move grpc so these don't have to be GLOBAL.
+add_executable(grpc_cpp_plugin IMPORTED GLOBAL)
+add_dependencies(grpc_cpp_plugin ${GRPC_TARGET})
+
+set(GRPC_CMAKE_ARGS
+  ${CMAKE_C_FORWARD_ARGS}
+  ${CMAKE_CXX_FORWARD_ARGS}
+  -DCMAKE_PREFIX_PATH=${PROTOBUF_ROOT}-build
+  -DgRPC_PROTOBUF_PROVIDER=package
+  -DgRPC_PROTOBUF_PACKAGE_TYPE=CONFIG
+  -DgRPC_ZLIB_PROVIDER=package)
+
+if (ENABLE_SSL)
+  set(GRPC_VARIANT "")
+  list(APPEND GRPC_CMAKE_ARGS -DgRPC_SSL_PROVIDER=package ${CMAKE_SSL_FORWARD_ARGS})
+else ()
+  set(GRPC_VARIANT "_unsecure")
+  list(APPEND GRPC_CMAKE_ARGS -DgRPC_SSL_PROVIDER=none)
+endif ()
+
+set(GRPC_BUILD_CMD
+  ${CMAKE_COMMAND} --build . --config $<CONFIG> --target gpr &&
+  ${CMAKE_COMMAND} --build . --config $<CONFIG> --target grpc${GRPC_VARIANT} &&
+  ${CMAKE_COMMAND} --build . --config $<CONFIG> --target grpc++${GRPC_VARIANT} &&
+  ${CMAKE_COMMAND} --build . --config $<CONFIG> --target grpc_cpp_plugin)
+
+set_target_properties(
+  grpc PROPERTIES
+  INTERFACE_INCLUDE_DIRECTORIES ${GRPC_ROOT}/include)
+
+PATCH_CMD(GRPC_PATCH_CMD grpc-${GRPC_VERSION}.patch)
+
+if (WIN32)
+  list(APPEND GRPC_CMAKE_ARGS -DZLIB_ROOT=${ZLIB_ROOT}-lib)
+
+  if (CMAKE_GENERATOR MATCHES "Visual Studio")
+    set_target_properties(
+      libgpr PROPERTIES
+      IMPORTED_LOCATION_DEBUG ${GRPC_ROOT}-build/Debug/gpr${LIBRARY_SUFFIX}
+      IMPORTED_LOCATION_RELEASE ${GRPC_ROOT}-build/Release/gpr${LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB_DEBUG ${GRPC_ROOT}-build/Debug/gpr${CMAKE_IMPORT_LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB_RELEASE ${GRPC_ROOT}-build/Release/gpr${CMAKE_IMPORT_LIBRARY_SUFFIX})
+
+    set_target_properties(
+      libgrpc PROPERTIES
+      IMPORTED_LOCATION_DEBUG ${GRPC_ROOT}-build/Debug/grpc${GRPC_VARIANT}${LIBRARY_SUFFIX}
+      IMPORTED_LOCATION_RELEASE ${GRPC_ROOT}-build/Release/grpc${GRPC_VARIANT}${LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB_DEBUG ${GRPC_ROOT}-build/Debug/grpc${GRPC_VARIANT}${CMAKE_IMPORT_LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB_RELEASE ${GRPC_ROOT}-build/Release/grpc${GRPC_VARIANT}${CMAKE_IMPORT_LIBRARY_SUFFIX})
+
+    set_target_properties(
+      libgrpc++ PROPERTIES
+      IMPORTED_LOCATION_DEBUG ${GRPC_ROOT}-build/Debug/grpc++${GRPC_VARIANT}${LIBRARY_SUFFIX}
+      IMPORTED_LOCATION_RELEASE ${GRPC_ROOT}-build/Release/grpc++${GRPC_VARIANT}${LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB_DEBUG ${GRPC_ROOT}-build/Debug/grpc++${GRPC_VARIANT}${CMAKE_IMPORT_LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB_RELEASE ${GRPC_ROOT}-build/Release/grpc++${GRPC_VARIANT}${CMAKE_IMPORT_LIBRARY_SUFFIX})
+
+    set_target_properties(
+      grpc_cpp_plugin PROPERTIES
+      IMPORTED_LOCATION_DEBUG ${GRPC_ROOT}-build/Debug/grpc_cpp_plugin.exe
+      IMPORTED_LOCATION_RELEASE ${GRPC_ROOT}-build/Release/grpc_cpp_plugin.exe)
+  else ()
+    set_target_properties(
+      libgpr PROPERTIES
+      IMPORTED_LOCATION ${GRPC_ROOT}-build/gpr${LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB ${GRPC_ROOT}-build/gpr${CMAKE_IMPORT_LIBRARY_SUFFIX})
+
+    set_target_properties(
+      libgrpc PROPERTIES
+      IMPORTED_LOCATION ${GRPC_ROOT}-build/grpc${GRPC_VARIANT}${LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB ${GRPC_ROOT}-build/grpc${GRPC_VARIANT}${CMAKE_IMPORT_LIBRARY_SUFFIX})
+
+    set_target_properties(
+      libgrpc++ PROPERTIES
+      IMPORTED_LOCATION ${GRPC_ROOT}-build/grpc++${GRPC_VARIANT}${LIBRARY_SUFFIX}
+      IMPORTED_IMPLIB ${GRPC_ROOT}-build/grpc++${GRPC_VARIANT}${CMAKE_IMPORT_LIBRARY_SUFFIX})
+
+    set_target_properties(
+      grpc_cpp_plugin PROPERTIES
+      IMPORTED_LOCATION ${GRPC_ROOT}-build/grpc_cpp_plugin.exe)
+  endif()
+else ()
+  set_target_properties(
+    libgpr PROPERTIES
+    IMPORTED_LOCATION ${GRPC_ROOT}-build/libgpr${LIBRARY_SUFFIX})
+
+  set_target_properties(
+    libgrpc PROPERTIES
+    IMPORTED_LOCATION ${GRPC_ROOT}-build/libgrpc${GRPC_VARIANT}${LIBRARY_SUFFIX})
+
+  set_target_properties(
+    libgrpc++ PROPERTIES
+    IMPORTED_LOCATION ${GRPC_ROOT}-build/libgrpc++${GRPC_VARIANT}${LIBRARY_SUFFIX})
+
+  set_target_properties(
+    grpc_cpp_plugin PROPERTIES
+    IMPORTED_LOCATION ${GRPC_ROOT}-build/grpc_cpp_plugin)
+endif ()
+
+MAKE_INCLUDE_DIR(grpc)
+GET_BYPRODUCTS(libgpr)
+GET_BYPRODUCTS(libgrpc)
+GET_BYPRODUCTS(libgrpc++)
+GET_BYPRODUCTS(grpc_cpp_plugin)
+
+ExternalProject_Add(
+  ${GRPC_TARGET}
+  DEPENDS          protobuf protoc zlib
+  PREFIX           ${GRPC_CMAKE_ROOT}
+  PATCH_COMMAND    ${GRPC_PATCH_CMD}
+  BUILD_BYPRODUCTS ${LIBGPR_BYPRODUCTS};${LIBGRPC_BYPRODUCTS};${LIBGRPC++_BYPRODUCTS};${GRPC_CPP_PLUGIN_BYPRODUCTS}
+  CMAKE_ARGS       ${GRPC_CMAKE_ARGS}
+  BUILD_COMMAND    ${GRPC_BUILD_CMD}
+  INSTALL_COMMAND  ${CMAKE_NOOP}
+  URL              ${GRPC_URL}
+  URL_HASH         ${GRPC_HASH})
+
+
 # Jemalloc: General-purpose malloc implementation.
 # http://jemalloc.net
 ##################################################
-EXTERNAL(jemalloc ${JEMALLOC_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
-add_library(jemalloc STATIC IMPORTED GLOBAL)
-add_dependencies(jemalloc ${JEMALLOC_TARGET})
+if (ENABLE_JEMALLOC_ALLOCATOR)
+  EXTERNAL(jemalloc ${JEMALLOC_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+  add_library(jemalloc STATIC IMPORTED GLOBAL)
+  add_dependencies(jemalloc ${JEMALLOC_TARGET})
 
-set_target_properties(
-  jemalloc PROPERTIES
-  IMPORTED_LOCATION ${JEMALLOC_ROOT}-build/lib/libjemalloc_pic${CMAKE_STATIC_LIBRARY_SUFFIX})
+  set_target_properties(
+    jemalloc PROPERTIES
+    IMPORTED_LOCATION ${JEMALLOC_ROOT}-build/lib/libjemalloc_pic${CMAKE_STATIC_LIBRARY_SUFFIX})
 
-set(
-  JEMALLOC_CONFIGURE_COMMAND
-  ${JEMALLOC_ROOT}/configure --enable-stats --enable-prof --with-malloc-conf=prof:true,prof_active:false)
+  set(
+    JEMALLOC_CONFIGURE_COMMAND
+    ${JEMALLOC_ROOT}/configure --enable-stats --enable-prof --with-malloc-conf=prof:true,prof_active:false)
 
-ExternalProject_Add(
-  ${JEMALLOC_TARGET}
-  PREFIX            ${JEMALLOC_CMAKE_ROOT}
-  CONFIGURE_COMMAND ${JEMALLOC_CONFIGURE_COMMAND}
-  INSTALL_COMMAND   ${CMAKE_NOOP}
-  URL               ${JEMALLOC_URL}
-  URL_HASH          ${JEMALLOC_HASH})
+  GET_BYPRODUCTS(jemalloc)
+
+  ExternalProject_Add(
+    ${JEMALLOC_TARGET}
+    PREFIX            ${JEMALLOC_CMAKE_ROOT}
+    BUILD_BYPRODUCTS  ${JEMALLOC_BYPRODUCTS}
+    CONFIGURE_COMMAND ${JEMALLOC_CONFIGURE_COMMAND}
+    INSTALL_COMMAND   ${CMAKE_NOOP}
+    URL               ${JEMALLOC_URL}
+    URL_HASH          ${JEMALLOC_HASH})
+endif ()
 
 
 # Apache ZooKeeper: C Client Library to ZooKeeper.
@@ -1068,32 +1553,43 @@ ExternalProject_Add(
 # https://github.com/google/leveldb
 ############################################
 if (NOT WIN32)
-  # TODO(andschwa): Move leveldb so these don't have to be GLOBAL.
-  EXTERNAL(leveldb ${LEVELDB_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
-  add_library(leveldb STATIC IMPORTED GLOBAL)
-  add_dependencies(leveldb ${LEVELDB_TARGET})
+  if (NOT UNBUNDLED_LEVELDB)
+    # TODO(andschwa): Move leveldb so these don't have to be GLOBAL.
+    EXTERNAL(leveldb ${LEVELDB_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+    add_library(leveldb STATIC IMPORTED GLOBAL)
+    add_dependencies(leveldb ${LEVELDB_TARGET})
 
-  set_target_properties(
-    leveldb PROPERTIES
-    IMPORTED_LOCATION ${LEVELDB_ROOT}/out-static/libleveldb${CMAKE_STATIC_LIBRARY_SUFFIX}
-    INTERFACE_INCLUDE_DIRECTORIES ${LEVELDB_ROOT}/include)
+    set_target_properties(
+      leveldb PROPERTIES
+      IMPORTED_LOCATION ${LEVELDB_ROOT}/out-static/libleveldb${CMAKE_STATIC_LIBRARY_SUFFIX}
+      INTERFACE_INCLUDE_DIRECTORIES ${LEVELDB_ROOT}/include)
 
-  PATCH_CMD(LEVELDB_PATCH_CMD leveldb-${LEVELDB_VERSION}.patch)
+    PATCH_CMD(LEVELDB_PATCH_CMD leveldb-${LEVELDB_VERSION}.patch)
 
-  MAKE_INCLUDE_DIR(leveldb)
-  GET_BYPRODUCTS(leveldb)
+    MAKE_INCLUDE_DIR(leveldb)
+    GET_BYPRODUCTS(leveldb)
 
-  ExternalProject_Add(
-    ${LEVELDB_TARGET}
-    PREFIX            ${LEVELDB_CMAKE_ROOT}
-    BUILD_BYPRODUCTS  ${LEVELDB_BYPRODUCTS}
-    PATCH_COMMAND     ${LEVELDB_PATCH_CMD}
-    CONFIGURE_COMMAND ${CMAKE_NOOP}
-    BUILD_IN_SOURCE   1
-    BUILD_COMMAND     ${MAKE_PROGRAM} OPT=-O2\ -DNDEBUG\ -fPIC all
-    INSTALL_COMMAND   ${CMAKE_NOOP}
-    URL               ${LEVELDB_URL}
-    URL_HASH          ${LEVELDB_HASH})
+    ExternalProject_Add(
+      ${LEVELDB_TARGET}
+      PREFIX            ${LEVELDB_CMAKE_ROOT}
+      BUILD_BYPRODUCTS  ${LEVELDB_BYPRODUCTS}
+      PATCH_COMMAND     ${LEVELDB_PATCH_CMD}
+      CONFIGURE_COMMAND ${CMAKE_NOOP}
+      BUILD_IN_SOURCE   1
+      BUILD_COMMAND     ${MAKE_PROGRAM} OPT=-O2\ -DNDEBUG\ -fPIC all
+      INSTALL_COMMAND   ${CMAKE_NOOP}
+      URL               ${LEVELDB_URL}
+      URL_HASH          ${LEVELDB_HASH})
+  else ()
+    find_package(LEVELDB REQUIRED)
+    # NOTE: We are linking leveldb dynamically to prevent us having to
+    # satisfy its default dependencies against gperftools' tcmalloc and
+    # snappy.
+    add_library(leveldb SHARED IMPORTED GLOBAL)
+    set_target_properties(leveldb PROPERTIES
+      IMPORTED_LOCATION ${LEVELDB_LIBS}
+      INTERFACE_INCLUDE_DIRECTORIES ${LEVELDB_INCLUDE_DIR})
+  endif ()
 endif ()
 
 

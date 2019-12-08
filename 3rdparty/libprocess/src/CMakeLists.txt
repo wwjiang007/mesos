@@ -27,60 +27,58 @@ endif ()
 set(PROCESS_SRC
   authenticator.cpp
   authenticator_manager.cpp
-  authenticator_manager.hpp
   clock.cpp
-  config.hpp
-  decoder.hpp
-  encoder.hpp
-  event_loop.hpp
-  event_queue.hpp
   firewall.cpp
-  gate.hpp
+  grpc.cpp
   gtest_constants.cpp
   help.cpp
   http.cpp
   http_proxy.cpp
-  http_proxy.hpp
   io.cpp
   latch.cpp
   logging.cpp
   memory_profiler.cpp
-  memory_profiler.hpp
   metrics/metrics.cpp
   mime.cpp
   pid.cpp
-  poll_socket.cpp
-  poll_socket.hpp
   process.cpp
-  process_reference.hpp
   profiler.cpp
   reap.cpp
-  run_queue.hpp
-  semaphore.hpp
   socket.cpp
-  socket_manager.hpp
   subprocess.cpp
-  time.cpp
-  timeseries.cpp)
+  time.cpp)
+
 
 if (WIN32)
   list(APPEND PROCESS_SRC
-    subprocess_windows.cpp)
+    windows/subprocess.cpp)
 else ()
   list(APPEND PROCESS_SRC
-    subprocess_posix.cpp)
+    posix/subprocess.cpp)
 endif ()
 
 if (ENABLE_LIBEVENT)
   list(APPEND PROCESS_SRC
-    libevent.hpp
-    libevent.cpp
-    libevent_poll.cpp)
+    posix/libevent/libevent.cpp
+    posix/libevent/libevent_poll.cpp)
+elseif (WIN32)
+  list(APPEND PROCESS_SRC
+    windows/event_loop.cpp
+    windows/libwinio.cpp)
 else ()
   list(APPEND PROCESS_SRC
-    libev.hpp
-    libev.cpp
-    libev_poll.cpp)
+    posix/libev/libev.cpp
+    posix/libev/libev_poll.cpp)
+endif ()
+
+if (WIN32 AND NOT ENABLE_LIBEVENT)
+  list(APPEND PROCESS_SRC
+    windows/io.cpp
+    windows/poll_socket.cpp)
+else ()
+  list(APPEND PROCESS_SRC
+    posix/io.cpp
+    posix/poll_socket.cpp)
 endif ()
 
 if (ENABLE_SSL)
@@ -92,7 +90,7 @@ if (ENABLE_SSL)
 
   if (ENABLE_LIBEVENT)
     list(APPEND PROCESS_SRC
-      libevent_ssl_socket.cpp)
+      posix/libevent/libevent_ssl_socket.cpp)
   endif ()
 endif ()
 
@@ -102,23 +100,22 @@ target_link_libraries(
   process PUBLIC
   stout
   http_parser
+  grpc
   $<$<BOOL:${ENABLE_SSL}>:OpenSSL::SSL>
   $<$<BOOL:${ENABLE_SSL}>:OpenSSL::Crypto>)
 
 target_link_libraries(
   process PRIVATE
   concurrentqueue
-  $<IF:$<BOOL:${ENABLE_LIBEVENT}>,libevent,libev>)
+  $<IF:$<BOOL:${ENABLE_LIBEVENT}>,libevent,$<$<NOT:$<PLATFORM_ID:Windows>>:libev>>)
 
 target_compile_definitions(
   process PRIVATE
+  $<$<AND:$<PLATFORM_ID:Windows>,$<NOT:$<BOOL:${ENABLE_LIBEVENT}>>>:ENABLE_LIBWINIO>
   $<$<BOOL:${ENABLE_LOCK_FREE_RUN_QUEUE}>:LOCK_FREE_RUN_QUEUE>
   $<$<BOOL:${ENABLE_LOCK_FREE_EVENT_QUEUE}>:LOCK_FREE_EVENT_QUEUE>
-  $<$<BOOL:${ENABLE_LAST_IN_FIRST_OUT_FIXED_SIZE_SEMAPHORE}>:LAST_IN_FIRST_OUT_FIXED_SIZE_SEMAPHORE>)
-
-if (LINUX)
-  target_compile_definitions(process PRIVATE LIBPROCESS_ALLOW_JEMALLOC)
-endif ()
+  $<$<BOOL:${ENABLE_LAST_IN_FIRST_OUT_FIXED_SIZE_SEMAPHORE}>:LAST_IN_FIRST_OUT_FIXED_SIZE_SEMAPHORE>
+  $<$<PLATFORM_ID:LINUX>:LIBPROCESS_ALLOW_JEMALLOC>)
 
 target_include_directories(process PUBLIC ../include)
 target_include_directories(process PRIVATE .)

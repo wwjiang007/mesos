@@ -47,8 +47,8 @@ BuildRequires: subversion-devel < 2.0
 BuildRequires: patch
 
 %if 0%{?el6}
-BuildRequires: devtoolset-3-gcc
-BuildRequires: devtoolset-3-gcc-c++
+BuildRequires: devtoolset-7-gcc
+BuildRequires: devtoolset-7-gcc-c++
 BuildRequires: epel-rpm-macros
 BuildRequires: libevent2-devel
 %define _with_xfs no
@@ -87,13 +87,15 @@ This package provides files for developing Mesos frameworks/modules.
 %setup -q
 
 %build
+%{!?el6:%define launcher_sealing --enable-launcher-sealing}
+
 %configure \
     --enable-optimize \
     --disable-python-dependency-install \
     --enable-install-module-dependencies \
+    %{launcher_sealing} \
     --enable-libevent \
     --enable-ssl \
-    --enable-grpc \
     --enable-hardening \
     --enable-xfs-disk-isolator=%{_with_xfs}
 
@@ -112,11 +114,11 @@ mkdir -p -m0755 %{buildroot}/%{_var}/log/%{name}
 mkdir -p -m0755 %{buildroot}/%{_var}/lib/%{name}
 
 echo zk://localhost:2181/mesos > %{buildroot}%{_sysconfdir}/mesos/zk
-echo %{_var}/log/%{name}       > %{buildroot}%{_sysconfdir}/mesos-master/work_dir
-echo %{_var}/log/%{name}       > %{buildroot}%{_sysconfdir}/mesos-slave/work_dir
+echo %{_var}/lib/%{name}       > %{buildroot}%{_sysconfdir}/mesos-master/work_dir
+echo %{_var}/lib/%{name}       > %{buildroot}%{_sysconfdir}/mesos-slave/work_dir
 echo 1                         > %{buildroot}%{_sysconfdir}/mesos-master/quorum
 
-install -m 0644 %{SOURCE1} %{buildroot}%{_bindir}/
+install -m 0755 %{SOURCE1} %{buildroot}%{_bindir}/
 install -m 0644 %{SOURCE2} %{SOURCE3} %{SOURCE4} %{buildroot}%{_sysconfdir}/default
 
 %if 0%{?el6}
@@ -160,10 +162,12 @@ install -m 0644 src/java/target/mesos-*.jar %{buildroot}%{_datadir}/java/
 ######################
 %files devel
 %doc LICENSE NOTICE
+%{_includedir}/csi/
+%{_includedir}/elfio/
 %{_includedir}/mesos/
 %{_includedir}/stout/
 %{_includedir}/process/
-%{_includedir}/elfio/
+%{_includedir}/rapidjson/
 %{_includedir}/picojson.h
 %{_libdir}/pkgconfig/%{name}.pc
 %{_libdir}/*.la

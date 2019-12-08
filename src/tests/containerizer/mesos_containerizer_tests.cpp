@@ -31,6 +31,7 @@
 #include <process/shared.hpp>
 
 #include <stout/net.hpp>
+#include <stout/path.hpp>
 #include <stout/strings.hpp>
 #include <stout/uuid.hpp>
 
@@ -43,6 +44,7 @@
 #include "slave/containerizer/mesos/containerizer.hpp"
 #include "slave/containerizer/mesos/launcher.hpp"
 
+#include "slave/containerizer/mesos/provisioner/backend.hpp"
 #include "slave/containerizer/mesos/provisioner/provisioner.hpp"
 
 #include "tests/environment.hpp"
@@ -58,6 +60,7 @@ using namespace process;
 
 using mesos::internal::master::Master;
 
+using mesos::internal::slave::Backend;
 using mesos::internal::slave::Containerizer;
 using mesos::internal::slave::executorEnvironment;
 using mesos::internal::slave::Fetcher;
@@ -234,14 +237,13 @@ TEST_F(MesosContainerizerTest, Destroy)
 
   AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
-  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
-  containerizer->destroy(containerId);
-
-  AWAIT_READY(wait);
-  ASSERT_SOME(wait.get());
-  ASSERT_TRUE(wait.get()->has_status());
-  EXPECT_WTERMSIG_EQ(SIGKILL, wait.get()->status());
+  AWAIT_READY(termination);
+  ASSERT_SOME(termination.get());
+  ASSERT_TRUE(termination.get()->has_status());
+  EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
 }
 
 
@@ -291,14 +293,13 @@ TEST_F(MesosContainerizerTest, StatusWithContainerID)
 
   EXPECT_EQ(containerId, status->container_id());
 
-  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
-  containerizer->destroy(containerId);
-
-  AWAIT_READY(wait);
-  ASSERT_SOME(wait.get());
-  ASSERT_TRUE(wait.get()->has_status());
-  EXPECT_WTERMSIG_EQ(SIGKILL, wait.get()->status());
+  AWAIT_READY(termination);
+  ASSERT_SOME(termination.get());
+  ASSERT_TRUE(termination.get()->has_status());
+  EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
 }
 
 
@@ -342,6 +343,7 @@ public:
         flags,
         true,
         fetcher.get(),
+        nullptr,
         std::move(launcher),
         provisioner->share(),
         isolators);
@@ -399,9 +401,6 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, ScriptSucceeds)
 
   // Check the preparation script actually ran.
   EXPECT_TRUE(os::exists(file));
-
-  // Destroy the container.
-  containerizer->destroy(containerId);
 }
 
 
@@ -446,9 +445,6 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, ScriptFails)
 
   // Check the preparation script actually ran.
   EXPECT_TRUE(os::exists(file));
-
-  // Destroy the container.
-  containerizer->destroy(containerId);
 }
 
 
@@ -505,9 +501,6 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, MultipleScripts)
 
   // Check the failing preparation script has actually ran.
   EXPECT_TRUE(os::exists(file2));
-
-  // Destroy the container.
-  containerizer->destroy(containerId);
 }
 
 
@@ -582,9 +575,6 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, ExecutorEnvironmentVariable)
   // Check the preparation script actually ran.
   EXPECT_TRUE(os::exists(file));
 
-  // Destroy the container.
-  containerizer->destroy(containerId);
-
   // Reset LIBPROCESS_IP if necessary.
   if (libprocessIP.isSome()) {
     os::setenv("LIBPROCESS_IP", libprocessIP.get());
@@ -657,7 +647,8 @@ TEST_F(MesosContainerizerExecuteTest, IoRedirection)
 
 // This test verified that the stdout and stderr files in the task's sandbox
 // are owned by the task user.
-TEST_F(MesosContainerizerExecuteTest, ROOT_SandboxFileOwnership)
+TEST_F(MesosContainerizerExecuteTest,
+       ROOT_UNPRIVILEGED_USER_SandboxFileOwnership)
 {
   slave::Flags flags;
   flags.launcher_dir = getLauncherDir();
@@ -673,10 +664,11 @@ TEST_F(MesosContainerizerExecuteTest, ROOT_SandboxFileOwnership)
   ContainerID containerId;
   containerId.set_value(id::UUID::random().toString());
 
-  const string user = "nobody";
+  Option<string> user = os::getenv("SUDO_USER");
+  ASSERT_SOME(user);
 
   ExecutorInfo executor = createExecutorInfo("executor", "exit 0");
-  executor.mutable_command()->set_user(user);
+  executor.mutable_command()->set_user(user.get());
 
   Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
@@ -687,7 +679,7 @@ TEST_F(MesosContainerizerExecuteTest, ROOT_SandboxFileOwnership)
   // Wait for the launch to complete.
   AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
-  Result<uid_t> uid = os::getuid(user);
+  Result<uid_t> uid = os::getuid(user.get());
   ASSERT_SOME(uid);
 
   // Verify that stdout is owned by the task user.
@@ -738,6 +730,7 @@ TEST_F(MesosContainerizerDestroyTest, DestroyWhileFetching)
       flags,
       true,
       &fetcher,
+      nullptr,
       launcher,
       provisioner->share(),
       vector<Owned<Isolator>>());
@@ -815,6 +808,7 @@ TEST_F(MesosContainerizerDestroyTest, DestroyWhilePreparing)
       flags,
       true,
       &fetcher,
+      nullptr,
       launcher,
       provisioner->share(),
       {Owned<Isolator>(isolator)});
@@ -942,6 +936,7 @@ TEST_F(MesosContainerizerProvisionerTest, ProvisionFailed)
       flags,
       true,
       &fetcher,
+      nullptr,
       launcher,
       Shared<Provisioner>(provisioner),
       vector<Owned<Isolator>>());
@@ -984,43 +979,81 @@ TEST_F(MesosContainerizerProvisionerTest, ProvisionFailed)
 
   AWAIT_FAILED(launch);
 
-  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
-  containerizer->destroy(containerId);
+  AWAIT_READY(termination);
+  ASSERT_SOME(termination.get());
 
-  AWAIT_READY(wait);
-  ASSERT_SOME(wait.get());
-
-  ContainerTermination termination = wait->get();
-
-  EXPECT_FALSE(termination.has_status());
+  EXPECT_FALSE(termination->get().has_status());
 }
 
 
-// This test verifies that there is no race (or leaked provisioned
-// directories) if the containerizer destroy a container while it
-// is provisioning an image.
-TEST_F(MesosContainerizerProvisionerTest, DestroyWhileProvisioning)
+class MockBackend : public Backend
+{
+public:
+  MockBackend() {}
+  ~MockBackend() override {}
+
+  MOCK_METHOD3(
+      provision,
+      Future<Option<vector<Path>>>(
+          const vector<string>&,
+          const string&,
+          const string&));
+
+  MOCK_METHOD2(
+      destroy,
+      Future<bool>(
+          const string&,
+          const string&));
+};
+
+
+// This test verifies that when the containerizer destroys a container while
+// provisioner backend is provisioning rootfs for the container, backend
+// destroy will not be invoked until backend provision finishes.
+TEST_F(
+    MesosContainerizerProvisionerTest,
+    ROOT_INTERNET_CURL_DestroyWhileProvisioning)
 {
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "posix";
+  flags.isolation = "docker/runtime";
+  flags.image_providers = "docker";
 
   Try<Launcher*> launcher_ = SubprocessLauncher::create(flags);
   ASSERT_SOME(launcher_);
 
   Owned<Launcher> launcher(new TestLauncher(Owned<Launcher>(launcher_.get())));
 
-  MockProvisioner* provisioner = new MockProvisioner();
+  const string provisionerDir = slave::paths::getProvisionerDir(flags.work_dir);
+  CHECK_SOME(os::mkdir(provisionerDir));
+  CHECK_SOME(os::realpath(provisionerDir));
 
   Future<Nothing> provision;
-  Promise<ProvisionInfo> promise;
+  Future<Nothing> destroy;
+  Promise<Option<vector<Path>>> promise;
 
-  EXPECT_CALL(*provisioner, provision(_, _))
+  MockBackend* backend = new MockBackend();
+  EXPECT_CALL(*backend, provision(_, _, _))
     .WillOnce(DoAll(FutureSatisfy(&provision),
                     Return(promise.future())));
 
-  EXPECT_CALL(*provisioner, destroy(_))
-    .WillOnce(Return(true));
+  EXPECT_CALL(*backend, destroy(_, _))
+    .WillOnce(DoAll(FutureSatisfy(&destroy),
+                    Return(true)));
+
+  hashmap<string, Owned<Backend>> backends =
+    {{"MockBackend", Owned<Backend>(backend)}};
+
+  Try<Owned<Provisioner>> provisioner = Provisioner::create(
+      flags,
+      provisionerDir,
+      "MockBackend",
+      backends);
+
+  ASSERT_SOME(provisioner);
 
   Fetcher fetcher(flags);
 
@@ -1028,8 +1061,9 @@ TEST_F(MesosContainerizerProvisionerTest, DestroyWhileProvisioning)
       flags,
       true,
       &fetcher,
+      nullptr,
       launcher,
-      Shared<Provisioner>(provisioner),
+      provisioner->share(),
       vector<Owned<Isolator>>());
 
   Owned<MesosContainerizer> containerizer(_containerizer.get());
@@ -1040,7 +1074,7 @@ TEST_F(MesosContainerizerProvisionerTest, DestroyWhileProvisioning)
   Image image;
   image.set_type(Image::DOCKER);
   Image::Docker dockerImage;
-  dockerImage.set_name(id::UUID::random().toString());
+  dockerImage.set_name("alpine");
   image.mutable_docker()->CopyFrom(dockerImage);
 
   ContainerInfo::MesosInfo mesosInfo;
@@ -1069,12 +1103,18 @@ TEST_F(MesosContainerizerProvisionerTest, DestroyWhileProvisioning)
 
   AWAIT_READY(provision);
 
+  // Destroying container in `PROVISIONING` state will discard the container
+  // launch immediately.
   containerizer->destroy(containerId);
 
-  ASSERT_TRUE(wait.isPending());
-  promise.set(ProvisionInfo{"rootfs", None()});
+  AWAIT_DISCARDED(launch);
 
-  AWAIT_FAILED(launch);
+  ASSERT_TRUE(destroy.isPending());
+  ASSERT_TRUE(wait.isPending());
+
+  promise.set(Option<vector<Path>>::none());
+
+  AWAIT_READY(destroy);
   AWAIT_READY(wait);
   ASSERT_SOME(wait.get());
 
@@ -1100,14 +1140,17 @@ TEST_F(MesosContainerizerProvisionerTest, IsolatorCleanupBeforePrepare)
   MockProvisioner* provisioner = new MockProvisioner();
 
   Future<Nothing> provision;
-  Promise<ProvisionInfo> promise;
+  Future<Nothing> destroy;
+  Promise<ProvisionInfo> provisionPromise;
+  Promise<bool> destroyPromise;
 
   EXPECT_CALL(*provisioner, provision(_, _))
     .WillOnce(DoAll(FutureSatisfy(&provision),
-                    Return(promise.future())));
+                    Return(provisionPromise.future())));
 
   EXPECT_CALL(*provisioner, destroy(_))
-    .WillOnce(Return(true));
+    .WillOnce(DoAll(FutureSatisfy(&destroy),
+                    Return(destroyPromise.future())));
 
   MockIsolator* isolator = new MockIsolator();
 
@@ -1120,6 +1163,7 @@ TEST_F(MesosContainerizerProvisionerTest, IsolatorCleanupBeforePrepare)
       flags,
       true,
       &fetcher,
+      nullptr,
       launcher,
       Shared<Provisioner>(provisioner),
       {Owned<Isolator>(isolator)});
@@ -1162,10 +1206,16 @@ TEST_F(MesosContainerizerProvisionerTest, IsolatorCleanupBeforePrepare)
 
   containerizer->destroy(containerId);
 
-  ASSERT_TRUE(wait.isPending());
-  promise.set(ProvisionInfo{"rootfs", None()});
+  AWAIT_READY(destroy);
 
-  AWAIT_FAILED(launch);
+  ASSERT_TRUE(wait.isPending());
+
+  provisionPromise.set(ProvisionInfo{"rootfs", None()});
+
+  AWAIT_DISCARDED(launch);
+
+  destroyPromise.set(true);
+
   AWAIT_READY(wait);
   ASSERT_SOME(wait.get());
 
@@ -1209,6 +1259,7 @@ TEST_F(MesosContainerizerDestroyTest, LauncherDestroyFailure)
       flags,
       true,
       &fetcher,
+      nullptr,
       launcher,
       provisioner->share(),
       vector<Owned<Isolator>>());
@@ -1239,12 +1290,11 @@ TEST_F(MesosContainerizerDestroyTest, LauncherDestroyFailure)
 
   AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
-  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
-
-  containerizer->destroy(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
   // The container destroy should fail.
-  AWAIT_FAILED(wait);
+  AWAIT_FAILED(termination);
 
   // We settle the clock here to ensure that the processing of
   // 'MesosContainerizerProcess::__destroy()' is complete and the
@@ -1339,13 +1389,12 @@ TEST_F(MesosLauncherStatusTest, ExecutorPIDTest)
       containerId,
       path::join(flags.launcher_dir, MESOS_CONTAINERIZER),
       vector<string>(),
-      Subprocess::FD(STDIN_FILENO),
-      Subprocess::FD(STDOUT_FILENO),
-      Subprocess::FD(STDERR_FILENO),
+      mesos::slave::ContainerIO(),
       nullptr,
       None(),
       None(),
-      None());
+      None(),
+      vector<int_fd>());
 
   ASSERT_SOME(forked);
 

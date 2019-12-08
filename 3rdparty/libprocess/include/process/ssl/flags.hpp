@@ -39,17 +39,21 @@ public:
   Option<std::string> cert_file;
   Option<std::string> key_file;
   bool verify_cert;
+  bool verify_server_cert;
   bool require_cert;
+  bool require_client_cert;
   bool verify_ipadd;
   unsigned int verification_depth;
   Option<std::string> ca_dir;
   Option<std::string> ca_file;
   std::string ciphers;
   std::string ecdh_curves;
+  std::string hostname_validation_scheme;
   bool enable_ssl_v3;
   bool enable_tls_v1_0;
   bool enable_tls_v1_1;
   bool enable_tls_v1_2;
+  bool enable_tls_v1_3;
 };
 
 

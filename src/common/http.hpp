@@ -36,7 +36,11 @@
 #include <stout/json.hpp>
 #include <stout/jsonify.hpp>
 #include <stout/protobuf.hpp>
+#include <stout/recordio.hpp>
 #include <stout/unreachable.hpp>
+#include <stout/uuid.hpp>
+
+#include "internal/evolve.hpp"
 
 // TODO(benh): Remove this once we get C++14 as an enum should have a
 // default hash.
@@ -76,8 +80,6 @@ constexpr char DEFAULT_BASIC_HTTP_AUTHENTICATEE[] = "basic";
 
 // Name of the default, JWT authenticator.
 constexpr char DEFAULT_JWT_HTTP_AUTHENTICATOR[] = "jwt";
-
-extern hashset<std::string> AUTHORIZABLE_ENDPOINTS;
 
 
 // Contains the media types corresponding to some of the "Content-*",
@@ -138,6 +140,69 @@ Try<Message> deserialize(
 bool streamingMediaType(ContentType contentType);
 
 
+// Represents the streaming HTTP connection to a client, such as a framework,
+// executor, or operator subscribed to the '/api/vX' endpoint.
+// The `Event` template is the evolved message being sent to the client,
+// e.g. `v1::scheduler::Event`, `v1::master::Event`, or `v1::executor::Event`.
+template <typename Event>
+struct StreamingHttpConnection
+{
+  StreamingHttpConnection(
+      const process::http::Pipe::Writer& _writer,
+      ContentType _contentType,
+      id::UUID _streamId = id::UUID::random())
+    : writer(_writer),
+      contentType(_contentType),
+      streamId(_streamId) {}
+
+  template <typename Message>
+  bool send(const Message& message)
+  {
+    // TODO(bmahler): Remove this evolve(). Could we still
+    // somehow assert that evolve(message) produces a result
+    // of type Event without calling evolve()?
+    Event e = evolve(message);
+
+    std::string record = serialize(contentType, e);
+
+    return writer.write(::recordio::encode(record));
+  }
+
+  // Like the above send, but for already serialized data.
+  bool send(const std::string& event)
+  {
+    return writer.write(::recordio::encode(event));
+  }
+
+  bool close()
+  {
+    return writer.close();
+  }
+
+  process::Future<Nothing> closed() const
+  {
+    return writer.readerClosed();
+  }
+
+  process::http::Pipe::Writer writer;
+  ContentType contentType;
+  id::UUID streamId;
+};
+
+
+// The representation of generic v0 protobuf => v1 protobuf as JSON,
+// e.g., `jsonify(asV1Protobuf(message))`.
+//
+// Specifically, this acts the same as JSON::Protobuf, except that
+// it remaps "slave" to "agent" in field names and enum values.
+struct asV1Protobuf : Representation<google::protobuf::Message>
+{
+  using Representation<google::protobuf::Message>::Representation;
+};
+
+void json(JSON::ObjectWriter* writer, const asV1Protobuf& protobuf);
+
+
 JSON::Object model(const Resources& resources);
 JSON::Object model(const hashmap<std::string, Resources>& roleResources);
 JSON::Object model(const Attributes& attributes);
@@ -146,7 +211,6 @@ JSON::Object model(const ExecutorInfo& executorInfo);
 JSON::Array model(const Labels& labels);
 JSON::Object model(const Task& task);
 JSON::Object model(const FileInfo& fileInfo);
-JSON::Object model(const quota::QuotaInfo& quotaInfo);
 
 void json(JSON::ObjectWriter* writer, const Task& task);
 
@@ -154,32 +218,33 @@ void json(JSON::ObjectWriter* writer, const Task& task);
 
 void json(JSON::ObjectWriter* writer, const Attributes& attributes);
 void json(JSON::ObjectWriter* writer, const CommandInfo& command);
+void json(JSON::ObjectWriter* writer, const DomainInfo& domainInfo);
 void json(JSON::ObjectWriter* writer, const ExecutorInfo& executorInfo);
+void json(
+    JSON::StringWriter* writer, const FrameworkInfo::Capability& capability);
 void json(JSON::ArrayWriter* writer, const Labels& labels);
+void json(JSON::ObjectWriter* writer, const MasterInfo& info);
+void json(
+    JSON::StringWriter* writer, const MasterInfo::Capability& capability);
+void json(JSON::ObjectWriter* writer, const Offer& offer);
 void json(JSON::ObjectWriter* writer, const Resources& resources);
+void json(
+    JSON::ObjectWriter* writer,
+    const google::protobuf::RepeatedPtrField<Resource>& resources);
+void json(JSON::ObjectWriter* writer, const ResourceQuantities& quantities);
+void json(JSON::ObjectWriter* writer, const ResourceLimits& limits);
+void json(JSON::ObjectWriter* writer, const SlaveInfo& slaveInfo);
+void json(
+    JSON::StringWriter* writer, const SlaveInfo::Capability& capability);
 void json(JSON::ObjectWriter* writer, const Task& task);
 void json(JSON::ObjectWriter* writer, const TaskStatus& status);
-void json(JSON::ObjectWriter* writer, const DomainInfo& domainInfo);
-
-namespace authorization {
-
-// Creates a subject for authorization purposes when given an authenticated
-// principal. This function accepts and returns an `Option` to make call sites
-// cleaner, since it is possible that `principal` will be `NONE`.
-const Option<authorization::Subject> createSubject(
-    const Option<process::http::authentication::Principal>& principal);
-
-} // namespace authorization {
-
-const process::http::authorization::AuthorizationCallbacks
-  createAuthorizationCallbacks(Authorizer* authorizer);
 
 
 // Implementation of the `ObjectApprover` interface authorizing all objects.
 class AcceptingObjectApprover : public ObjectApprover
 {
 public:
-  virtual Try<bool> approved(
+  Try<bool> approved(
       const Option<ObjectApprover::Object>& object) const noexcept override
   {
     return true;
@@ -199,10 +264,7 @@ public:
   bool approved(const Args&... args)
   {
     if (!approvers.contains(action)) {
-      LOG(WARNING) << "Attempted to authorize "
-                   << (principal.isSome()
-                       ? "'" + stringify(principal.get()) + "'"
-                       : "")
+      LOG(WARNING) << "Attempted to authorize " << principal
                    << " for unexpected action " << stringify(action);
       return false;
     }
@@ -212,10 +274,7 @@ public:
 
     if (approved.isError()) {
       // TODO(joerg84): Expose these errors back to the caller.
-      LOG(WARNING) << "Failed to authorize principal "
-                   << (principal.isSome()
-                       ? "'" + stringify(principal.get()) + "' "
-                       : "")
+      LOG(WARNING) << "Failed to authorize principal " << principal
                    << "for action " << stringify(action) << ": "
                    << approved.error();
       return false;
@@ -230,10 +289,14 @@ private:
           authorization::Action,
           process::Owned<ObjectApprover>>&& _approvers,
       const Option<process::http::authentication::Principal>& _principal)
-    : approvers(std::move(_approvers)), principal(_principal) {}
+    : approvers(std::move(_approvers)),
+      principal(_principal.isSome()
+          ? "'" + stringify(_principal.get()) + "'"
+          : "")
+    {}
 
   hashmap<authorization::Action, process::Owned<ObjectApprover>> approvers;
-  Option<process::http::authentication::Principal> principal;
+  const std::string principal; // Only used for logging.
 };
 
 
@@ -334,6 +397,17 @@ Try<Nothing> initializeHttpAuthenticators(
 // Logs the request. Route handlers can compose this with the
 // desired request handler to get consistent request logging.
 void logRequest(const process::http::Request& request);
+
+
+// Log the response for the corresponding request together with the request
+// processing time. Route handlers can compose this with the desired request
+// handler to get consistent request/response logging.
+//
+// TODO(alexr): Consider taking `response` as a future to allow logging for
+// cases when response has not been generated.
+void logResponse(
+    const process::http::Request& request,
+    const process::http::Response& response);
 
 } // namespace mesos {
 

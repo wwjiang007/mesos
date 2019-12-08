@@ -96,9 +96,9 @@ public:
   OfferEqMatcher(int _cpus, int _mem)
     : cpus(_cpus), mem(_mem) {}
 
-  virtual bool MatchAndExplain(
+  bool MatchAndExplain(
       const vector<Offer>& offers,
-      ::testing::MatchResultListener* listener) const
+      ::testing::MatchResultListener* listener) const override
   {
     double totalCpus = 0;
     double totalMem = 0;
@@ -122,12 +122,12 @@ public:
     return matches;
   }
 
-  virtual void DescribeTo(::std::ostream* os) const
+  void DescribeTo(::std::ostream* os) const override
   {
     *os << "contains " << cpus << " cpus and " << mem << " mem";
   }
 
-  virtual void DescribeNegationTo(::std::ostream* os) const
+  void DescribeNegationTo(::std::ostream* os) const override
   {
     *os << "does not contain " << cpus << " cpus and " << mem << " mem";
   }
@@ -164,7 +164,7 @@ TYPED_TEST(MasterAllocatorTest, SingleFramework)
 {
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   Try<Owned<cluster::Master>> master = this->StartMaster(&allocator);
   ASSERT_SOME(master);
@@ -214,7 +214,7 @@ TYPED_TEST(MasterAllocatorTest, ResourcesUnused)
 
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   Try<Owned<cluster::Master>> master = this->StartMaster(&allocator);
   ASSERT_SOME(master);
@@ -257,7 +257,7 @@ TYPED_TEST(MasterAllocatorTest, ResourcesUnused)
     .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, 1, 512, "*"));
 
   Future<Nothing> recoverResources;
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillOnce(DoAll(InvokeRecoverResources(&allocator),
                     FutureSatisfy(&recoverResources)));
 
@@ -300,7 +300,7 @@ TYPED_TEST(MasterAllocatorTest, ResourcesUnused)
   AWAIT_READY(resourceOffers);
 
   // Shut everything down.
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillRepeatedly(DoDefault());
 
   Future<Nothing> shutdown;
@@ -324,7 +324,7 @@ TYPED_TEST(MasterAllocatorTest, OutOfOrderDispatch)
 {
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   Try<Owned<cluster::Master>> master = this->StartMaster(&allocator);
   ASSERT_SOME(master);
@@ -374,7 +374,7 @@ TYPED_TEST(MasterAllocatorTest, OutOfOrderDispatch)
   // framework has terminated or is inactive.
   Future<SlaveID> slaveId;
   Future<Resources> savedResources;
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     // "Catches" the recoverResources call from the master, so
     // that it doesn't get processed until we redispatch it after
     // the removeFramework trigger.
@@ -395,7 +395,7 @@ TYPED_TEST(MasterAllocatorTest, OutOfOrderDispatch)
   AWAIT_READY(slaveId);
   AWAIT_READY(savedResources);
 
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillOnce(DoDefault()); // For the re-dispatch.
 
   // Re-dispatch the recoverResources call which we "caught"
@@ -405,7 +405,8 @@ TYPED_TEST(MasterAllocatorTest, OutOfOrderDispatch)
       frameworkId1.get(),
       slaveId.get(),
       savedResources.get(),
-      None());
+      None(),
+      false);
 
   // TODO(benh): Seems like we should wait for the above
   // recoverResources to be executed.
@@ -435,7 +436,7 @@ TYPED_TEST(MasterAllocatorTest, OutOfOrderDispatch)
   AWAIT_READY(resourceOffers);
 
   // Called when driver2 stops.
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillRepeatedly(DoDefault());
   EXPECT_CALL(allocator, deactivateFramework(_))
     .WillRepeatedly(DoDefault());
@@ -455,7 +456,7 @@ TYPED_TEST(MasterAllocatorTest, SchedulerFailover)
 {
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   Try<Owned<cluster::Master>> master = this->StartMaster(&allocator);
   ASSERT_SOME(master);
@@ -510,7 +511,7 @@ TYPED_TEST(MasterAllocatorTest, SchedulerFailover)
 
   // We don't filter the unused resources to make sure that
   // they get offered to the framework as soon as it fails over.
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillOnce(InvokeRecoverResourcesWithFilters(&allocator, 0))
     // For subsequent offers.
     .WillRepeatedly(InvokeRecoverResourcesWithFilters(&allocator, 0));
@@ -569,7 +570,7 @@ TYPED_TEST(MasterAllocatorTest, SchedulerFailover)
     .Times(AtMost(1));
 
   // Shut everything down.
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillRepeatedly(DoDefault());
 
   EXPECT_CALL(allocator, deactivateFramework(_))
@@ -588,7 +589,7 @@ TYPED_TEST(MasterAllocatorTest, FrameworkExited)
 
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   master::Flags masterFlags = this->CreateMasterFlags();
   masterFlags.allocation_interval = Milliseconds(50);
@@ -645,7 +646,7 @@ TYPED_TEST(MasterAllocatorTest, FrameworkExited)
 
   // The framework does not use all the resources.
   Future<Nothing> recoverResources;
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillOnce(DoAll(InvokeRecoverResources(&allocator),
                     FutureSatisfy(&recoverResources)));
 
@@ -683,7 +684,7 @@ TYPED_TEST(MasterAllocatorTest, FrameworkExited)
 
   // The framework 2 does not use all the resources.
   Future<Nothing> recoverResources2;
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillOnce(DoAll(InvokeRecoverResources(&allocator),
                     FutureSatisfy(&recoverResources2)));
 
@@ -700,7 +701,7 @@ TYPED_TEST(MasterAllocatorTest, FrameworkExited)
 
   // Shutdown framework 1; framework 2 should then be offered the
   // resources that were consumed by framework 1.
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillRepeatedly(DoDefault());
 
   Future<Nothing> removeFramework;
@@ -749,7 +750,7 @@ TYPED_TEST(MasterAllocatorTest, SlaveLost)
 {
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   Try<Owned<cluster::Master>> master = this->StartMaster(&allocator);
   ASSERT_SOME(master);
@@ -785,7 +786,7 @@ TYPED_TEST(MasterAllocatorTest, SlaveLost)
     .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, 2, 512, "*"));
 
   Future<Nothing> recoverResources;
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillOnce(DoAll(InvokeRecoverResources(&allocator),
                     FutureSatisfy(&recoverResources)));
 
@@ -812,7 +813,7 @@ TYPED_TEST(MasterAllocatorTest, SlaveLost)
 
   // 'recoverResources' should be called twice, once for the task
   // and once for the executor.
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .Times(2);
 
   Future<Nothing> removeSlave;
@@ -855,7 +856,7 @@ TYPED_TEST(MasterAllocatorTest, SlaveLost)
                 DEFAULT_FRAMEWORK_INFO.roles(0)));
 
   // Shut everything down.
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillRepeatedly(DoDefault());
 
   driver.stop();
@@ -873,7 +874,7 @@ TYPED_TEST(MasterAllocatorTest, SlaveAdded)
 {
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   master::Flags masterFlags = this->CreateMasterFlags();
   masterFlags.allocation_interval = Milliseconds(50);
@@ -917,7 +918,7 @@ TYPED_TEST(MasterAllocatorTest, SlaveAdded)
   // on slave1 from the task launch won't get reoffered
   // immediately and will get combined with slave2's
   // resources for a single offer.
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillOnce(InvokeRecoverResourcesWithFilters(&allocator, 0.1))
     .WillRepeatedly(InvokeRecoverResourcesWithFilters(&allocator, 0));
 
@@ -955,7 +956,7 @@ TYPED_TEST(MasterAllocatorTest, SlaveAdded)
     .Times(AtMost(1));
 
   // Shut everything down.
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillRepeatedly(DoDefault());
 
   driver.stop();
@@ -969,7 +970,7 @@ TYPED_TEST(MasterAllocatorTest, TaskFinished)
 {
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   master::Flags masterFlags = this->CreateMasterFlags();
   masterFlags.allocation_interval = Milliseconds(50);
@@ -1017,7 +1018,7 @@ TYPED_TEST(MasterAllocatorTest, TaskFinished)
   // allocator knows about the unused resources so that it can
   // aggregate them with the resources from the finished task.
   Future<Nothing> recoverResources;
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillRepeatedly(DoAll(InvokeRecoverResources(&allocator),
                           FutureSatisfy(&recoverResources)));
 
@@ -1046,7 +1047,7 @@ TYPED_TEST(MasterAllocatorTest, TaskFinished)
   status.mutable_task_id()->MergeFrom(taskInfo.task_id());
   status.set_state(TASK_FINISHED);
 
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _));
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _));
 
   // After the first task gets killed.
   Future<Nothing> resourceOffers;
@@ -1061,7 +1062,7 @@ TYPED_TEST(MasterAllocatorTest, TaskFinished)
     .Times(AtMost(1));
 
   // Shut everything down.
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillRepeatedly(DoDefault());
 
   driver.stop();
@@ -1075,7 +1076,7 @@ TYPED_TEST(MasterAllocatorTest, CpusOnlyOfferedAndTaskLaunched)
 {
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   master::Flags masterFlags = this->CreateMasterFlags();
   masterFlags.allocation_interval = Milliseconds(50);
@@ -1158,7 +1159,7 @@ TYPED_TEST(MasterAllocatorTest, MemoryOnlyOfferedAndTaskLaunched)
 {
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   master::Flags masterFlags = this->CreateMasterFlags();
   masterFlags.allocation_interval = Milliseconds(50);
@@ -1235,6 +1236,112 @@ TYPED_TEST(MasterAllocatorTest, MemoryOnlyOfferedAndTaskLaunched)
 }
 
 
+// This test verifies that the allocator honors the `min_allocatable_resources`
+// flag and only offers resources that are more than at least one of the
+// specified resources quantities.
+TYPED_TEST(MasterAllocatorTest, MinAllocatableResources)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = this->CreateMasterFlags();
+  masterFlags.min_allocatable_resources =
+    "cpus:1;mem:100|disk:100|cpus:1;ports:10";
+
+  TestAllocator<TypeParam> allocator;
+
+  Try<Owned<cluster::Master>> master =
+    this->StartMaster(&allocator, masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  // Prevent agents from destruction until end of test.
+  vector<Owned<cluster::Slave>> slaves;
+
+  // Add agents with non-allocatable resources.
+  vector<string> nonAllocatableAgentResources = {
+    "cpus:1;mem:10;disk:10;ports:[1-5]",
+    "cpus:0.5;mem:100;disk:10;ports:[6-10]",
+    "cpus:0.5;mem:200;disk:10;ports:[11-15]",
+    "cpus:0.5;mem:10;disk:50;ports:[16-20]"};
+
+  foreach (const string& resourcesString, nonAllocatableAgentResources) {
+    Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+      FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+    slave::Flags flags = this->CreateSlaveFlags();
+    flags.resources = resourcesString;
+
+    Try<Owned<cluster::Slave>> slave = this->StartSlave(detector.get(), flags);
+    ASSERT_SOME(slave);
+
+    // Advance the clock to trigger agent registration.
+    Clock::advance(flags.registration_backoff_factor);
+    Clock::settle();
+
+    AWAIT_READY(slaveRegisteredMessage);
+
+    slaves.push_back(slave.get());
+  }
+
+  // Add agents with allocatable resources.
+  vector<string> allocatableAgentResources = {
+    "cpus:1;mem:100;disk:0;ports:[1-5]",    // contains `cpus:1;mem:100`
+    "cpus:0.5;mem:10;disk:100;ports:[1-5]", // contains `disk:100`
+    "cpus:1;mem:100;disk:50",               // contains `cpus:1;mem:100`
+    "cpus:1;mem:10;disk:10;ports:[1-10]",   // contains `cpus:1;ports:10`
+  };
+
+  hashset<SlaveID> allocatableAgents;
+  foreach (const string& resourcesString, allocatableAgentResources) {
+    Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+      FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+    slave::Flags flags = this->CreateSlaveFlags();
+    flags.resources = resourcesString;
+
+    Try<Owned<cluster::Slave>> slave = this->StartSlave(detector.get(), flags);
+    ASSERT_SOME(slave);
+
+    // Advance the clock to trigger agent registration.
+    Clock::advance(flags.registration_backoff_factor);
+    Clock::settle();
+
+    AWAIT_READY(slaveRegisteredMessage);
+
+    slaves.push_back(slave.get());
+    allocatableAgents.insert(slaveRegisteredMessage->slave_id());
+  }
+
+  // Add a framework. This will trigger an event-driven allocation.
+  // Since it is the only framework, it will get all offers.
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  driver.start();
+
+  AWAIT_READY(offers);
+
+  // All allocatable agents are offered. None of the non-allocatable
+  // agents should be offered.
+  EXPECT_EQ(offers->size(), allocatableAgents.size());
+
+  foreach (const Offer& offer, offers.get()) {
+    EXPECT_TRUE(allocatableAgents.count(offer.slave_id()) != 0);
+  }
+
+  driver.stop();
+  driver.join();
+}
+
+
 // Checks that changes to the whitelist are sent to the allocator.
 // The allocator whitelisting is tested in the allocator unit tests.
 // TODO(bmahler): Move this to a whitelist unit test.
@@ -1254,7 +1361,7 @@ TYPED_TEST(MasterAllocatorTest, Whitelist)
 
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   Future<Nothing> updateWhitelist1;
   EXPECT_CALL(allocator, updateWhitelist(Option<hashset<string>>(hosts)))
@@ -1293,7 +1400,7 @@ TYPED_TEST(MasterAllocatorTest, RoleTest)
 {
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   master::Flags masterFlags = this->CreateMasterFlags();
   masterFlags.roles = Some("role2");
@@ -1388,7 +1495,7 @@ TYPED_TEST(MasterAllocatorTest, FrameworkReregistersFirst)
   {
     TestAllocator<TypeParam> allocator;
 
-    EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+    EXPECT_CALL(allocator, initialize(_, _, _));
 
     Try<Owned<cluster::Master>> master = this->StartMaster(
         &allocator, masterFlags);
@@ -1415,7 +1522,7 @@ TYPED_TEST(MasterAllocatorTest, FrameworkReregistersFirst)
       .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, 1, 500, "*"))
       .WillRepeatedly(DeclineOffers());
 
-    EXPECT_CALL(allocator, recoverResources(_, _, _, _));
+    EXPECT_CALL(allocator, recoverResources(_, _, _, _, _));
 
     EXPECT_CALL(exec, registered(_, _, _, _));
 
@@ -1439,14 +1546,14 @@ TYPED_TEST(MasterAllocatorTest, FrameworkReregistersFirst)
     // that it doesn't try to retry the update after master failover.
     AWAIT_READY(_statusUpdateAcknowledgement);
 
-    EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+    EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
       .WillRepeatedly(DoDefault());
   }
 
   {
     TestAllocator<TypeParam> allocator2;
 
-    EXPECT_CALL(allocator2, initialize(_, _, _, _, _, _));
+    EXPECT_CALL(allocator2, initialize(_, _, _));
 
     Future<Nothing> addFramework;
     EXPECT_CALL(allocator2, addFramework(_, _, _, _, _))
@@ -1514,7 +1621,7 @@ TYPED_TEST(MasterAllocatorTest, SlaveReregistersFirst)
   {
     TestAllocator<TypeParam> allocator;
 
-    EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+    EXPECT_CALL(allocator, initialize(_, _, _));
 
     Try<Owned<cluster::Master>> master = this->StartMaster(&allocator);
 
@@ -1534,7 +1641,7 @@ TYPED_TEST(MasterAllocatorTest, SlaveReregistersFirst)
     ASSERT_SOME(slave);
 
     EXPECT_CALL(allocator, addFramework(_, _, _, _, _));
-    EXPECT_CALL(allocator, recoverResources(_, _, _, _));
+    EXPECT_CALL(allocator, recoverResources(_, _, _, _, _));
 
     EXPECT_CALL(sched, registered(&driver, _, _));
 
@@ -1566,14 +1673,14 @@ TYPED_TEST(MasterAllocatorTest, SlaveReregistersFirst)
     // that it doesn't try to retry the update after master failover.
     AWAIT_READY(_statusUpdateAcknowledgement);
 
-    EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+    EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
       .WillRepeatedly(DoDefault());
   }
 
   {
     TestAllocator<TypeParam> allocator2;
 
-    EXPECT_CALL(allocator2, initialize(_, _, _, _, _, _));
+    EXPECT_CALL(allocator2, initialize(_, _, _));
 
     Future<Nothing> addSlave;
     EXPECT_CALL(allocator2, addSlave(_, _, _, _, _, _))
@@ -1640,7 +1747,7 @@ TYPED_TEST(MasterAllocatorTest, RebalancedForUpdatedWeights)
 
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   // Start Mesos master.
   master::Flags masterFlags = this->CreateMasterFlags();
@@ -1742,7 +1849,7 @@ TYPED_TEST(MasterAllocatorTest, RebalancedForUpdatedWeights)
   EXPECT_CALL(sched1, offerRescinded(&driver1, _)).Times(3);
 
   Future<Resources> recoverResources1, recoverResources2, recoverResources3;
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillOnce(DoAll(FutureArg<2>(&recoverResources1),
                     InvokeRecoverResources(&allocator)))
     .WillOnce(DoAll(FutureArg<2>(&recoverResources2),
@@ -1834,7 +1941,7 @@ TYPED_TEST(MasterAllocatorTest, NestedRoles)
 
   TestAllocator<TypeParam> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   master::Flags masterFlags = this->CreateMasterFlags();
   Try<Owned<cluster::Master>> master =

@@ -20,6 +20,8 @@
 #include <sys/types.h>
 #endif
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib> // For rand.
 #include <list>
 #include <map>
@@ -44,11 +46,16 @@
 #include <stout/try.hpp>
 #include <stout/uuid.hpp>
 
+#if defined(__WINDOWS__)
+#include <stout/windows.hpp>
+#endif
+
 #include <stout/os/environment.hpp>
 #include <stout/os/int_fd.hpp>
 #include <stout/os/kill.hpp>
 #include <stout/os/killtree.hpp>
 #include <stout/os/realpath.hpp>
+#include <stout/os/shell.hpp>
 #include <stout/os/stat.hpp>
 #include <stout/os/which.hpp>
 #include <stout/os/write.hpp>
@@ -57,12 +64,16 @@
 #include <stout/os/sysctl.hpp>
 #endif
 
+#if defined(__WINDOWS__)
+#include <stout/os/shell.hpp>
+#endif
+
 #include <stout/tests/utils.hpp>
 
-#ifndef __WINDOWS__
+#if !defined(__WINDOWS__)
 using os::Exec;
-#endif // __WINDOWS__
 using os::Fork;
+#endif // __WINDOWS__
 using os::Process;
 using os::ProcessTree;
 
@@ -73,33 +84,80 @@ using std::set;
 using std::string;
 using std::vector;
 
+#if defined(__WINDOWS__)
+// NOTE: These are used to partially implement tests which otherwise
+// relied on `os::Exec` and `os::Fork`.
+using ::internal::windows::ProcessData;
+
+ProcessData windows_fork()
+{
+  // This will unfortunately generate some output.
+  Try<ProcessData> process_data = ::internal::windows::create_process(
+      "", {"ping.exe", "127.0.0.1", "-n", "10"}, None());
+  CHECK_SOME(process_data);
+  return process_data.get();
+}
+
+void windows_kill(const ProcessData& p)
+{
+  CHECK_EQ(TRUE, ::TerminateProcess(p.process_handle.get_handle(), 0));
+  CHECK_EQ(
+      WAIT_OBJECT_0, ::WaitForSingleObject(p.process_handle.get_handle(), 500));
+}
+#endif
 
 class OsTest : public TemporaryDirectoryTest {};
 
 
-#ifndef __WINDOWS__
 TEST_F(OsTest, Environment)
 {
   // Make sure the environment has some entries with '=' in the value.
   os::setenv("SOME_SPECIAL_FLAG", "--flag=foobar");
 
-  char** environ = os::raw::environment();
+#ifndef __WINDOWS__
+  char** raw_environ = os::raw::environment();
+#else
+  std::vector<string> raw_environ;
+  const std::unique_ptr<wchar_t[], decltype(&::FreeEnvironmentStringsW)> env(
+      ::GetEnvironmentStringsW(), &::FreeEnvironmentStringsW);
+
+  for (size_t i = 0; env[i] != L'\0' && env[i + 1] != L'\0';
+       /* incremented below */) {
+    std::wstring entry(&env[i]);
+
+    // Increment past the current environment string and null terminator.
+    i = i + entry.size() + 1;
+
+    size_t position = entry.find_first_of(L'=');
+    if (position == std::string::npos) {
+      continue; // Skip malformed environment entries.
+    }
+
+    raw_environ.push_back(stringify(entry.substr(0)));
+  }
+#endif // __WINDOWS__
 
   hashmap<string, string> environment = os::environment();
 
-  for (size_t index = 0; environ[index] != nullptr; index++) {
-    string entry(environ[index]);
-    size_t position = entry.find_first_of('=');
+#ifndef __WINDOWS__
+  for (size_t index = 0; raw_environ[index] != nullptr; index++) {
+#else
+  for (size_t index = 0; index < raw_environ.size(); index++) {
+#endif // __WINDOWS__
+    string entry(raw_environ[index]);
+    // In practice, sometimes the key starts with `=` even though it
+    // is not supposed to. If we don't skip it, we get an empty key.
+    size_t position = entry.find_first_of('=', 1);
     if (position == string::npos) {
       continue; // Skip malformed environment entries.
     }
+
     const string key = entry.substr(0, position);
     const string value = entry.substr(position + 1);
     EXPECT_TRUE(environment.contains(key));
     EXPECT_EQ(value, environment[key]);
   }
 }
-#endif // __WINDOWS__
 
 
 TEST_F(OsTest, TrivialEnvironment)
@@ -156,8 +214,14 @@ TEST_F(OsTest, System)
 }
 
 
-// NOTE: Disabled because `os::cloexec` is not implemented on Windows.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(OsTest, Cloexec)
+// NOTE: `os::cloexec` is a stub on Windows that returns `true`.
+#ifdef __WINDOWS__
+TEST_F(OsTest, Cloexec)
+{
+  ASSERT_SOME_TRUE(os::isCloexec(int_fd(INVALID_HANDLE_VALUE)));
+}
+#else
+TEST_F(OsTest, Cloexec)
 {
   Try<int_fd> fd = os::open(
       "cloexec",
@@ -185,10 +249,36 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(OsTest, Cloexec)
 
   close(fd.get());
 }
+#endif // __WINDOWS__
 
 
-// NOTE: Disabled because `os::nonblock` doesn't exist on Windows.
-#ifndef __WINDOWS__
+// NOTE: `os::isNonblock` is a stub on Windows that returns `true`.
+#ifdef __WINDOWS__
+TEST_F(OsTest, Nonblock)
+{
+  // `os::isNonblock` is a stub on Windows that returns `true`.
+  EXPECT_SOME_TRUE(os::isNonblock(int_fd(INVALID_HANDLE_VALUE)));
+
+  // `os::nonblock` is a no-op for handles.
+  EXPECT_SOME(os::nonblock(int_fd(INVALID_HANDLE_VALUE)));
+
+  // `os::nonblock` should fail for an invalid socket.
+  EXPECT_ERROR(os::nonblock(int_fd(INVALID_SOCKET)));
+
+  // NOTE: There is no way on Windows to check if the socket is in
+  // blocking or non-blocking mode, so `os::isNonblock` is a stub. A
+  // Windows socket always starts in blocking mode, and then can be
+  // set as non-blocking. All we can check here is that `os::nonblock`
+  // does not fail on a valid socket.
+  ASSERT_TRUE(net::wsa_initialize());
+  Try<int_fd> socket =
+    net::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP, WSA_FLAG_NO_HANDLE_INHERIT);
+  ASSERT_SOME(socket);
+  EXPECT_SOME(os::nonblock(socket.get()));
+  EXPECT_SOME(os::close(socket.get()));
+  ASSERT_TRUE(net::wsa_cleanup());
+}
+#else
 TEST_F(OsTest, Nonblock)
 {
   int pipes[2];
@@ -263,23 +353,24 @@ TEST_F(OsTest, BootId)
   Try<string> read = os::read("/proc/sys/kernel/random/boot_id");
   ASSERT_SOME(read);
   EXPECT_EQ(bootId.get(), strings::trim(read.get()));
-#elif defined(__APPLE__) || defined(__FreeBSD__)
-  // For OS X and FreeBSD systems, the boot id is the system boot time in
-  // seconds, so assert it can be numified and is a reasonable value.
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__WINDOWS__)
+  // For OS X, FreeBSD, and Windows systems, the boot id is the system
+  // boot time in seconds, so assert it can be numified and is a
+  // reasonable value.
   Try<uint64_t> numified = numify<uint64_t>(bootId.get());
   ASSERT_SOME(numified);
-
-  timeval time;
-  gettimeofday(&time, nullptr);
   EXPECT_GT(Seconds(numified.get()), Seconds(0));
-  EXPECT_LT(Seconds(numified.get()), Seconds(time.tv_sec));
-#endif
+
+  using namespace std::chrono;
+  EXPECT_LT(
+      Seconds(numified.get()),
+      Seconds(duration_cast<seconds>(system_clock::now().time_since_epoch())
+                .count()));
+#endif // APPLE / FreeBSD / WINDOWS
 }
 
 
-// TODO(hausdorff): Enable test on Windows after we fix. The test hangs. See
-// MESOS-3441.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(OsTest, Sleep)
+TEST_F(OsTest, Sleep)
 {
   Duration duration = Milliseconds(10);
   Stopwatch stopwatch;
@@ -343,8 +434,6 @@ TEST_F(OsTest, Sysctl)
 #endif // __APPLE__ || __FreeBSD__
 
 
-// TODO(hausdorff): Enable when we implement `Fork` and `Exec`. See MESOS-3638.
-#ifndef __WINDOWS__
 TEST_F(OsTest, Children)
 {
   Try<set<pid_t>> children = os::children(getpid());
@@ -352,6 +441,7 @@ TEST_F(OsTest, Children)
   ASSERT_SOME(children);
   EXPECT_TRUE(children->empty());
 
+#ifndef __WINDOWS__
   Try<ProcessTree> tree =
     Fork(None(),                   // Child.
          Fork(Exec(SLEEP_COMMAND(10))),   // Grandchild.
@@ -362,19 +452,33 @@ TEST_F(OsTest, Children)
 
   pid_t child = tree->process.pid;
   pid_t grandchild = tree->children.front().process.pid;
+#else
+  // NOTE: On Windows, while debugging, children will include, e.g.,
+  // `conhost.exe`, so we have to count those too.
+  const size_t existing_children = children.get().size();
+  ProcessData process_data = windows_fork();
+  pid_t child = process_data.pid;
+#endif // __WINDOWS__
 
   // Ensure the non-recursive children does not include the
   // grandchild.
   children = os::children(getpid(), false);
 
   ASSERT_SOME(children);
+
+#ifndef __WINDOWS__
   EXPECT_EQ(1u, children->size());
+#else
+  EXPECT_EQ(existing_children + 1u, children->size());
+#endif // __WINDOWS__
+
   EXPECT_EQ(1u, children->count(child));
 
   children = os::children(getpid());
 
   ASSERT_SOME(children);
 
+#ifndef __WINDOWS__
   // Depending on whether or not the shell has fork/exec'ed in each
   // above 'Exec', we could have 2 or 4 children. That is, some shells
   // might simply for exec the command above (i.e., 'sleep 10') while
@@ -392,19 +496,31 @@ TEST_F(OsTest, Children)
 
   // We have to reap the child for running the tests in repetition.
   ASSERT_EQ(child, waitpid(child, nullptr, 0));
+#else
+  // Cleanup by killing the descendant processes.
+  windows_kill(process_data);
+
+  children = os::children(getpid(), false);
+  ASSERT_SOME(children);
+  EXPECT_EQ(existing_children, children->size());
+#endif
 }
 
-
+#ifndef __WINDOWS__
 void dosetsid()
 {
   if (::setsid() == -1) {
     ABORT(string("Failed to setsid: ") + os::strerror(errno));
   }
 }
+#endif // __WINDOWS__
 
 
 TEST_F(OsTest, Killtree)
 {
+  // NOTE: This test is written differently for Windows since there is
+  // no implementation of `fork` and `exec` on Windows.
+#ifndef __WINDOWS__
   Try<ProcessTree> tree =
     Fork(&dosetsid,                        // Child.
          Fork(None(),                      // Grandchild.
@@ -523,9 +639,37 @@ TEST_F(OsTest, Killtree)
 
   // We have to reap the child for running the tests in repetition.
   ASSERT_EQ(child, waitpid(child, nullptr, 0));
+#else
+  Try<set<pid_t>> children = os::children(getpid());
+  ASSERT_SOME(children);
+
+  const size_t existing_children = children->size();
+  ProcessData process_data = windows_fork();
+  pid_t child = process_data.pid;
+
+  Try<std::wstring> name = os::name_job(child);
+  ASSERT_SOME(name);
+  Try<SharedHandle> handle = os::create_job(name.get());
+  ASSERT_SOME(handle);
+  ASSERT_SOME(os::assign_job(handle.get(), child));
+
+  children = os::children(getpid());
+  ASSERT_SOME(children);
+  ASSERT_EQ(existing_children + 1u, children->size());
+
+  Try<list<ProcessTree>> trees = os::killtree(child, SIGKILL, true, true);
+  ASSERT_SOME(trees);
+
+  children = os::children(getpid());
+  ASSERT_SOME(children);
+  ASSERT_EQ(existing_children, children->size());
+#endif // __WINDOWS__
 }
 
 
+#ifndef __WINDOWS__
+// NOTE: This test is disabled for Windows since there is
+// no implementation of `fork` and `exec` on Windows.
 TEST_F(OsTest, KilltreeNoRoot)
 {
   Try<ProcessTree> tree =
@@ -641,12 +785,17 @@ TEST_F(OsTest, KilltreeNoRoot)
   EXPECT_NONE(os::process(grandchild));
   EXPECT_NONE(os::process(greatGrandchild));
 }
+#endif // __WINDOWS__
 
 
 TEST_F(OsTest, ProcessExists)
 {
   // Check we exist.
   EXPECT_TRUE(os::exists(::getpid()));
+
+  // NOTE: Some of this test is disabled for Windows since there is no
+  // implementation of `fork` and `exec` on Windows.
+#if !defined(__WINDOWS__)
 
   // In a FreeBSD jail, pid 1 may not exist.
 #if !defined(__FreeBSD__)
@@ -699,9 +848,26 @@ TEST_F(OsTest, ProcessExists)
   EXPECT_WTERMSIG_EQ(SIGKILL, status);
 
   EXPECT_FALSE(os::exists(pid));
+#else
+  pid_t child;
+  // Scope the `ProcessData` so the handles are destructed (and thus
+  // closed) before the last test.
+  {
+    ProcessData process_data = windows_fork();
+    child = process_data.pid;
+    EXPECT_TRUE(os::exists(child));
+    windows_kill(process_data);
+  }
+
+  os::sleep(Milliseconds(500));
+  EXPECT_FALSE(os::exists(child));
+#endif // __WINDOWS__
 }
 
 
+#ifndef __WINDOWS__
+// NOTE: Enable this test when there is an implementation of
+// `os::getuid` and `os::chown` for Windows.
 TEST_F(OsTest, User)
 {
   Try<string> user_ = os::shell("id -un");
@@ -765,8 +931,13 @@ TEST_F(OsTest, User)
   EXPECT_SOME(os::setgroups(gids.get(), uid.get()));
   EXPECT_SOME(os::setuid(uid.get()));
 }
+#endif // __WINDOWS__
 
 
+#ifndef __WINDOWS__
+// NOTE: Enable this test if there are ever implementations of
+// `os::getuid`, `os::getgid`, `os::chmod` and `os::chown` for
+// Windows.
 TEST_F(OsTest, SYMLINK_Chown)
 {
   Result<uid_t> uid = os::getuid();
@@ -835,8 +1006,12 @@ TEST_F(OsTest, SYMLINK_Chown)
       os::stat::uid("chown/one/file",
                     FollowSymlink::DO_NOT_FOLLOW_SYMLINK));
 }
+#endif // __WINDOWS__
 
 
+#ifndef __WINDOWS__
+// NOTE: Enable this test when there is an implementation of
+// `os::getuid`, `os::getgid`, `os::chmod` and `os::chown` for Windows.
 TEST_F(OsTest, ChownNoAccess)
 {
   Result<uid_t> uid = os::getuid();
@@ -888,12 +1063,12 @@ TEST_F(OsTest, TrivialUser)
 }
 
 
-// TODO(hausdorff): Look into enabling this on Windows. Right now,
-// `LD_LIBRARY_PATH` doesn't exist on Windows, so `setPaths` doesn't work. See
-// MESOS-5940.
+#ifndef __WINDOWS__
 // Test setting/resetting/appending to LD_LIBRARY_PATH environment
 // variable (DYLD_LIBRARY_PATH on OS X).
-TEST_F_TEMP_DISABLED_ON_WINDOWS(OsTest, Libraries)
+//
+// NOTE: This will never be enabled on Windows as there is no equivalent.
+TEST_F(OsTest, Libraries)
 {
   const string path1 = "/tmp/path1";
   const string path2 = "/tmp/path1";
@@ -929,40 +1104,83 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(OsTest, Libraries)
   os::libraries::setPaths(originalLibraryPath);
   EXPECT_EQ(os::libraries::paths(), originalLibraryPath);
 }
+#endif // __WINDOWS__
 
 
-// NOTE: `os::shell()` is explicitly disallowed on Windows.
-#ifndef __WINDOWS__
 TEST_F(OsTest, Shell)
 {
   Try<string> result = os::shell("echo %s", "hello world");
+#ifdef __WINDOWS__
+  EXPECT_SOME_EQ("hello world\r\n", result);
+#else
   EXPECT_SOME_EQ("hello world\n", result);
+#endif // __WINDOWS__
 
   result = os::shell("foobar");
   EXPECT_ERROR(result);
 
+#ifdef __WINDOWS__
+  // NOTE: This relies on the strange semantics of Windows' echo,
+  // where quotes are not removed. We are testing that a quoted
+  // argument with a space in it remains quoted by `os::shell`.
+  result = os::shell("echo \"foo bar\"");
+  EXPECT_SOME_EQ("\"foo bar\"\r\n", result);
+
+  // Because the arguments do not have whitespace in them,
+  // `CommandLineToArgv` removes the surrounding quotes before passing
+  // them to `echo`.
+  result = os::shell("echo \"foo\" \"bar\"");
+  EXPECT_SOME_EQ("foo bar\r\n", result);
+#endif // __WINDOWS__
+
   // The `|| true`` necessary so that os::shell() sees a success
   // exit code and returns stdout (which we have piped stderr to).
+#ifdef __WINDOWS__
+  result = os::shell("dir foobar889076 2>&1 || exit /b 0");
+  ASSERT_SOME(result);
+  EXPECT_TRUE(strings::contains(result.get(), "File Not Found"));
+#else
   result = os::shell("LC_ALL=C ls /tmp/foobar889076 2>&1 || true");
   ASSERT_SOME(result);
   EXPECT_TRUE(strings::contains(result.get(), "No such file or directory"));
+#endif // __WINDOWS__
+
+  // Testing a command that wrote a substantial amount of data.
+  const string output(2 * os::pagesize(), 'c');
+  const string outfile = path::join(sandbox.get(), "out.txt");
+  ASSERT_SOME(os::write(outfile, output));
+#ifdef __WINDOWS__
+  result = os::shell("type %s", outfile.c_str());
+#else
+  result = os::shell("cat %s", outfile.c_str());
+#endif // __WINDOWS__
+  EXPECT_SOME_EQ(output, result);
 
   // Testing a more ambitious command that mutates the filesystem.
-  const string path = "/tmp/os_tests.txt";
+  const string path = path::join(sandbox.get(), "os_tests.txt");
+#ifdef __WINDOWS__
+  result = os::shell("copy /y nul %s", path.c_str());
+  ASSERT_SOME(result);
+  EXPECT_EQ("1 file(s) copied.", strings::trim(result.get()));
+#else
   result = os::shell("touch %s", path.c_str());
   EXPECT_SOME_EQ("", result);
+#endif // __WINDOWS__
   EXPECT_TRUE(os::exists(path));
 
   // Let's clean up, and ensure this worked too.
+#ifdef __WINDOWS__
+  result = os::shell("del %s", path.c_str());
+#else
   result = os::shell("rm %s", path.c_str());
-  EXPECT_SOME_EQ("", result);
-  EXPECT_FALSE(os::exists("/tmp/os_tests.txt"));
-}
 #endif // __WINDOWS__
+  EXPECT_SOME_EQ("", result);
+  EXPECT_FALSE(os::exists(path));
+}
 
 
-// NOTE: Disabled on Windows because `mknod` does not exist.
 #ifndef __WINDOWS__
+// NOTE: Disabled on Windows because `mknod` does not exist.
 TEST_F(OsTest, Mknod)
 {
 #ifdef __FreeBSD__
@@ -1014,11 +1232,36 @@ TEST_F(OsTest, SYMLINK_Realpath)
   ASSERT_SOME(fs::symlink(testFile, testLink));
 
   // Validate the symlink.
+#ifdef __WINDOWS__
+  Try<int_fd> handle = os::open(testFile, O_RDONLY);
+  ASSERT_SOME(handle);
+  FILE_ID_INFO fileInfo;
+  BOOL result = ::GetFileInformationByHandleEx(
+    handle.get(), FileIdInfo, &fileInfo, sizeof(fileInfo));
+  ASSERT_SOME(os::close(handle.get()));
+  ASSERT_EQ(TRUE, result);
+
+  handle = os::open(testLink, O_RDONLY);
+  ASSERT_SOME(handle);
+  FILE_ID_INFO linkInfo;
+  result = ::GetFileInformationByHandleEx(
+    handle.get(), FileIdInfo, &linkInfo, sizeof(linkInfo));
+  ASSERT_SOME(os::close(handle.get()));
+  ASSERT_EQ(TRUE, result);
+
+  ASSERT_EQ(fileInfo.VolumeSerialNumber, linkInfo.VolumeSerialNumber);
+  ASSERT_TRUE(std::equal(
+    std::begin(fileInfo.FileId.Identifier),
+    std::end(fileInfo.FileId.Identifier),
+    std::begin(linkInfo.FileId.Identifier),
+    std::end(linkInfo.FileId.Identifier)));
+#else
   const Try<ino_t> fileInode = os::stat::inode(testFile);
   ASSERT_SOME(fileInode);
   const Try<ino_t> linkInode = os::stat::inode(testLink);
   ASSERT_SOME(linkInode);
   ASSERT_EQ(fileInode.get(), linkInode.get());
+#endif // __WINDOWS__
 
   // Verify that the symlink resolves correctly.
   Result<string> resolved = os::realpath(testLink);

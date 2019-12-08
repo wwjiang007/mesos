@@ -29,6 +29,8 @@
 #include "slave/containerizer/mesos/isolators/network/cni/spec.hpp"
 #include "slave/containerizer/mesos/isolators/network/cni/paths.hpp"
 
+#include "linux/ns.hpp"
+
 namespace mesos {
 namespace internal {
 namespace slave {
@@ -49,27 +51,30 @@ class NetworkCniIsolatorProcess : public MesosIsolatorProcess
 public:
   static Try<mesos::slave::Isolator*> create(const Flags& flags);
 
-  virtual ~NetworkCniIsolatorProcess() {}
+  ~NetworkCniIsolatorProcess() override {}
 
-  virtual bool supportsNesting();
+  bool supportsNesting() override;
 
-  virtual process::Future<Nothing> recover(
-      const std::list<mesos::slave::ContainerState>& states,
-      const hashset<ContainerID>& orphans);
+  process::Future<Nothing> recover(
+      const std::vector<mesos::slave::ContainerState>& states,
+      const hashset<ContainerID>& orphans) override;
 
-  virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
-      const mesos::slave::ContainerConfig& containerConfig);
+      const mesos::slave::ContainerConfig& containerConfig) override;
 
-  virtual process::Future<Nothing> isolate(
+  process::Future<Nothing> isolate(
       const ContainerID& containerId,
-      pid_t pid);
+      pid_t pid) override;
 
-  virtual process::Future<ContainerStatus> status(
-      const ContainerID& containerId);
+  process::Future<ContainerStatus> status(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<Nothing> cleanup(
-      const ContainerID& containerId);
+  process::Future<ResourceStatistics> usage(
+      const ContainerID& containerId) override;
+
+  process::Future<Nothing> cleanup(
+      const ContainerID& containerId) override;
 
 private:
   struct ContainerNetwork
@@ -130,20 +135,18 @@ private:
       const hashmap<std::string, std::string>& _networkConfigs,
       const hashmap<std::string, ContainerDNSInfo::MesosInfo>& _cniDNSMap,
       const Option<ContainerDNSInfo::MesosInfo>& _defaultCniDNS = None(),
-      const Option<std::string>& _rootDir = None(),
-      const Option<std::string>& _pluginDir = None())
+      const Option<std::string>& _rootDir = None())
     : ProcessBase(process::ID::generate("mesos-network-cni-isolator")),
       flags(_flags),
       networkConfigs(_networkConfigs),
       cniDNSMap(_cniDNSMap),
       defaultCniDNS(_defaultCniDNS),
-      rootDir(_rootDir),
-      pluginDir(_pluginDir) {}
+      rootDir(_rootDir) {}
 
   process::Future<Nothing> _isolate(
       const ContainerID& containerId,
       pid_t pid,
-      const std::list<process::Future<Nothing>>& attaches);
+      const std::vector<process::Future<Nothing>>& attaches);
 
   process::Future<Nothing> __isolate(
       const NetworkCniIsolatorSetup& setup);
@@ -181,7 +184,10 @@ private:
 
   process::Future<Nothing> _cleanup(
       const ContainerID& containerId,
-      const std::list<process::Future<Nothing>>& detaches);
+      const std::vector<process::Future<Nothing>>& detaches);
+
+  static Try<ResourceStatistics> _usage(
+      const hashset<std::string> ifNames);
 
   // Searches the `networkConfigs` hashmap for a CNI network. If the
   // hashmap doesn't contain the network, will try to load all the CNI
@@ -213,11 +219,12 @@ private:
   // CNI network information root directory.
   const Option<std::string> rootDir;
 
-  // CNI plugins directory.
-  const Option<std::string> pluginDir;
-
   // Information of CNI networks that each container joins.
   hashmap<ContainerID, process::Owned<Info>> infos;
+
+  // Runner manages a separate thread to call `usage` functions
+  // in the containers' namespaces.
+  ns::NamespaceRunner namespaceRunner;
 };
 
 
@@ -250,8 +257,8 @@ public:
   Flags flags;
 
 protected:
-  virtual int execute();
-  virtual flags::FlagsBase* getFlags() { return &flags; }
+  int execute() override;
+  flags::FlagsBase* getFlags() override { return &flags; }
 };
 
 } // namespace slave {

@@ -16,6 +16,9 @@
 
 #include "resource_provider/validation.hpp"
 
+#include <mesos/type_utils.hpp>
+
+#include <stout/foreach.hpp>
 #include <stout/none.hpp>
 #include <stout/unreachable.hpp>
 
@@ -27,7 +30,8 @@ namespace resource_provider {
 namespace validation {
 namespace call {
 
-Option<Error> validate(const Call& call)
+Option<Error> validate(
+    const Call& call, const Option<ResourceProviderInfo>& resourceProviderInfo)
 {
   if (!call.IsInitialized()) {
     return Error("Not initialized: " + call.InitializationErrorString());
@@ -37,7 +41,20 @@ Option<Error> validate(const Call& call)
     return Error("Expecting 'type' to be present");
   }
 
-  switch(call.type()) {
+  switch (call.type()) {
+    case Call::UNKNOWN:
+    case Call::SUBSCRIBE:
+      break;
+    case Call::UPDATE_STATE:
+    case Call::UPDATE_OPERATION_STATUS:
+    case Call::UPDATE_PUBLISH_RESOURCES_STATUS:
+      if (!call.has_resource_provider_id()) {
+        return Error("Expecting 'resource_provider_id' to be present");
+      }
+      break;
+  }
+
+  switch (call.type()) {
     case Call::UNKNOWN: {
       return None();
     }
@@ -51,34 +68,42 @@ Option<Error> validate(const Call& call)
     }
 
     case Call::UPDATE_OPERATION_STATUS: {
-      if (!call.has_resource_provider_id()) {
-        return Error("Expecting 'resource_provider_id' to be present");
-      }
-
       if (!call.has_update_operation_status()) {
         return Error("Expecting 'update_operation_status' to be present");
+      }
+
+      if (resourceProviderInfo.isSome() && resourceProviderInfo->has_id()) {
+        const Call::UpdateOperationStatus& updateOperationStatus =
+          call.update_operation_status();
+        if (!updateOperationStatus.status().has_resource_provider_id() ||
+            updateOperationStatus.status().resource_provider_id() !=
+              resourceProviderInfo->id()) {
+          return Error(
+              "Inconsistent resource provider ID in 'update_operation_status'");
+        }
       }
 
       return None();
     }
 
     case Call::UPDATE_STATE: {
-      if (!call.has_resource_provider_id()) {
-        return Error("Expecting 'resource_provider_id' to be present");
-      }
-
       if (!call.has_update_state()) {
         return Error("Expecting 'update_state' to be present");
+      }
+
+      if (resourceProviderInfo.isSome() && resourceProviderInfo->has_id()) {
+        foreach (const Resource& resource, call.update_state().resources()) {
+          if (!resource.has_provider_id() ||
+              resource.provider_id() != resourceProviderInfo->id()) {
+            return Error("Inconsistent resource provider ID in 'update_state'");
+          }
+        }
       }
 
       return None();
     }
 
     case Call::UPDATE_PUBLISH_RESOURCES_STATUS: {
-      if (!call.has_resource_provider_id()) {
-        return Error("Expecting 'resource_provider_id' to be present");
-      }
-
       if (!call.has_update_publish_resources_status()) {
         return Error(
             "Expecting 'update_publish_resources_status' to be present.");

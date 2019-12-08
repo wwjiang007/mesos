@@ -55,7 +55,7 @@ public:
       connected(false),
       subscribeCall(false) {}
 
-  virtual ~V0ToV1AdapterProcess() = default;
+  ~V0ToV1AdapterProcess() override = default;
 
   void registered(
       const mesos::ExecutorInfo& _executorInfo,
@@ -226,6 +226,12 @@ public:
 
       case Call::MESSAGE: {
         driver->sendFrameworkMessage(call.message().data());
+        break;
+      }
+
+      case Call::HEARTBEAT: {
+        // NOTE: Heartbeat calls were added to HTTP executors only.
+        // There is no equivalent method for PID-based executors.
         break;
       }
 

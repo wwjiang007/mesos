@@ -16,11 +16,12 @@
 
 #include "resource_provider/storage/uri_disk_profile_adaptor.hpp"
 
+#include <algorithm>
 #include <map>
 #include <string>
 #include <tuple>
 
-#include <csi/spec.hpp>
+#include <mesos/type_utils.hpp>
 
 #include <mesos/module/disk_profile_adaptor.hpp>
 
@@ -39,7 +40,7 @@
 #include <stout/result.hpp>
 #include <stout/strings.hpp>
 
-#include "csi/utils.hpp"
+#include "csi/v0_utils.hpp"
 
 #include "resource_provider/storage/disk_profile_utils.hpp"
 
@@ -57,28 +58,6 @@ using mesos::resource_provider::DiskProfileMapping;
 namespace mesos {
 namespace internal {
 namespace storage {
-
-bool operator==(
-    const Map<string, string>& left,
-    const Map<string, string>& right) {
-  if (left.size() != right.size()) {
-    return false;
-  }
-
-  typename Map<string, string>::const_iterator iterator = left.begin();
-  while (iterator != left.end()) {
-    if (right.count(iterator->first) != 1) {
-      return false;
-    }
-
-    if (iterator->second != right.at(iterator->first)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
 
 UriDiskProfileAdaptor::UriDiskProfileAdaptor(const Flags& _flags)
   : flags(_flags),
@@ -122,8 +101,7 @@ Future<hashset<string>> UriDiskProfileAdaptor::watch(
 UriDiskProfileAdaptorProcess::UriDiskProfileAdaptorProcess(
     const UriDiskProfileAdaptor::Flags& _flags)
   : ProcessBase(ID::generate("uri-disk-profile-adaptor")),
-    flags(_flags),
-    watchPromise(new Promise<Nothing>()) {}
+    flags(_flags) {}
 
 
 void UriDiskProfileAdaptorProcess::initialize()
@@ -137,19 +115,22 @@ Future<DiskProfileAdaptor::ProfileInfo>
       const string& profile,
       const ResourceProviderInfo& resourceProviderInfo)
 {
-  if (profileMatrix.count(profile) != 1) {
+  if (!profileMatrix.contains(profile) || !profileMatrix.at(profile).active) {
     return Failure("Profile '" + profile + "' not found");
   }
 
-  const DiskProfileMapping::CSIManifest& manifest = profileMatrix.at(profile);
+  const DiskProfileMapping::CSIManifest& manifest =
+    profileMatrix.at(profile).manifest;
 
-  // TODO(chhsiao): A storage resource provider may need to translate
-  // a profile that no longer applies to it to replay a `CREATE_VOLUME`
-  // or `CREATE_BLOCK` operation during recovery, so resource provider
-  // selection is only done in `watch()` but not here. We should do the
-  // selection once profiles are checkpointed in the resource provider.
+  if (!isSelectedResourceProvider(manifest, resourceProviderInfo)) {
+    return Failure(
+        "Profile '" + profile + "' does not apply to resource provider with "
+        "type '" + resourceProviderInfo.type() + "' and name '" +
+        resourceProviderInfo.name() + "'");
+  }
+
   return DiskProfileAdaptor::ProfileInfo{
-    manifest.volume_capabilities(),
+    csi::v0::devolve(manifest.volume_capabilities()),
     manifest.create_parameters()
   };
 }
@@ -159,31 +140,24 @@ Future<hashset<string>> UriDiskProfileAdaptorProcess::watch(
     const hashset<string>& knownProfiles,
     const ResourceProviderInfo& resourceProviderInfo)
 {
-  // Calculate the new set of profiles for the resource provider.
-  // TODO(chhsiao): A storage resource provider assumes that the new set
-  // should be a superset of `knownProfiles`, so we bypass resource
-  // provider selection if a profile is already known. We should do the
-  // selection once profiles are checkpointed in the resource provider.
-  hashset<string> newProfiles = knownProfiles;
-  foreachpair (const string& profile,
-               const DiskProfileMapping::CSIManifest& manifest,
-               profileMatrix) {
-    if (knownProfiles.contains(profile)) {
-      continue;
-    }
-
-    if (isSelectedResourceProvider(manifest, resourceProviderInfo)) {
-      newProfiles.insert(profile);
+  // Calculate the current set of profiles for the resource provider.
+  hashset<string> currentProfiles;
+  foreachpair (
+      const string& profile, const ProfileRecord& record, profileMatrix) {
+    if (record.active &&
+        isSelectedResourceProvider(record.manifest, resourceProviderInfo)) {
+      currentProfiles.insert(profile);
     }
   }
 
-  if (newProfiles != knownProfiles) {
-    return newProfiles;
+  if (currentProfiles != knownProfiles) {
+    return currentProfiles;
   }
 
   // Wait for the next update if there is no change.
-  return watchPromise->future()
-    .then(defer(self(), &Self::watch, knownProfiles, resourceProviderInfo));
+  watchers.emplace_back(knownProfiles, resourceProviderInfo);
+
+  return watchers.back().promise.future();
 }
 
 
@@ -197,24 +171,30 @@ void UriDiskProfileAdaptorProcess::poll()
     CHECK_SOME(url);
 
     http::get(url.get())
-      .onAny(defer(self(), [=](const Future<http::Response>& future) {
-        if (future.isReady()) {
-          // NOTE: We don't check the HTTP status code because we don't know
-          // what potential codes are considered successful.
-          _poll(future->body);
-        } else if (future.isFailed()) {
-          _poll(Error(future.failure()));
-        } else {
-          _poll(Error("Future discarded or abandoned"));
-        }
-      }));
+      .onAny(defer(self(), &Self::_poll, lambda::_1));
   } else {
-    _poll(os::read(flags.uri.string()));
+    __poll(os::read(flags.uri.string()));
   }
 }
 
 
-void UriDiskProfileAdaptorProcess::_poll(const Try<string>& fetched)
+void UriDiskProfileAdaptorProcess::_poll(const Future<http::Response>& response)
+{
+  if (response.isReady()) {
+    if (response->code == http::Status::OK) {
+      __poll(response->body);
+    } else {
+      __poll(Error("Unexpected HTTP response '" + response->status + "'"));
+    }
+  } else if (response.isFailed()) {
+    __poll(Error(response.failure()));
+  } else {
+    __poll(Error("Future discarded or abandoned"));
+  }
+}
+
+
+void UriDiskProfileAdaptorProcess::__poll(const Try<string>& fetched)
 {
   if (fetched.isSome()) {
     Try<DiskProfileMapping> parsed = parseDiskProfileMapping(fetched.get());
@@ -241,33 +221,26 @@ void UriDiskProfileAdaptorProcess::notify(
 {
   bool hasErrors = false;
 
-  foreachpair (const string& profile,
-               const DiskProfileMapping::CSIManifest& manifest,
-               profileMatrix) {
-    if (parsed.profile_matrix().count(profile) != 1) {
-      hasErrors = true;
-
-      LOG(WARNING)
-        << "Fetched profile mapping does not contain profile '" << profile
-        << "'. The fetched mapping will be ignored entirely";
+  foreach (const auto& entry, parsed.profile_matrix()) {
+    if (!profileMatrix.contains(entry.first)) {
       continue;
     }
 
     bool matchingCapability =
-      manifest.volume_capabilities() ==
-        parsed.profile_matrix().at(profile).volume_capabilities();
+      entry.second.volume_capabilities() ==
+        profileMatrix.at(entry.first).manifest.volume_capabilities();
 
     bool matchingParameters =
-      manifest.create_parameters() ==
-        parsed.profile_matrix().at(profile).create_parameters();
+      entry.second.create_parameters() ==
+        profileMatrix.at(entry.first).manifest.create_parameters();
 
     if (!matchingCapability || !matchingParameters) {
       hasErrors = true;
 
       LOG(WARNING)
-        << "Fetched profile mapping for profile '" << profile << "'"
-        << " does not match earlier data."
-        << " The fetched mapping will be ignored entirely";
+        << "Fetched profile mapping for profile '" << entry.first
+        << "' does not match earlier data. "
+        << "The fetched mapping will be ignored entirely";
     }
   }
 
@@ -278,29 +251,60 @@ void UriDiskProfileAdaptorProcess::notify(
     return;
   }
 
-  // Profiles can only be added, so if the parsed data is the same size,
-  // nothing has changed and no notifications need to be sent.
-  if (parsed.profile_matrix().size() <= profileMatrix.size()) {
-    return;
-  }
+  // TODO(chhsiao): No need to update the profile matrix and send notifications
+  // if the parsed mapping has the same size and profile selectors.
 
   // The fetched mapping satisfies our invariants.
 
-  // Save the protobuf as a map.
-  profileMatrix = map<string, DiskProfileMapping::CSIManifest>(
-      parsed.profile_matrix().begin(),
-      parsed.profile_matrix().end());
+  // Mark disappeared profiles as inactive.
+  foreachpair (const string& profile, ProfileRecord& record, profileMatrix) {
+    if (parsed.profile_matrix().count(profile) != 1) {
+      record.active = false;
 
-  // Notify any watchers and then prepare a new promise for the next
-  // iteration of polling.
+      LOG(INFO)
+        << "Profile '" << profile << "' is marked inactive "
+        << "because it is not in the fetched profile mapping";
+    }
+  }
+
+  // Save the fetched profile mapping.
+  foreach (const auto& entry, parsed.profile_matrix()) {
+    profileMatrix.put(entry.first, {entry.second, true});
+  }
+
+  // Notify a watcher if its current set of profiles differs from its known set.
   //
   // TODO(josephw): Delay this based on the `--max_random_wait` option.
-  watchPromise->set(Nothing());
-  watchPromise.reset(new Promise<Nothing>());
+  foreach (WatcherData& watcher, watchers) {
+    hashset<string> current;
+    foreachpair (
+        const string& profile, const ProfileRecord& record, profileMatrix) {
+      if (record.active &&
+          isSelectedResourceProvider(record.manifest, watcher.info)) {
+        current.insert(profile);
+      }
+    }
+
+    if (current != watcher.known) {
+      CHECK(watcher.promise.set(current))
+        << "Promise for watcher '" << watcher.info << "' is already "
+        << watcher.promise.future();
+    }
+  }
+
+  // Remove all notified watchers.
+  watchers.erase(
+      std::remove_if(
+          watchers.begin(),
+          watchers.end(),
+          [](const WatcherData& watcher) {
+            return watcher.promise.future().isReady();
+          }),
+      watchers.end());
 
   LOG(INFO)
-    << "Updated disk profile mapping to " << profileMatrix.size()
-    << " total profiles";
+    << "Updated disk profile mapping to " << parsed.profile_matrix().size()
+    << " active profiles";
 }
 
 } // namespace storage {

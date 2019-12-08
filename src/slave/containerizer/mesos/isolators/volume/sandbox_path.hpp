@@ -23,6 +23,8 @@
 
 #include "slave/flags.hpp"
 
+#include "slave/volume_gid_manager/volume_gid_manager.hpp"
+
 #include "slave/containerizer/mesos/isolator.hpp"
 
 namespace mesos {
@@ -32,30 +34,40 @@ namespace slave {
 class VolumeSandboxPathIsolatorProcess : public MesosIsolatorProcess
 {
 public:
-  static Try<mesos::slave::Isolator*> create(const Flags& flags);
+  static Try<mesos::slave::Isolator*> create(
+      const Flags& flags,
+      VolumeGidManager* volumeGidManager);
 
-  virtual ~VolumeSandboxPathIsolatorProcess();
+  ~VolumeSandboxPathIsolatorProcess() override;
 
-  virtual bool supportsNesting();
-  virtual bool supportsStandalone();
+  bool supportsNesting() override;
+  bool supportsStandalone() override;
 
-  virtual process::Future<Nothing> recover(
-      const std::list<mesos::slave::ContainerState>& states,
-      const hashset<ContainerID>& orphans);
+  process::Future<Nothing> recover(
+      const std::vector<mesos::slave::ContainerState>& states,
+      const hashset<ContainerID>& orphans) override;
 
-  virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
-      const mesos::slave::ContainerConfig& containerConfig);
+      const mesos::slave::ContainerConfig& containerConfig) override;
 
-  virtual process::Future<Nothing> cleanup(
-      const ContainerID& containerId);
+  process::Future<Nothing> cleanup(
+      const ContainerID& containerId) override;
 
 private:
   VolumeSandboxPathIsolatorProcess(
       const Flags& flags,
+#ifdef __linux__
+      VolumeGidManager* volumeGidManager,
+#endif // __linux__
       bool bindMountSupported);
 
   const Flags flags;
+
+#ifdef __linux__
+  VolumeGidManager* volumeGidManager;
+#endif // __linux__
+
   const bool bindMountSupported;
 
   hashmap<ContainerID, std::string> sandboxes;

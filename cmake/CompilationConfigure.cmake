@@ -75,9 +75,57 @@ option(
   TRUE)
 
 option(
+  UNBUNDLED_LIBARCHIVE
+  "Build with an installed libarchive version instead of the bundled."
+  FALSE)
+
+set(
+  LIBARCHIVE_ROOT_DIR
+  ""
+  CACHE STRING
+  "Specify the path to libarchive, e.g. \"C:\\libarchive-Win64\".")
+
+option(
   ENABLE_LIBEVENT
   "Use libevent instead of libev as the core event loop implementation."
   FALSE)
+
+if (ENABLE_LIBEVENT)
+  option(
+    UNBUNDLED_LIBEVENT
+    "Build libprocess with an installed libevent version instead of the bundled."
+    FALSE)
+
+  set(
+    LIBEVENT_ROOT_DIR
+    ""
+    CACHE STRING
+    "Specify the path to libevent, e.g. \"C:\\libevent-Win64\".")
+endif()
+
+option(
+  UNBUNDLED_LEVELDB
+  "Build with an installed leveldb version instead of the bundled."
+  FALSE)
+
+set(
+  LEVELDB_ROOT_DIR
+  ""
+  CACHE STRING
+  "Specify the path to leveldb, e.g. \"C:\\leveldb-Win64\".")
+
+if (ENABLE_SECCOMP_ISOLATOR)
+  option(
+    UNBUNDLED_LIBSECCOMP
+    "Build with an installed libseccomp version instead of the bundled."
+    FALSE)
+
+  set(
+    LIBSECCOMP_ROOT_DIR
+    ""
+    CACHE STRING
+    "Specify the path to libseccomp, e.g. \"C:\\libseccomp-Win64\".")
+endif ()
 
 option(
   ENABLE_SSL
@@ -100,53 +148,56 @@ option(
   FALSE)
 
 option(
+  PYTHON
+  "Command for the Python interpreter, set to `python` if not given."
+  "python")
+
+option(
+  PYTHON_3
+  "Command for the Python 3 interpreter, set to the option PYTHON if not given."
+  "")
+
+option(
   ENABLE_NEW_CLI
   "Build the new CLI instead of the old one."
   FALSE)
 
 if (ENABLE_NEW_CLI)
-  find_package(PythonInterp)
-  find_package(PythonLibs)
-
-  if (NOT PYTHON_LIBRARY)
-    message(
-      FATAL_ERROR
-      "Python not found.\n"
-      "The new CLI requires Python version 2.6 or 2.7 in order to build.\n"
-      "Your Python version is ${PYTHONLIBS_VERSION_STRING}.\n"
-      "You may wish to set the PYTHON environment variable to an "
-      "appropriate value if Python is not installed in your PATH.")
+  # We always want to have PYTHON_3 set as it will be used to build the CLI.
+  if (NOT PYTHON_3)
+    if (PYTHON)
+      # Set PYTHON_3 to PYTHON if PYTHON is set but not PYTHON_3.
+      set(PYTHON_3 ${PYTHON})
+    else ()
+      # Set PYTHON_3 to the one CMake finds if PYTHON is not set.
+      # PythonInterp sets PYTHON_EXECUTABLE by looking for an interpreter
+      # from newest to oldest,, we then use it to set PYTHON and PYTHON_3.
+      find_package(PythonInterp)
+      if (NOT PYTHONINTERP_FOUND)
+        message(FATAL_ERROR "You must have Python set up in order to continue.")
+      endif ()
+      set(PYTHON ${PYTHON_EXECUTABLE})
+      set(PYTHON_3 ${PYTHON})
+    endif ()
   endif ()
 
-  if (${PYTHONLIBS_VERSION_STRING} VERSION_LESS "2.6.0")
-    message(
-      FATAL_ERROR
-      "Python version too old.\n"
-      "The new CLI requires Python version 2.6 or 2.7 in order to build.\n"
-      "Your Python version is ${PYTHONLIBS_VERSION_STRING}.\n"
-      "You may wish to set the PYTHON environment variable to an "
-      "appropriate value to assure the right Python executable is found.")
+  # Find `tox` for testing `src/python/lib/`.
+  find_program(TOX tox)
+  if (NOT TOX)
+    message(FATAL_ERROR "'tox' is required in order to run Mesos Python library tests.")
   endif ()
 
-  if (${PYTHONLIBS_VERSION_STRING} VERSION_EQUAL "3.0.0" OR
-      ${PYTHONLIBS_VERSION_STRING} VERSION_GREATER "3.0.0")
-    message(
-      FATAL_ERROR
-      "Python version too new.\n"
-      "The new CLI requires Python version 2.6 or 2.7 in order to build.\n"
-      "Your Python version is ${PYTHONLIBS_VERSION_STRING}.\n"
-      "You may wish to set the PYTHON environment variable to an "
-      "appropriate value to assure the right Python executable is found.")
-  endif ()
+  execute_process(
+    COMMAND ${PYTHON_3} -c
+      "import sys; print('%d.%d' % (sys.version_info[0], sys.version_info[1]))"
+    OUTPUT_VARIABLE PYTHON_3_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
 
-  find_program(VIRTUALENV virtualenv)
-  if (NOT VIRTUALENV)
-    message(
-      FATAL_ERROR
-      "Cannot find virtualenv.\n"
-      "The new CLI requires 'virtualenv' be installed as part of your "
-      "Python ${PYTHONLIBS_VERSION_STRING} installation.\n"
-      "You may wish to install it via 'pip install virtualenv'.")
+  if (PYTHON_3_VERSION VERSION_LESS "3.6.0")
+    message(FATAL_ERROR
+    "You must be running python 3.6 or newer in order to continue.\n"
+    "You appear to be running Python ${PYTHON_3_VERSION}.\n"
+    "Set the CMake option 'PYTHON_3' to define which interpreter to use.")
   endif ()
 endif ()
 
@@ -194,17 +245,19 @@ if (WIN32 AND REBUNDLED)
     "  * curl\n"
     "  * apr\n"
     "  * zlib\n"
-    "  * glog\n"
     "do not come rebundled in the Mesos repository.  They will be downloaded from "
     "the Internet, even though the `REBUNDLED` flag was set.")
 endif ()
 
-if (WIN32 AND (NOT ENABLE_LIBEVENT))
+if (WIN32 AND ENABLE_LIBEVENT)
   message(
-    FATAL_ERROR
-    "Windows builds of Mesos currently do not support libev, the default event "
-    "loop used by Mesos.  To opt into using libevent, pass "
-    "`-DENABLE_LIBEVENT=1` as an argument when you run CMake.")
+    WARNING
+    "The Windows imlementation of libevent is BUGGY. Use it at your own risk. "
+    "It does NOT support async I/O. You WILL have problems. Tests WILL fail. "
+    "This is NOT supported, and WILL eventually be removed. "
+    "When not explicitly enabled, the build will default to the native Windows "
+    "IOCP implementation, `libwinio`, built on the Windows Thread Pool API. "
+    "See MESOS-8668 for context.")
 endif ()
 
 if (ENABLE_SSL AND (NOT ENABLE_LIBEVENT))
@@ -294,6 +347,9 @@ elseif (CMAKE_CXX_COMPILER_ID MATCHES MSVC)
     /w44267)
 endif ()
 
+if (CMAKE_CXX_COMPILER_ID MATCHES Clang)
+  add_compile_options(-Wno-inconsistent-missing-override)
+endif ()
 
 # POSIX CONFIGURATION.
 ######################
@@ -313,6 +369,12 @@ if (NOT WIN32)
     message(
       WARNING
       "The compiler ${CMAKE_CXX_COMPILER} cannot apply stack protectors.")
+  endif ()
+
+  # Do not omit frame pointers in debug builds to ease debugging and profiling.
+  if ((CMAKE_BUILD_TYPE MATCHES Debug) OR
+      (CMAKE_BUILD_TYPE MATCHES RelWithDebInfo))
+    add_compile_options(-fno-omit-frame-pointer)
   endif ()
 
   # Directory structure for some build artifacts.
@@ -364,6 +426,51 @@ if (LINUX)
   option(
     ENABLE_JEMALLOC_ALLOCATOR
     "Use jemalloc as memory allocator for the master and agent binaries."
+    FALSE)
+
+  option(ENABLE_XFS_DISK_ISOLATOR
+    "Whether to enable the XFS disk isolator."
+    FALSE)
+
+  if (ENABLE_XFS_DISK_ISOLATOR)
+    # TODO(andschwa): Check for required headers and libraries.
+    message(FATAL_ERROR
+      "The XFS disk isolator is not yet supported, see MESOS-9117.")
+  endif ()
+
+  option(ENABLE_LAUNCHER_SEALING
+    "Whether to enable containerizer launcher sealing via memfd."
+    FALSE)
+
+  option(ENABLE_PORT_MAPPING_ISOLATOR
+    "Whether to enable the port mapping isolator."
+    FALSE)
+
+  if (ENABLE_PORT_MAPPING_ISOLATOR)
+    # TODO(andschwa): Check for `libnl-3`.
+    message(FATAL_ERROR
+      "The port mapping isolator is not yet supported, see MESOS-8993.")
+  endif ()
+
+  option(ENABLE_NETWORK_PORTS_ISOLATOR
+    "Whether to enable the network ports isolator."
+    FALSE)
+
+  if (ENABLE_NETWORK_PORTS_ISOLATOR)
+    # TODO(andschwa): Check for `libnl-3`.
+    message(FATAL_ERROR
+      "The network ports isolator is not yet supported, see MESOS-8993.")
+  endif ()
+
+  # Enabled when either the port mapping isolator or network ports
+  # isolator is enabled.
+  if (ENABLE_PORT_MAPPING_ISOLATOR OR ENABLE_NETWORK_PORTS_ISOLATOR)
+    set(ENABLE_LINUX_ROUTING TRUE)
+  endif ()
+
+  option(
+    ENABLE_SECCOMP_ISOLATOR
+    "Whether to enable `linux/seccomp` isolator."
     FALSE)
 endif ()
 
@@ -501,35 +608,65 @@ string(REPLACE "\"" "\\\"" BUILD_FLAGS "${BUILD_FLAGS_RAW}")
 
 set(BUILD_JAVA_JVM_LIBRARY ${JAVA_JVM_LIBRARY})
 
-# When building from source, from a git clone, emit some extra build info.
-if (IS_DIRECTORY "${CMAKE_SOURCE_DIR}/.git")
-  execute_process(
-    COMMAND git rev-parse HEAD
-    OUTPUT_VARIABLE BUILD_GIT_SHA
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    ERROR_QUIET
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
-
-  execute_process(
-    COMMAND git symbolic-ref HEAD
-    OUTPUT_VARIABLE BUILD_GIT_BRANCH
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    ERROR_QUIET
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
-
-  execute_process(
-    COMMAND git describe --exact --tags
-    OUTPUT_VARIABLE BUILD_GIT_TAG
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    ERROR_QUIET
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
-endif ()
-
-# Emit the BUILD_DATE, BUILD_TIME, and BUILD_USER variables into a file.
-# When building from a git clone, the variables BUILD_GIT_SHA,
-# BUILD_GIT_BRANCH, and BUILD_GIT_TAG will also be emitted.
+# Emit the BUILD_DATE, BUILD_TIME and BUILD_USER definitions into a file.
 # This will be updated each time `cmake` is run.
 configure_file(
   "${CMAKE_SOURCE_DIR}/src/common/build_config.hpp.in"
   "${CMAKE_BINARY_DIR}/src/common/build_config.hpp"
   @ONLY)
+
+# Create 'src/common/git_version.hpp' only if we did not do so before.
+# This protects the results from getting overwritten by additional cmake
+# runs outside the reach of the git repository.
+if(NOT EXISTS "${CMAKE_BINARY_DIR}/src/common/git_version.hpp")
+  # When building from a git clone, the definitions BUILD_GIT_SHA,
+  # BUILD_GIT_BRANCH and BUILD_GIT_TAG will be emitted.
+  if (IS_DIRECTORY "${CMAKE_SOURCE_DIR}/.git")
+    # Optionally set BUILD_GIT_SHA.
+    set(DEFINE_BUILD_GIT_SHA "")
+
+    execute_process(
+      COMMAND git rev-parse HEAD
+      OUTPUT_VARIABLE BUILD_GIT_SHA
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      ERROR_QUIET
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+    if (NOT BUILD_GIT_SHA STREQUAL "")
+      set(DEFINE_BUILD_GIT_SHA "#define BUILD_GIT_SHA \"${BUILD_GIT_SHA}\"")
+    endif()
+
+    # Optionally set BUILD_GIT_BRANCH.
+    set(DEFINE_BUILD_GIT_BRANCH "")
+
+    execute_process(
+      COMMAND git symbolic-ref HEAD
+      OUTPUT_VARIABLE BUILD_GIT_BRANCH
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      ERROR_QUIET
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+    if (NOT BUILD_GIT_BRANCH STREQUAL "")
+      set(DEFINE_BUILD_GIT_BRANCH "#define BUILD_GIT_BRANCH \"${BUILD_GIT_BRANCH}\"")
+    endif()
+
+    # Optionally set BUILD_GIT_TAG.
+    set(DEFINE_BUILD_GIT_TAG "")
+
+    execute_process(
+      COMMAND git describe --exact --tags
+      OUTPUT_VARIABLE BUILD_GIT_TAG
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      ERROR_QUIET
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+    if (NOT BUILD_GIT_TAG STREQUAL "")
+      set(DEFINE_BUILD_GIT_TAG "#define BUILD_GIT_TAG \"${BUILD_GIT_TAG}\"")
+    endif()
+  endif ()
+
+  configure_file(
+    "${CMAKE_SOURCE_DIR}/src/common/git_version.hpp.in"
+    "${CMAKE_BINARY_DIR}/src/common/git_version.hpp"
+    @ONLY)
+endif()

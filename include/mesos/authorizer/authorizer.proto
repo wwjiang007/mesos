@@ -50,7 +50,7 @@ message Object {
   optional Task task = 3;
   optional TaskInfo task_info = 4;
   optional ExecutorInfo executor_info = 5;
-  optional quota.QuotaInfo quota_info = 6;
+  optional quota.QuotaInfo quota_info = 6 [deprecated = true];
   optional WeightInfo weight_info = 7;
   optional Resource resource = 8;
   optional CommandInfo command_info = 9;
@@ -128,15 +128,27 @@ enum Action {
   UPDATE_WEIGHT = 10;
   UPDATE_WEIGHT_WITH_ROLE = 10;
 
-  // `GET_QUOTA` will have an object with `QuotaInfo` set.
+  // Prioir to Mesos 1.9, `GET_QUOTA` has an object with both `QuotaInfo`
+  // and `value` set. Since Mesos 1.9, the object will only have `value` set.
+  //
   // The `_WITH_ROLE` alias is deprecated and will be removed after
-  // Mesos 1.2's deprecation cycle ends. The `value` field will continue
-  // to be set until that time.
+  // Mesos 1.2's deprecation cycle ends.
   GET_QUOTA = 11;
   GET_QUOTA_WITH_ROLE = 11;
 
   // `UPDATE_QUOTA` will have an object with a `QuotaInfo` set.
-  UPDATE_QUOTA = 12;
+  //
+  // TODO(mzhu): Remove this action after associated API calls `SET_QUOTA`
+  // and `REMOVE_QUOTA` are no longer supported.
+  //
+  // NOTE: We cannot reuse this action for the `UPDATE_QUOTA` API call,
+  // because the associated `QuotaConfig` message contains more information
+  // than `QuotaInfo`.
+  UPDATE_QUOTA = 12 [deprecated = true];
+
+  // `UPDATE_QUOTA_WITH_CONFIG` will have an object
+  // with a `value` field set to the role name.
+  UPDATE_QUOTA_WITH_CONFIG = 50;
 
   // `VIEW_FRAMEWORK` will have an object with a `FrameworkInfo` set.
   VIEW_FRAMEWORK = 13;
@@ -215,6 +227,18 @@ enum Action {
   GET_MAINTENANCE_STATUS = 33;
 
   // This action will not fill in any object fields, since a principal is
+  // either allowed to drain an agent or is unauthorized.
+  DRAIN_AGENT = 51;
+
+  // This action will not fill in any object fields, since a principal is
+  // either allowed to deactivate an agent or is unauthorized.
+  DEACTIVATE_AGENT = 52;
+
+  // This action will not fill in any object fields, since a principal is
+  // either allowed to reactivate an agent or is unauthorized.
+  REACTIVATE_AGENT = 53;
+
+  // This action will not fill in any object fields, since a principal is
   // either allowed to mark an agent as gone or is unauthorized.
   MARK_AGENT_GONE = 34;
 
@@ -252,8 +276,52 @@ enum Action {
   MODIFY_RESOURCE_PROVIDER_CONFIG = 39;
 
   // This action will not fill in any object fields. A principal is either
+  // allowed to mark a resource provider as gone or is unauthorized.
+  MARK_RESOURCE_PROVIDER_GONE = 48;
+
+  // This action will not fill in any object fields. A principal is either
+  // allowed to view resource provider information or is unauthorized.
+  VIEW_RESOURCE_PROVIDER = 47;
+
+  // This action will not fill in any object fields. A principal is either
   // allowed to prune unused container images or is unauthorized.
   PRUNE_IMAGES = 41;
+
+  // `RESIZE_VOLUME` will have an object with `Resource` set.
+  //
+  // NOTE: For consistency, the `value` field will be set with the most refined
+  // role until all `*_WITH_ROLE` aliases are removed.
+  RESIZE_VOLUME = 42;
+
+  // `CREATE_BLOCK_DISK` will have an object with `Resource` set.
+  //
+  // NOTE: For consistency, the `value` field will be set with the most refined
+  // role until all `*_WITH_ROLE` aliases are removed.
+  CREATE_BLOCK_DISK = 43;
+
+  // `DESTROY_BLOCK_DISK` will have an object with `Resource` set.
+  //
+  // NOTE: For consistency, the `value` field will be set with the most refined
+  // role until all `*_WITH_ROLE` aliases are removed.
+  DESTROY_BLOCK_DISK = 44;
+
+  // `CREATE_MOUNT_DISK` will have an object with `Resource` set.
+  //
+  // NOTE: For consistency, the `value` field will be set with the most refined
+  // role until all `*_WITH_ROLE` aliases are removed.
+  CREATE_MOUNT_DISK = 45;
+
+  // `DESTROY_MOUNT_DISK` will have an object with `Resource` set.
+  //
+  // NOTE: For consistency, the `value` field will be set with the most refined
+  // role until all `*_WITH_ROLE` aliases are removed.
+  DESTROY_MOUNT_DISK = 46;
+
+  // `DESTROY_RAW_DISK` will have an object with `Resource` set.
+  //
+  // NOTE: For consistency, the `value` field will be set with the most refined
+  // role until all `*_WITH_ROLE` aliases are removed.
+  DESTROY_RAW_DISK = 49;
 }
 
 

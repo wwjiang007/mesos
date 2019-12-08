@@ -90,7 +90,8 @@ string CurlFetcherPlugin::name() const
 Future<Nothing> CurlFetcherPlugin::fetch(
     const URI& uri,
     const string& directory,
-    const Option<string>& data) const
+    const Option<string>& data,
+    const Option<string>& outputFileName) const
 {
   // TODO(jieyu): Validate the given URI.
 
@@ -105,9 +106,13 @@ Future<Nothing> CurlFetcherPlugin::fetch(
         directory + "': " + mkdir.error());
   }
 
-  // TODO(jieyu): Allow user to specify the name of the output file.
-  const string output =
-    path::join(directory, Path(path::from_uri(uri.path())).basename());
+  string output;
+  if (outputFileName.isSome()) {
+    output = path::join(directory, outputFileName.get());
+  } else {
+    output = path::join(directory, Path(path::from_uri(uri.path())).basename());
+  }
+
 #ifndef __WINDOWS__
   const string curl = "curl";
 #else

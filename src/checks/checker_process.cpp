@@ -171,30 +171,29 @@ static Try<tuple<string, string>> decodeProcessIOData(const string& data)
   string stdoutReceived;
   string stderrReceived;
 
-  ::recordio::Decoder<v1::agent::ProcessIO> decoder(
-      lambda::bind(
-          deserialize<v1::agent::ProcessIO>,
-          ContentType::PROTOBUF,
-          lambda::_1));
+  ::recordio::Decoder decoder;
 
-  Try<std::deque<Try<v1::agent::ProcessIO>>> records = decoder.decode(data);
+  Try<std::deque<string>> records = decoder.decode(data);
 
   if (records.isError()) {
     return Error(records.error());
   }
 
   while (!records->empty()) {
-    Try<v1::agent::ProcessIO> record = records->front();
+    string record = std::move(records->front());
     records->pop_front();
 
-    if (record.isError()) {
-      return Error(record.error());
+    Try<v1::agent::ProcessIO> result = deserialize<v1::agent::ProcessIO>(
+        ContentType::PROTOBUF, record);
+
+    if (result.isError()) {
+      return Error(result.error());
     }
 
-    if (record->data().type() == v1::agent::ProcessIO::Data::STDOUT) {
-      stdoutReceived += record->data().data();
-    } else if (record->data().type() == v1::agent::ProcessIO::Data::STDERR) {
-      stderrReceived += record->data().data();
+    if (result->data().type() == v1::agent::ProcessIO::Data::STDOUT) {
+      stdoutReceived += result->data().data();
+    } else if (result->data().type() == v1::agent::ProcessIO::Data::STDERR) {
+      stderrReceived += result->data().data();
     }
   }
 
@@ -616,6 +615,8 @@ Future<int> CheckerProcess::nestedCommandCheck(
     agent::Call call;
     call.set_type(agent::Call::REMOVE_NESTED_CONTAINER);
 
+    mesos::ContainerID previousId = previousCheckContainerId.get();
+
     agent::Call::RemoveNestedContainer* removeContainer =
       call.mutable_remove_nested_container();
 
@@ -635,33 +636,31 @@ Future<int> CheckerProcess::nestedCommandCheck(
 
     http::request(request, false)
       .onFailed(defer(self(),
-                      [this, promise](const string& failure) {
+                      [this, promise, previousId](const string& failure) {
         LOG(WARNING) << "Connection to remove the nested container '"
-                     << previousCheckContainerId.get() << "' used for the "
-                     << name << " for task '" << taskId << "' failed: "
-                     << failure;
+                     << previousId << "' used for the " << name << " for"
+                     << " task '" << taskId << "' failed: " << failure;
 
         // Something went wrong while sending the request, we treat this
         // as a transient failure and discard the promise.
         promise->discard();
       }))
       .onReady(defer(self(),
-                     [this, promise, cmd, nested]
+                     [this, promise, cmd, nested, previousId]
                      (const http::Response& response) {
         if (response.code != http::Status::OK) {
           // The agent was unable to remove the check container, we
           // treat this as a transient failure and discard the promise.
           LOG(WARNING) << "Received '" << response.status << "' ("
                        << response.body << ") while removing the nested"
-                       << " container '" << previousCheckContainerId.get()
-                       << "' used for the " << name << " for task '"
-                       << taskId << "'";
+                       << " container '" << previousId << "' used for"
+                       << " the " << name << " for task '" << taskId << "'";
 
           promise->discard();
+        } else {
+          previousCheckContainerId = None();
+          _nestedCommandCheck(promise, cmd, nested);
         }
-
-        previousCheckContainerId = None();
-        _nestedCommandCheck(promise, cmd, nested);
       }));
   } else {
     _nestedCommandCheck(promise, cmd, nested);
@@ -795,7 +794,19 @@ void CheckerProcess::___nestedCommandCheck(
                  << launchResponse.body << ") while launching " << name
                  << " for task '" << taskId << "'";
 
-    promise->discard();
+    // We'll try to remove the container created for the check at the
+    // beginning of the next check. In order to prevent a failure, the
+    // promise should only be completed once we're sure that the
+    // container has terminated.
+    waitNestedContainer(checkContainerId, nested)
+      .onAny([promise](const Future<Option<int>>&) {
+        // We assume that once `WaitNestedContainer` returns,
+        // irrespective of whether the response contains a failure, the
+        // container will be in a terminal state, and that it will be
+        // possible to remove it.
+        promise->discard();
+    });
+
     return;
   }
 
@@ -881,7 +892,10 @@ void CheckerProcess::nestedCommandCheckFailure(
     //
     // This will allow us to recover from a blip. The executor will
     // pause the checker when it detects that the agent is not
-    // available.
+    // available. Here we do not need to wait the check container since
+    // the agent may have been unavailable, and when the agent is back,
+    // it will destroy the check container as orphan container, and we
+    // will eventually remove it in `nestedCommandCheck()`.
     LOG(WARNING) << "Connection to the agent to launch " << name
                  << " for task '" << taskId << "' failed: " << failure;
 
@@ -988,16 +1002,12 @@ void CheckerProcess::processCommandCheckResult(
   processCheckResult(stopwatch, result);
 }
 
-
-Future<int> CheckerProcess::httpCheck(
-    const check::Http& http,
-    const Option<runtime::Plain>& plain)
+static vector<string> httpCheckCommand(
+    const string& command,
+    const string& url)
 {
-  const string url = http.scheme + "://" + http.domain + ":" +
-                     stringify(http.port) + http.path;
-
-  const vector<string> argv = {
-    HTTP_CHECK_COMMAND,
+  return {
+    command,
     "-s",                 // Don't show progress meter or error messages.
     "-S",                 // Makes curl show an error message if it fails.
     "-L",                 // Follows HTTP 3xx redirects.
@@ -1007,8 +1017,16 @@ Future<int> CheckerProcess::httpCheck(
     "-g",                 // Switches off the "URL globbing parser".
     url
   };
+}
 
-  return _httpCheck(argv, plain);
+Future<int> CheckerProcess::httpCheck(
+    const check::Http& http,
+    const Option<runtime::Plain>& plain)
+{
+  const string url =
+    http.scheme + "://" + http.domain + ":" + stringify(http.port) + http.path;
+
+  return _httpCheck(httpCheckCommand(HTTP_CHECK_COMMAND, url), plain);
 }
 
 
@@ -1167,9 +1185,7 @@ static vector<string> dockerNetworkRunCommand(
     "run",
     "--rm",
     "--network=container:" + docker.containerName,
-    image,
-    "pwsh",
-    "-Command"
+    image
   };
 }
 
@@ -1187,20 +1203,8 @@ Future<int> CheckerProcess::dockerHttpCheck(
   const string url = http.scheme + "://" + http.domain + ":" +
                      stringify(http.port) + http.path;
 
-  vector<string> httpCheckCommandParameters = {
-    "Invoke-WebRequest",
-    "-Uri", url,
-    "-UseBasicParsing",                     // Needed for nanoserver.
-    "-SkipCertificateCheck",                // Similar to `curl -k`.
-    "|",
-    "Out-File",                             // Write status to file.
-    "-InputObject", "{$_.StatusCode}",      // Just return status code.
-    "-Path", "$HOME\\status",
-    "-Encoding", "ASCII",                   // Avoid UTF-16 encoding.
-    "-NoNewline",
-    ";",
-    "Get-Content", "-Raw", "$HOME\\status"  // Output status code.
-  };
+  const vector<string> httpCheckCommandParameters =
+    httpCheckCommand(HTTP_CHECK_COMMAND, url);
 
   argv.insert(
       argv.end(),
@@ -1212,17 +1216,28 @@ Future<int> CheckerProcess::dockerHttpCheck(
 #endif // __WINDOWS__
 
 
+static vector<string> tcpCommand(
+  const string& command,
+  const string& domain,
+  uint16_t port)
+{
+  return {
+    command,
+    "--ip=" + domain,
+    "--port=" + stringify(port)
+  };
+}
+
+
 Future<bool> CheckerProcess::tcpCheck(
     const check::Tcp& tcp,
     const Option<runtime::Plain>& plain)
 {
   const string command = path::join(tcp.launcherDir, TCP_CHECK_COMMAND);
 
-  const vector<string> argv = {
-    command,
-    "--ip=" + tcp.domain,
-    "--port=" + stringify(tcp.port)
-  };
+  const vector<string> argv =
+    tcpCommand(command, tcp.domain, static_cast<uint16_t>(tcp.port));
+
   return _tcpCheck(argv, plain);
 }
 
@@ -1363,14 +1378,8 @@ Future<bool> CheckerProcess::dockerTcpCheck(
   vector<string> argv =
     dockerNetworkRunCommand(docker, DOCKER_HEALTH_CHECK_IMAGE);
 
-  // Test-NetConnection doesn't exist on PowerShell Core, so we
-  // call the C# TcpClient library instead. Command looks like:
-  // (New-Object System.Net.Sockets.TcpClient(IP, PORT)).Close()
-  vector<string> tcpCheckCommandParameters = {
-    "(New-Object",
-    "System.Net.Sockets.TcpClient(\"" + tcp.domain + "\",",
-    stringify(tcp.port) + ")).Close()"
-  };
+  const vector<string> tcpCheckCommandParameters =
+    tcpCommand(TCP_CHECK_COMMAND, tcp.domain, static_cast<uint16_t>(tcp.port));
 
   argv.insert(
       argv.end(),

@@ -62,12 +62,12 @@ def autocomplete(cmds, plugins, config, argv):
     current_word = argv[0]
     argv = argv[1:]
 
-    if len(argv) > 0 and argv[0] == "help":
+    if argv and argv[0] == "help":
         argv = argv[1:]
 
     comp_words = list(cmds.keys()) + ["help"]
     comp_words = cli.util.completions(comp_words, current_word, argv)
-    if comp_words != None:
+    if comp_words is not None:
         return (option, comp_words)
 
     plugin = cli.util.get_module(plugins, argv[0])
@@ -93,7 +93,7 @@ def main(argv):
     cmds = {
         cli.util.get_module(plugins, plugin).PLUGIN_NAME:
         cli.util.get_module(plugins, plugin).SHORT_HELP
-        for plugin in plugins.keys()
+        for plugin in list(plugins.keys())
     }
 
     # Parse all incoming arguments using docopt.
@@ -122,33 +122,33 @@ def main(argv):
         except Exception:
             pass
 
-        print option
-        print " ".join(comp_words)
+        print(option)
+        print(" ".join(comp_words))
+        return 0
 
     # Use the meta-command "help" to print help information for the
     # supplied command and its subcommands.
-    elif cmd == "help":
-        if len(argv) > 0 and argv[0] in cmds:
+    if cmd == "help":
+        if argv and argv[0] in cmds:
             plugin = cli.util.get_module(plugins, argv[0])
             plugin_class = getattr(plugin, plugin.PLUGIN_CLASS)
-            plugin_class(settings, config).main(argv[1:] + ["--help"])
-        else:
-            main(["--help"])
+            return plugin_class(settings, config).main(argv[1:] + ["--help"])
+
+        return main(["--help"])
 
     # Run the command through its plugin.
-    elif cmd in cmds.keys():
+    if cmd in list(cmds.keys()):
         plugin = cli.util.get_module(plugins, cmd)
         plugin_class = getattr(plugin, plugin.PLUGIN_CLASS)
-        plugin_class(settings, config).main(argv)
+        return plugin_class(settings, config).main(argv)
 
     # Print help information if no commands match.
-    else:
-        main(["--help"])
+    return main(["--help"])
 
 
 if __name__ == "__main__":
     try:
-        main(sys.argv[1:])
+        sys.exit(main(sys.argv[1:]))
     except CLIException as exception:
         sys.exit("Error: {error}.".format(error=str(exception)))
     except KeyboardInterrupt:

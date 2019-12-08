@@ -28,7 +28,7 @@
 #include <process/process.hpp>
 
 #include <process/metrics/counter.hpp>
-#include <process/metrics/gauge.hpp>
+#include <process/metrics/pull_gauge.hpp>
 
 #include <stout/hashmap.hpp>
 
@@ -42,7 +42,7 @@ class FetcherProcess : public process::Process<FetcherProcess>
 {
 public:
   explicit FetcherProcess(const Flags& _flags);
-  virtual ~FetcherProcess();
+  ~FetcherProcess() override;
 
   process::Future<Nothing> fetch(
       const ContainerID& containerId,
@@ -190,6 +190,9 @@ public:
     size_t size() const;
 
   private:
+    // Returns whether the cache file exists and not corrupted.
+    Try<Nothing> validate(const std::shared_ptr<Cache::Entry>& entry);
+
     // Maximum storable number of bytes in the cache directory.
     const Bytes space;
 
@@ -258,8 +261,8 @@ private:
     process::metrics::Counter task_fetches_succeeded;
     process::metrics::Counter task_fetches_failed;
 
-    process::metrics::Gauge cache_size_total_bytes;
-    process::metrics::Gauge cache_size_used_bytes;
+    process::metrics::PullGauge cache_size_total_bytes;
+    process::metrics::PullGauge cache_size_used_bytes;
   } metrics;
 
   const Flags flags;

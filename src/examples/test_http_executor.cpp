@@ -195,6 +195,10 @@ public:
           break;
         }
 
+        case Event::HEARTBEAT: {
+          break;
+        }
+
         case Event::UNKNOWN: {
           LOG(WARNING) << "Received an UNKNOWN event and ignored";
           break;
@@ -204,7 +208,7 @@ public:
   }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // We initialize the library here to ensure that callbacks are only invoked
     // after the process has spawned.

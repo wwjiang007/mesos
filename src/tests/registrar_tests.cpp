@@ -21,6 +21,8 @@
 #include <string>
 #include <vector>
 
+#include <google/protobuf/util/message_differencer.h>
+
 #include <mesos/attributes.hpp>
 #include <mesos/type_utils.hpp>
 
@@ -71,6 +73,7 @@ using mesos::internal::log::Replica;
 using std::cout;
 using std::endl;
 using std::map;
+using std::pair;
 using std::set;
 using std::string;
 using std::vector;
@@ -82,7 +85,9 @@ using process::http::OK;
 using process::http::Response;
 using process::http::Unauthorized;
 
+using google::protobuf::Map;
 using google::protobuf::RepeatedPtrField;
+using google::protobuf::util::MessageDifferencer;
 
 using mesos::internal::protobuf::maintenance::createMachineList;
 using mesos::internal::protobuf::maintenance::createSchedule;
@@ -148,7 +153,7 @@ public:
       replica2(nullptr) {}
 
 protected:
-  virtual void SetUp()
+  void SetUp() override
   {
     TemporaryDirectoryTest::SetUp();
 
@@ -190,7 +195,7 @@ protected:
     slave.CopyFrom(info);
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     delete state;
     delete storage;
@@ -908,42 +913,553 @@ TEST_F(RegistrarTest, StopMaintenance)
 }
 
 
+// Marks an agent for draining and checks for the appropriate data.
+TEST_F(RegistrarTest, DrainAgent)
+{
+  SlaveID notAdmittedID;
+  notAdmittedID.set_value("not-admitted");
+
+  {
+    // Prepare the registrar.
+    Registrar registrar(flags, state);
+    AWAIT_READY(registrar.recover(master));
+
+    // Add an agent to be marked by other operations.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new AdmitSlave(slave))));
+
+    // Try to mark an unknown agent for draining.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new DrainAgent(notAdmittedID, None(), false))));
+  }
+
+  {
+    // Check that the agent is admitted, but has no DrainConfig.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(1, registry->slaves().slaves().size());
+    EXPECT_EQ(slave, registry->slaves().slaves(0).info());
+    EXPECT_FALSE(registry->slaves().slaves(0).has_drain_info());
+    EXPECT_FALSE(registry->slaves().slaves(0).deactivated());
+
+    // No minimum capability should be added when the operation does
+    // not mutate anything.
+    EXPECT_EQ(0, registry->minimum_capabilities().size());
+
+    // Drain an admitted agent.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new DrainAgent(slave.id(), None(), true))));
+  }
+
+  {
+    // Check that agent is now marked for draining.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(1, registry->slaves().slaves().size());
+    ASSERT_TRUE(registry->slaves().slaves(0).has_drain_info());
+    EXPECT_EQ(DRAINING, registry->slaves().slaves(0).drain_info().state());
+    EXPECT_FALSE(registry->slaves().slaves(0)
+      .drain_info().config().has_max_grace_period());
+    EXPECT_TRUE(registry->slaves().slaves(0).drain_info().config().mark_gone());
+    EXPECT_TRUE(registry->slaves().slaves(0).deactivated());
+
+    // Minimum capability should be added now.
+    ASSERT_EQ(1, registry->minimum_capabilities().size());
+    EXPECT_EQ(
+        MasterInfo_Capability_Type_Name(MasterInfo::Capability::AGENT_DRAINING),
+        registry->minimum_capabilities(0).capability());
+
+    // Mark the agent unreachable.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new MarkSlaveUnreachable(slave, protobuf::getCurrentTime()))));
+  }
+
+  {
+    // Check that unreachable agent retains the draining.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    EXPECT_EQ(0, registry->slaves().slaves().size());
+    ASSERT_EQ(1, registry->unreachable().slaves().size());
+    ASSERT_TRUE(registry->unreachable().slaves(0).has_drain_info());
+    EXPECT_FALSE(
+        registry->unreachable().slaves(0)
+          .drain_info().config().has_max_grace_period());
+    EXPECT_TRUE(
+        registry->unreachable().slaves(0).drain_info().config().mark_gone());
+    EXPECT_TRUE(registry->unreachable().slaves(0).deactivated());
+
+    // Mark the agent reachable.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new MarkSlaveReachable(slave))));
+  }
+
+  {
+    // Check that reachable agent retains the draining.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(1, registry->slaves().slaves().size());
+    EXPECT_EQ(0, registry->unreachable().slaves().size());
+    ASSERT_TRUE(registry->slaves().slaves(0).has_drain_info());
+    EXPECT_FALSE(
+        registry->slaves().slaves(0)
+          .drain_info().config().has_max_grace_period());
+    EXPECT_TRUE(registry->slaves().slaves(0).drain_info().config().mark_gone());
+    EXPECT_TRUE(registry->slaves().slaves(0).deactivated());
+  }
+}
+
+
+TEST_F(RegistrarTest, MarkAgentDrained)
+{
+  {
+    // Prepare the registrar.
+    Registrar registrar(flags, state);
+    AWAIT_READY(registrar.recover(master));
+
+    // Add an agent to be marked for draining.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new AdmitSlave(slave))));
+
+    // Try to mark a non-draining agent as drained. This should fail.
+    AWAIT_FALSE(registrar.apply(Owned<RegistryOperation>(
+        new MarkAgentDrained(slave.id()))));
+
+    // Drain the admitted agent.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new DrainAgent(slave.id(), None(), true))));
+  }
+
+  {
+    // Check that agent is now marked for draining.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(1, registry->slaves().slaves().size());
+    EXPECT_TRUE(registry->slaves().slaves(0).has_drain_info());
+    EXPECT_EQ(DRAINING, registry->slaves().slaves(0).drain_info().state());
+
+    // Transition from draining to drained.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new MarkAgentDrained(slave.id()))));
+  }
+
+  {
+    // Check that agent is now marked drained.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(1, registry->slaves().slaves().size());
+    ASSERT_TRUE(registry->slaves().slaves(0).has_drain_info());
+    EXPECT_EQ(DRAINED, registry->slaves().slaves(0).drain_info().state());
+
+    // Try the same sequence of operations for an unreachable agent.
+    // First remove the agent.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new RemoveSlave(slave))));
+
+    // Add the agent back, anew.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new AdmitSlave(slave))));
+
+    // Mark it unreachable.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new MarkSlaveUnreachable(slave, protobuf::getCurrentTime()))));
+
+    // Try to mark the agent drained prematurely.
+    AWAIT_FALSE(registrar.apply(Owned<RegistryOperation>(
+        new MarkAgentDrained(slave.id()))));
+
+    // Now drain properly.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new DrainAgent(slave.id(), None(), true))));
+
+    // And finish draining.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new MarkAgentDrained(slave.id()))));
+  }
+
+  {
+    // Check that unreachable agent is now marked drained.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(1, registry->unreachable().slaves().size());
+    ASSERT_TRUE(registry->unreachable().slaves(0).has_drain_info());
+    EXPECT_EQ(DRAINED, registry->unreachable().slaves(0).drain_info().state());
+  }
+}
+
+
+TEST_F(RegistrarTest, DeactivateAgent)
+{
+  SlaveID notAdmittedID;
+  notAdmittedID.set_value("not-admitted");
+
+  {
+    // Prepare the registrar.
+    Registrar registrar(flags, state);
+    AWAIT_READY(registrar.recover(master));
+
+    // Add an agent to be marked by other operations.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new AdmitSlave(slave))));
+
+    // Try to mark an unknown agent for draining.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new DeactivateAgent(notAdmittedID))));
+  }
+
+  {
+    // Check that the agent is admitted and is not deactivated.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(1, registry->slaves().slaves().size());
+    EXPECT_EQ(slave, registry->slaves().slaves(0).info());
+    EXPECT_FALSE(registry->slaves().slaves(0).has_drain_info());
+    EXPECT_FALSE(registry->slaves().slaves(0).deactivated());
+
+    // No minimum capability should be added when the operation does
+    // not mutate anything.
+    EXPECT_EQ(0, registry->minimum_capabilities().size());
+
+    // Deactivate the admitted agent this time.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new DeactivateAgent(slave.id()))));
+  }
+
+  {
+    // Check that agent is now deactivated.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(1, registry->slaves().slaves().size());
+    EXPECT_FALSE(registry->slaves().slaves(0).has_drain_info());
+    EXPECT_TRUE(registry->slaves().slaves(0).deactivated());
+
+    // Minimum capability should be added now.
+    ASSERT_EQ(1, registry->minimum_capabilities().size());
+    EXPECT_EQ(
+        MasterInfo_Capability_Type_Name(MasterInfo::Capability::AGENT_DRAINING),
+        registry->minimum_capabilities(0).capability());
+
+    // Mark the agent unreachable.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new MarkSlaveUnreachable(slave, protobuf::getCurrentTime()))));
+  }
+
+  {
+    // Check that unreachable agent retains the deactivation.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    EXPECT_EQ(0, registry->slaves().slaves().size());
+    ASSERT_EQ(1, registry->unreachable().slaves().size());
+    EXPECT_FALSE(registry->unreachable().slaves(0).has_drain_info());
+    EXPECT_TRUE(registry->unreachable().slaves(0).deactivated());
+
+    // Mark the agent reachable.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new MarkSlaveReachable(slave))));
+  }
+
+  {
+    // Check that reachable agent retains the deactivation.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(1, registry->slaves().slaves().size());
+    EXPECT_EQ(0, registry->unreachable().slaves().size());
+    EXPECT_FALSE(registry->slaves().slaves(0).has_drain_info());
+    EXPECT_TRUE(registry->slaves().slaves(0).deactivated());
+  }
+}
+
+
+// Checks that reactivating agents will remove the draining/deactivated
+// metadata and the AGENT_DRAINING minimum capability correctly.
+TEST_F(RegistrarTest, ReactivateAgent)
+{
+  SlaveID reachable1;
+  reachable1.set_value("reachable1");
+
+  SlaveID reachable2;
+  reachable2.set_value("reachable2");
+
+  SlaveID unreachable1;
+  unreachable1.set_value("unreachable1");
+
+  SlaveID unreachable2;
+  unreachable2.set_value("unreachable2");
+
+  SlaveInfo info1;
+  info1.set_hostname("localhost");
+  info1.mutable_id()->CopyFrom(reachable1);
+
+  SlaveInfo info2;
+  info2.set_hostname("localhost");
+  info2.mutable_id()->CopyFrom(reachable2);
+
+  SlaveInfo info3;
+  info3.set_hostname("localhost");
+  info3.mutable_id()->CopyFrom(unreachable1);
+
+  SlaveInfo info4;
+  info4.set_hostname("localhost");
+  info4.mutable_id()->CopyFrom(unreachable2);
+
+  {
+    // Prepare the registrar.
+    Registrar registrar(flags, state);
+    AWAIT_READY(registrar.recover(master));
+
+    // Add all the agents.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new AdmitSlave(info1))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new AdmitSlave(info2))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new AdmitSlave(info3))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new AdmitSlave(info4))));
+
+    // Mark two agents as unreachable.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new MarkSlaveUnreachable(info3, protobuf::getCurrentTime()))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new MarkSlaveUnreachable(info4, protobuf::getCurrentTime()))));
+
+    // Two reachable deactivated agents.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new DeactivateAgent(reachable1))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new DeactivateAgent(reachable2))));
+  }
+
+  {
+    // Check for two deactivated agents and the minimum capability.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(2, registry->slaves().slaves().size());
+    ASSERT_EQ(2, registry->unreachable().slaves().size());
+
+    EXPECT_TRUE(registry->slaves().slaves(0).deactivated());
+    EXPECT_TRUE(registry->slaves().slaves(1).deactivated());
+
+    ASSERT_EQ(1, registry->minimum_capabilities().size());
+    EXPECT_EQ(
+        MasterInfo_Capability_Type_Name(MasterInfo::Capability::AGENT_DRAINING),
+        registry->minimum_capabilities(0).capability());
+
+    // Reactivate one agent.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new ReactivateAgent(reachable1))));
+  }
+
+  {
+    // Check for one deactivated agent and
+    // that the minimum capability is still present.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(2, registry->slaves().slaves().size());
+    ASSERT_EQ(2, registry->unreachable().slaves().size());
+
+    EXPECT_FALSE(registry->slaves().slaves(0).deactivated());
+    EXPECT_TRUE(registry->slaves().slaves(1).deactivated());
+
+    ASSERT_EQ(1, registry->minimum_capabilities().size());
+    EXPECT_EQ(
+        MasterInfo_Capability_Type_Name(MasterInfo::Capability::AGENT_DRAINING),
+        registry->minimum_capabilities(0).capability());
+
+    // Reactivate the other agent.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new ReactivateAgent(reachable2))));
+  }
+
+  {
+    // Check for one deactivated agent and
+    // that the minimum capability is still present.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(2, registry->slaves().slaves().size());
+    ASSERT_EQ(2, registry->unreachable().slaves().size());
+
+    EXPECT_FALSE(registry->slaves().slaves(0).deactivated());
+    EXPECT_FALSE(registry->slaves().slaves(1).deactivated());
+
+    ASSERT_EQ(0, registry->minimum_capabilities().size());
+
+    // Two unreachable deactivated agents.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new DeactivateAgent(unreachable1))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new DeactivateAgent(unreachable2))));
+
+    // Try reactivating an agent that is already active.
+    // This should not result in a change.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new ReactivateAgent(reachable1))));
+  }
+
+  {
+    // Again, check for two deactivated agents and the minimum capability.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(2, registry->slaves().slaves().size());
+    ASSERT_EQ(2, registry->unreachable().slaves().size());
+
+    EXPECT_TRUE(registry->unreachable().slaves(0).deactivated());
+    EXPECT_TRUE(registry->unreachable().slaves(1).deactivated());
+
+    ASSERT_EQ(1, registry->minimum_capabilities().size());
+    EXPECT_EQ(
+        MasterInfo_Capability_Type_Name(MasterInfo::Capability::AGENT_DRAINING),
+        registry->minimum_capabilities(0).capability());
+
+    // Reactivate one. This time, in the opposite order.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new ReactivateAgent(unreachable2))));
+  }
+
+  {
+    // Should be one deactivated agent, with minimum capability still present.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(2, registry->slaves().slaves().size());
+    ASSERT_EQ(2, registry->unreachable().slaves().size());
+
+    EXPECT_TRUE(registry->unreachable().slaves(0).deactivated());
+    EXPECT_FALSE(registry->unreachable().slaves(1).deactivated());
+
+    ASSERT_EQ(1, registry->minimum_capabilities().size());
+    EXPECT_EQ(
+        MasterInfo_Capability_Type_Name(MasterInfo::Capability::AGENT_DRAINING),
+        registry->minimum_capabilities(0).capability());
+
+    // Reactivate the other one.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new ReactivateAgent(unreachable1))));
+  }
+
+  {
+    // No deactivated agents, with no minimum capability.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(2, registry->slaves().slaves().size());
+    ASSERT_EQ(2, registry->unreachable().slaves().size());
+
+    EXPECT_FALSE(registry->unreachable().slaves(0).deactivated());
+    EXPECT_FALSE(registry->unreachable().slaves(1).deactivated());
+
+    ASSERT_EQ(0, registry->minimum_capabilities().size());
+
+    // Now try deactivate reachable and unreachable together.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new DeactivateAgent(reachable1))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new DeactivateAgent(unreachable1))));
+
+    // We'll skip a validation step here and reactivate one right away.
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new ReactivateAgent(reachable1))));
+  }
+
+  {
+    // Minimum capability should not be removed if an unreachable agent
+    // is deactivated.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(2, registry->slaves().slaves().size());
+    ASSERT_EQ(2, registry->unreachable().slaves().size());
+
+    EXPECT_FALSE(registry->slaves().slaves(0).deactivated());
+    EXPECT_TRUE(registry->unreachable().slaves(0).deactivated());
+
+    ASSERT_EQ(1, registry->minimum_capabilities().size());
+    EXPECT_EQ(
+        MasterInfo_Capability_Type_Name(MasterInfo::Capability::AGENT_DRAINING),
+        registry->minimum_capabilities(0).capability());
+  }
+}
+
+
 // Tests that adding and updating quotas in the registry works properly.
 TEST_F(RegistrarTest, UpdateQuota)
 {
-  const string ROLE1 = "role1";
-  const string ROLE2 = "role2";
+  // Helper to construct `QuotaConfig`.
+  auto createQuotaConfig = [](const string& role,
+                              const string& quantitiesString,
+                              const string& limitsString) {
+    QuotaConfig config;
+    config.set_role(role);
 
-  // NOTE: `quotaResources1` yields a collection with two `Resource`
-  // objects once converted to `RepeatedPtrField`.
-  Resources quotaResources1 = Resources::parse("cpus:1;mem:1024").get();
-  Resources quotaResources2 = Resources::parse("cpus:2").get();
+    google::protobuf::Map<string, Value::Scalar> guarantees_;
+    ResourceQuantities quantities =
+      CHECK_NOTERROR(ResourceQuantities::fromString(quantitiesString));
+    foreachpair (const string& name, const Value::Scalar& scalar, quantities) {
+      guarantees_[name] = scalar;
+    }
 
-  // Prepare `QuotaInfo` protobufs used in the test.
-  QuotaInfo quota1;
-  quota1.set_role(ROLE1);
-  quota1.mutable_guarantee()->CopyFrom(quotaResources1);
+    google::protobuf::Map<string, Value::Scalar> limits_;
+    ResourceLimits limits =
+      CHECK_NOTERROR(ResourceLimits::fromString(limitsString));
+    foreachpair (const string& name, const Value::Scalar& scalar, limits) {
+      limits_[name] = scalar;
+    }
 
-  Option<Error> validateError1 = quota::validation::quotaInfo(quota1);
-  EXPECT_NONE(validateError1);
+    *config.mutable_guarantees() = std::move(guarantees_);
+    *config.mutable_limits() = std::move(limits_);
 
-  QuotaInfo quota2;
-  quota2.set_role(ROLE2);
-  quota2.mutable_guarantee()->CopyFrom(quotaResources1);
+    return config;
+  };
 
-  Option<Error> validateError2 = quota::validation::quotaInfo(quota2);
-  EXPECT_NONE(validateError2);
+  RepeatedPtrField<QuotaConfig> configs;
 
   {
-    // Prepare the registrar; see the comment above why we need to do this in
-    // every scope.
+    // Initially no quota and minimum capabilities are recorded.
+
     Registrar registrar(flags, state);
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    // Store quota for a role without quota.
-    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
-        new UpdateQuota(quota1))));
+    EXPECT_EQ(0, registry->quota_configs().size());
+    EXPECT_EQ(0, registry->minimum_capabilities().size());
+
+    // Store quota for a role with default quota.
+    *configs.Add() = createQuotaConfig("role1", "", "");
+
+    AWAIT_TRUE(
+        registrar.apply(Owned<RegistryOperation>(new UpdateQuota(configs))));
   }
 
   {
@@ -951,20 +1467,17 @@ TEST_F(RegistrarTest, UpdateQuota)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    // Check that the recovered quota matches the one we stored.
-    ASSERT_EQ(1, registry->quotas().size());
-    EXPECT_EQ(ROLE1, registry->quotas(0).info().role());
-    ASSERT_EQ(2, registry->quotas(0).info().guarantee().size());
+    // Default quota is not persisted into the registry.
+    EXPECT_EQ(0, registry->quota_configs().size());
+    EXPECT_EQ(0, registry->minimum_capabilities().size());
 
-    Resources storedResources(registry->quotas(0).info().guarantee());
-    EXPECT_EQ(quotaResources1, storedResources);
+    // Update quota for `role1`.
+    configs.Clear();
+    *configs.Add() =
+      createQuotaConfig("role1", "cpus:1;mem:1024", "cpus:2;mem:2048");
 
-    // Change quota for `ROLE1`.
-    quota1.mutable_guarantee()->CopyFrom(quotaResources2);
-
-    // Update the only stored quota.
-    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
-        new UpdateQuota(quota1))));
+    AWAIT_TRUE(
+        registrar.apply(Owned<RegistryOperation>(new UpdateQuota(configs))));
   }
 
   {
@@ -972,17 +1485,49 @@ TEST_F(RegistrarTest, UpdateQuota)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    // Check that the recovered quota matches the one we updated.
-    ASSERT_EQ(1, registry->quotas().size());
-    EXPECT_EQ(ROLE1, registry->quotas(0).info().role());
-    ASSERT_EQ(1, registry->quotas(0).info().guarantee().size());
+    EXPECT_EQ(1, registry->quota_configs().size());
 
-    Resources storedResources(registry->quotas(0).info().guarantee());
-    EXPECT_EQ(quotaResources2, storedResources);
+    Try<JSON::Array> expected = JSON::parse<JSON::Array>(
+      R"~(
+      [
+        {
+          "guarantees": {
+            "cpus": {
+              "value": 1
+            },
+            "mem": {
+              "value": 1024
+            }
+          },
+          "limits": {
+            "cpus": {
+              "value": 2
+            },
+            "mem": {
+              "value": 2048
+            }
+          },
+          "role": "role1"
+        }
+      ])~");
 
-    // Store one more quota for a role without quota.
-    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
-        new UpdateQuota(quota2))));
+    EXPECT_EQ(
+        CHECK_NOTERROR(expected), JSON::protobuf(registry->quota_configs()));
+
+    // The `QUOTA_V2` capability is added to the registry.
+    //
+    // TODO(mzhu): This assumes the the registry starts empty which might not
+    // be in the future. Just check the presence of `QUOTA_V2`.
+    EXPECT_EQ(1, registry->minimum_capabilities().size());
+    EXPECT_EQ("QUOTA_V2", registry->minimum_capabilities(0).capability());
+
+    // Update quota for "role2".
+    configs.Clear();
+    *configs.Add() =
+      createQuotaConfig("role2", "cpus:1;mem:1024", "cpus:2;mem:2048");
+
+    AWAIT_TRUE(
+        registrar.apply(Owned<RegistryOperation>(new UpdateQuota(configs))));
   }
 
   {
@@ -994,88 +1539,64 @@ TEST_F(RegistrarTest, UpdateQuota)
     // NOTE: We assume quota messages are stored in order they have
     // been added.
     // TODO(alexr): Consider removing dependency on the order.
-    ASSERT_EQ(2, registry->quotas().size());
-    EXPECT_EQ(ROLE1, registry->quotas(0).info().role());
-    ASSERT_EQ(1, registry->quotas(0).info().guarantee().size());
+    Try<JSON::Array> expected = JSON::parse<JSON::Array>(
+      R"~(
+      [
+        {
+          "guarantees": {
+            "cpus": {
+              "value": 1
+            },
+            "mem": {
+              "value": 1024
+            }
+          },
+          "limits": {
+            "cpus": {
+              "value": 2
+            },
+            "mem": {
+              "value": 2048
+            }
+          },
+          "role": "role1"
+        },
+        {
+          "guarantees": {
+            "cpus": {
+              "value": 1
+            },
+            "mem": {
+              "value": 1024
+            }
+          },
+          "limits": {
+            "cpus": {
+              "value": 2
+            },
+            "mem": {
+              "value": 2048
+            }
+          },
+          "role": "role2"
+        }
+      ])~");
 
-    EXPECT_EQ(ROLE2, registry->quotas(1).info().role());
-    ASSERT_EQ(2, registry->quotas(1).info().guarantee().size());
+    EXPECT_EQ(
+        CHECK_NOTERROR(expected), JSON::protobuf(registry->quota_configs()));
 
-    Resources storedResources(registry->quotas(1).info().guarantee());
-    EXPECT_EQ(quotaResources1, storedResources);
+    // TODO(mzhu): This assumes the the registry starts empty which might not
+    // be in the future. Just check the presence of `QUOTA_V2`.
+    EXPECT_EQ(1, registry->minimum_capabilities().size());
+    EXPECT_EQ("QUOTA_V2", registry->minimum_capabilities(0).capability());
 
-    // Change quota for `role2`.
-    quota2.mutable_guarantee()->CopyFrom(quotaResources2);
+    // Change quota for "role1"` and "role2"` in a single call.
+    configs.Clear();
+    *configs.Add() = createQuotaConfig("role1", "cpus:2", "cpus:4");
+    *configs.Add() = createQuotaConfig("role2", "cpus:2", "cpus:4");
 
-    // Update quota for `role2` in presence of multiple quotas.
-    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
-        new UpdateQuota(quota2))));
-  }
-
-  {
-    Registrar registrar(flags, state);
-    Future<Registry> registry = registrar.recover(master);
-    AWAIT_READY(registry);
-
-    // Check that the recovered quotas match those we stored and updated
-    // previously.
-    // NOTE: We assume quota messages are stored in order they have been
-    // added and update does not change the order.
-    // TODO(alexr): Consider removing dependency on the order.
-    ASSERT_EQ(2, registry->quotas().size());
-
-    EXPECT_EQ(ROLE1, registry->quotas(0).info().role());
-    ASSERT_EQ(1, registry->quotas(0).info().guarantee().size());
-
-    Resources storedResources1(registry->quotas(0).info().guarantee());
-    EXPECT_EQ(quotaResources2, storedResources1);
-
-    EXPECT_EQ(ROLE2, registry->quotas(1).info().role());
-    ASSERT_EQ(1, registry->quotas(1).info().guarantee().size());
-
-    Resources storedResources2(registry->quotas(1).info().guarantee());
-    EXPECT_EQ(quotaResources2, storedResources2);
-  }
-}
-
-
-// Tests removing quotas from the registry.
-TEST_F(RegistrarTest, RemoveQuota)
-{
-  const string ROLE1 = "role1";
-  const string ROLE2 = "role2";
-
-  {
-    // Prepare the registrar; see the comment above why we need to do this in
-    // every scope.
-    Registrar registrar(flags, state);
-    Future<Registry> registry = registrar.recover(master);
-    AWAIT_READY(registry);
-
-    // NOTE: `quotaResources` yields a collection with two `Resource`
-    // objects once converted to `RepeatedPtrField`.
-    Resources quotaResources1 = Resources::parse("cpus:1;mem:1024").get();
-    Resources quotaResources2 = Resources::parse("cpus:2").get();
-
-    // Prepare `QuotaInfo` protobufs.
-    QuotaInfo quota1;
-    quota1.set_role(ROLE1);
-    quota1.mutable_guarantee()->CopyFrom(quotaResources1);
-
-    Option<Error> validateError1 = quota::validation::quotaInfo(quota1);
-    EXPECT_NONE(validateError1);
-
-    QuotaInfo quota2;
-    quota2.set_role(ROLE2);
-    quota2.mutable_guarantee()->CopyFrom(quotaResources2);
-
-    Option<Error> validateError2 = quota::validation::quotaInfo(quota2);
-    EXPECT_NONE(validateError2);
-
-    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
-        new UpdateQuota(quota1))));
-    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
-        new UpdateQuota(quota2))));
+    AWAIT_TRUE(
+        registrar.apply(Owned<RegistryOperation>(new UpdateQuota(configs))));
   }
 
   {
@@ -1084,16 +1605,54 @@ TEST_F(RegistrarTest, RemoveQuota)
     AWAIT_READY(registry);
 
     // Check that the recovered quotas match those we stored previously.
-    // NOTE: We assume quota messages are stored in order they have been
-    // added.
+    // NOTE: We assume quota messages are stored in order they have
+    // been added.
     // TODO(alexr): Consider removing dependency on the order.
-    ASSERT_EQ(2, registry->quotas().size());
-    EXPECT_EQ(ROLE1, registry->quotas(0).info().role());
-    EXPECT_EQ(ROLE2, registry->quotas(1).info().role());
+    Try<JSON::Array> expected = JSON::parse<JSON::Array>(
+      R"~(
+      [
+        {
+          "guarantees": {
+            "cpus": {
+              "value": 2
+            }
+          },
+          "limits": {
+            "cpus": {
+              "value": 4
+            }
+          },
+          "role": "role1"
+        },
+        {
+          "guarantees": {
+            "cpus": {
+              "value": 2
+            }
+          },
+          "limits": {
+            "cpus": {
+              "value": 4
+            }
+          },
+          "role": "role2"
+        }
+      ])~");
 
-    // Remove quota for `role2`.
-    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
-        new RemoveQuota(ROLE2))));
+    EXPECT_EQ(
+        CHECK_NOTERROR(expected), JSON::protobuf(registry->quota_configs()));
+
+    // TODO(mzhu): This assumes the the registry starts empty which might not
+    // be in the future. Just check the presence of `QUOTA_V2`.
+    EXPECT_EQ(1, registry->minimum_capabilities().size());
+    EXPECT_EQ("QUOTA_V2", registry->minimum_capabilities(0).capability());
+
+    // Reset "role2"` quota to default.
+    configs.Clear();
+    *configs.Add() = createQuotaConfig("role2", "", "");
+
+    AWAIT_TRUE(
+        registrar.apply(Owned<RegistryOperation>(new UpdateQuota(configs))));
   }
 
   {
@@ -1101,13 +1660,41 @@ TEST_F(RegistrarTest, RemoveQuota)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    // Check that there is only one quota left in the registry.
-    ASSERT_EQ(1, registry->quotas().size());
-    EXPECT_EQ(ROLE1, registry->quotas(0).info().role());
+    configs.Clear();
+    *configs.Add() = createQuotaConfig("role1", "cpus:2", "cpus:4");
 
-    // Remove quota for `ROLE1`.
-    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
-        new RemoveQuota(ROLE1))));
+    Try<JSON::Array> expected = JSON::parse<JSON::Array>(
+      R"~(
+      [
+        {
+          "guarantees": {
+            "cpus": {
+              "value": 2
+            }
+          },
+          "limits": {
+            "cpus": {
+              "value": 4
+            }
+          },
+          "role": "role1"
+        }
+      ])~");
+
+    EXPECT_EQ(
+        CHECK_NOTERROR(expected), JSON::protobuf(registry->quota_configs()));
+
+    // TODO(mzhu): This assumes the the registry starts empty which might not
+    // be in the future. Just check the presence of `QUOTA_V2`.
+    EXPECT_EQ(1, registry->minimum_capabilities().size());
+    EXPECT_EQ("QUOTA_V2", registry->minimum_capabilities(0).capability());
+
+    // Reset "role1"` quota to default.
+    configs.Clear();
+    *configs.Add() = createQuotaConfig("role1", "", "");
+
+    AWAIT_TRUE(
+        registrar.apply(Owned<RegistryOperation>(new UpdateQuota(configs))));
   }
 
   {
@@ -1115,9 +1702,52 @@ TEST_F(RegistrarTest, RemoveQuota)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    // Check that there are no more quotas at this point.
-    ASSERT_TRUE(registry->quotas().empty());
+    EXPECT_EQ(0, registry->quota_configs().size());
+    // The `QUOTA_V2` capability is removed because `quota_configs` is empty.
+    EXPECT_EQ(0, registry->minimum_capabilities().size());
   }
+}
+
+
+// Tests that updating quota with an invalid config fails.
+TEST_F(RegistrarTest, UpdateQuotaInvalid)
+{
+  QuotaConfig config;
+  config.set_role("role1");
+
+  auto resourceMap = [](const vector<pair<string, double>>& vector)
+    -> Map<string, Value::Scalar> {
+    Map<string, Value::Scalar> result;
+
+    foreachpair (const string& name, double value, vector) {
+      Value::Scalar scalar;
+      scalar.set_value(value);
+      result[name] = scalar;
+    }
+
+    return result;
+  };
+
+  // The quota endpoint only allows memory / disk up to
+  // 1 exabyte (in megabytes) or 1 trillion cores/ports/other.
+  // For this test, we just check 1 invalid case via mem.
+  double largestMegabytes = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+
+  *config.mutable_limits() = resourceMap({{"mem", largestMegabytes + 1.0}});
+
+  Registrar registrar(flags, state);
+  Future<Registry> registry = registrar.recover(master);
+  AWAIT_READY(registry);
+
+  EXPECT_EQ(0, registry->quota_configs().size());
+  EXPECT_EQ(0, registry->minimum_capabilities().size());
+
+  // Store quota for a role with default quota.
+  RepeatedPtrField<QuotaConfig> configs;
+  *configs.Add() = config;
+
+  AWAIT_FALSE(
+      registrar.apply(Owned<RegistryOperation>(new UpdateQuota(configs))));
 }
 
 

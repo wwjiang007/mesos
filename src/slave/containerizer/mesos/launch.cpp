@@ -18,6 +18,7 @@
 #ifdef __linux__
 #include <sched.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #endif // __linux__
 #include <string.h>
 
@@ -33,10 +34,11 @@
 
 #include <stout/adaptor.hpp>
 #include <stout/foreach.hpp>
+#include <stout/fs.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
-#include <stout/protobuf.hpp>
 #include <stout/path.hpp>
+#include <stout/protobuf.hpp>
 #include <stout/stringify.hpp>
 #include <stout/try.hpp>
 #include <stout/unreachable.hpp>
@@ -65,6 +67,10 @@
 #include "linux/ns.hpp"
 #endif
 
+#ifdef ENABLE_SECCOMP_ISOLATOR
+#include "linux/seccomp/seccomp.hpp"
+#endif
+
 #ifndef __WINDOWS__
 #include "posix/rlimits.hpp"
 #endif // __WINDOWS__
@@ -73,11 +79,12 @@
 #include "slave/containerizer/mesos/paths.hpp"
 
 using std::cerr;
-using std::cout;
 using std::endl;
 using std::set;
 using std::string;
 using std::vector;
+
+using process::Owned;
 
 #ifdef __linux__
 using mesos::internal::capabilities::Capabilities;
@@ -85,6 +92,11 @@ using mesos::internal::capabilities::Capability;
 using mesos::internal::capabilities::ProcessCapabilities;
 #endif // __linux__
 
+#ifdef ENABLE_SECCOMP_ISOLATOR
+using mesos::internal::seccomp::SeccompFilter;
+#endif
+
+using mesos::slave::ContainerFileOperation;
 using mesos::slave::ContainerLaunchInfo;
 using mesos::slave::ContainerMountInfo;
 
@@ -248,6 +260,19 @@ static void exitWithStatus(int status)
 }
 
 
+#ifdef __linux__
+static Try<Nothing> mountContainerFilesystem(const ContainerMountInfo& mount)
+{
+  return fs::mount(
+      mount.has_source() ? Option<string>(mount.source()) : None(),
+      mount.target(),
+      mount.has_type() ? Option<string>(mount.type()) : None(),
+      mount.has_flags() ? mount.flags() : 0,
+      mount.has_options() ? Option<string>(mount.options()) : None());
+}
+#endif // __linux__
+
+
 static Try<Nothing> prepareMounts(const ContainerLaunchInfo& launchInfo)
 {
 #ifdef __linux__
@@ -301,7 +326,7 @@ static Try<Nothing> prepareMounts(const ContainerLaunchInfo& launchInfo)
       return Error("Failed to mark '/' as rslave: " + mnt.error());
     }
 
-    cout << "Marked '/' as rslave" << endl;
+    cerr << "Marked '/' as rslave" << endl;
   } else {
     hashset<string> sharedMountTargets;
     foreach (const ContainerMountInfo& mount, launchInfo.mounts()) {
@@ -371,16 +396,13 @@ static Try<Nothing> prepareMounts(const ContainerLaunchInfo& launchInfo)
     // should consider forcing all isolators to use
     // `ContainerMountInfo` for volume mounts.
     if (hasSharedMount) {
-      Result<string> realTargetPath = os::realpath(mount.target());
-      if (!realTargetPath.isSome()) {
-        return Error(
-            "Failed to get the realpath of the mount target '" +
-            mount.target() + "': " +
-            (realTargetPath.isError() ? realTargetPath.error() : "Not found"));
+      Try<fs::MountInfoTable> table = fs::MountInfoTable::read();
+      if (table.isError()) {
+        return Error("Failed to read mount table: " + table.error());
       }
 
       Try<fs::MountInfoTable::Entry> entry =
-        fs::MountInfoTable::findByTarget(realTargetPath.get());
+        table->findByTarget(mount.target());
 
       if (entry.isError()) {
         return Error(
@@ -396,22 +418,140 @@ static Try<Nothing> prepareMounts(const ContainerLaunchInfo& launchInfo)
       }
     }
 
-    Try<Nothing> mnt = fs::mount(
-        (mount.has_source() ? Option<string>(mount.source()) : None()),
-        mount.target(),
-        (mount.has_type() ? Option<string>(mount.type()) : None()),
-        (mount.has_flags() ? mount.flags() : 0),
-        (mount.has_options() ? Option<string>(mount.options()) : None()));
+    // If the mount target doesn't exist yet, create it. The isolator
+    // is responsible for ensuring the target path is safe.
+    if (mount.has_source() && !os::exists(mount.target())) {
+      const string dirname = Path(mount.target()).dirname();
 
+      if (!os::exists(dirname)) {
+        Try<Nothing> mkdir = os::mkdir(Path(mount.target()).dirname());
+
+        if (mkdir.isError()) {
+          return Error(
+              "Failed to create mount target directory '" + dirname + "': " +
+              mkdir.error());
+        }
+      }
+
+      // The mount source could be a file, a directory, or a Linux
+      // pseudo-filesystem. In the last case, the target must be a
+      // directory, so if the source doesn't exist, we default to
+      // mounting on a directory.
+      Try<Nothing> target =
+        (!os::exists(mount.source()) || os::stat::isdir(mount.source()))
+          ? os::mkdir(mount.target())
+          : os::touch(mount.target());
+
+      if (target.isError()) {
+        return Error(
+            "Failed to create mount target '" + mount.target() + "': " +
+            target.error());
+      }
+    }
+
+    Try<Nothing> mnt = mountContainerFilesystem(mount);
     if (mnt.isError()) {
       return Error(
           "Failed to mount '" + stringify(JSON::protobuf(mount)) +
           "': " + mnt.error());
     }
-
-    cout << "Prepared mount '" << JSON::protobuf(mount) << "'" << endl;
   }
 #endif // __linux__
+
+  return Nothing();
+}
+
+
+static Try<Nothing> maskPath(const string& target)
+{
+  Try<Nothing> mnt = Nothing();
+
+#ifdef __linux__
+  if (os::stat::isfile(target)) {
+    mnt = fs::mount("/dev/null", target, None(), MS_BIND | MS_RDONLY, None());
+  } else if (os::stat::isdir(target)) {
+    mnt = fs::mount(None(), target, "tmpfs", MS_RDONLY, "size=0");
+  }
+#endif // __linux__
+
+  if (mnt.isError()) {
+    return Error("Failed to mask '" + target + "': " + mnt.error());
+  }
+
+  return Nothing();
+}
+
+
+static Try<Nothing> executeFileOperation(const ContainerFileOperation& op)
+{
+  switch (op.operation()) {
+    case ContainerFileOperation::SYMLINK: {
+      Try<Nothing> result =
+        ::fs::symlink(op.symlink().source(), op.symlink().target());
+      if (result.isError()) {
+        return Error(
+            "Failed to link '" + op.symlink().source() + "' as '" +
+            op.symlink().target() + "': " + result.error());
+      }
+
+      return Nothing();
+    }
+
+    case ContainerFileOperation::MOUNT: {
+#ifdef __linux__
+      Try<Nothing> result = mountContainerFilesystem(op.mount());
+      if (result.isError()) {
+        return Error(
+            "Failed to mount '" + stringify(JSON::protobuf(op.mount())) +
+            "': " + result.error());
+      }
+
+      return Nothing();
+#else
+      return Error("Container mount is not supported on non-Linux systems");
+#endif // __linux__
+    }
+
+    case ContainerFileOperation::RENAME: {
+      Try<Nothing> result =
+        os::rename(op.rename().source(), op.rename().target());
+
+      // TODO(jpeach): We should only fall back to `mv` if the error
+      // is EXDEV, in which case a rename is a copy+unlink.
+      if (result.isError()) {
+        Option<int> status = os::spawn(
+            "mv", {"mv", "-f", op.rename().source(), op.rename().target()});
+
+        if (status.isNone()) {
+          return Error(
+              "Failed to rename '" + op.rename().source() + "' to '" +
+              op.rename().target() + "':  spawn failed");
+        }
+
+        if (!WSUCCEEDED(status.get())) {
+          return Error(
+              "Failed to rename '" + op.rename().source() + "' to '" +
+              op.rename().target() + "': " + WSTRINGIFY(status.get()));
+        }
+
+        result = Nothing();
+      }
+
+      return Nothing();
+  }
+
+    case ContainerFileOperation::MKDIR: {
+      Try<Nothing> result =
+        os::mkdir(op.mkdir().target(), op.mkdir().recursive());
+      if (result.isError()) {
+        return Error(
+            "Failed to create directory '" + op.mkdir().target() + "': " +
+            result.error());
+      }
+
+      return result;
+    }
+  }
 
   return Nothing();
 }
@@ -442,18 +582,6 @@ static Try<Nothing> enterChroot(const string& rootfs)
 #ifdef __WINDOWS__
   return Error("Changing rootfs is not supported on Windows");
 #else
-  // Verify that rootfs is an absolute path.
-  Result<string> realpath = os::realpath(rootfs);
-  if (realpath.isError()) {
-    return Error(
-        "Failed to determine if rootfs '" + rootfs +
-        "' is an absolute path: " + realpath.error());
-  } else if (realpath.isNone()) {
-    return Error("Rootfs path '" + rootfs + "' does not exist");
-  } else if (realpath.get() != rootfs) {
-    return Error("Rootfs path '" + rootfs + "' is not an absolute path");
-  }
-
 #ifdef __linux__
   Try<Nothing> chroot = fs::chroot::enter(rootfs);
 #else
@@ -470,6 +598,45 @@ static Try<Nothing> enterChroot(const string& rootfs)
   return Nothing();
 #endif // __WINDOWS__
 }
+
+
+#ifdef __linux__
+static void calculateCapabilities(
+    const ContainerLaunchInfo& launchInfo,
+    ProcessCapabilities* capabilities)
+{
+  // If the task has any effective capabilities, grant them to all
+  // the capability sets.
+  if (launchInfo.has_effective_capabilities()) {
+    set<Capability> target =
+      capabilities::convert(launchInfo.effective_capabilities());
+
+    capabilities->set(capabilities::AMBIENT, target);
+    capabilities->set(capabilities::EFFECTIVE, target);
+    capabilities->set(capabilities::PERMITTED, target);
+    capabilities->set(capabilities::INHERITABLE, target);
+    capabilities->set(capabilities::BOUNDING, target);
+  }
+
+  // If we also have bounding capabilities, apply that in preference to
+  // the effective capabilities.
+  if (launchInfo.has_bounding_capabilities()) {
+    set<Capability> bounding =
+      capabilities::convert(launchInfo.bounding_capabilities());
+
+    capabilities->set(capabilities::BOUNDING, bounding);
+  }
+
+  // Force the inherited set to be the same as the bounding set. If we
+  // are root and capabilities have not been specified, then this is a
+  // no-op. If capabilities have been specified, then we need to clip the
+  // inherited set to prevent file-based capabilities granting privileges
+  // outside the bounding set.
+  capabilities->set(
+      capabilities::INHERITABLE,
+      capabilities->get(capabilities::BOUNDING));
+}
+#endif // __linux__
 
 
 int MesosContainerizerLaunch::execute()
@@ -625,10 +792,76 @@ int MesosContainerizerLaunch::execute()
   }
 #endif // __WINDOWS__
 
+#ifdef __linux__
+  // If we need a new mount namespace, we have to do it before
+  // we make the mounts needed to prepare the rootfs template.
+  if (flags.unshare_namespace_mnt) {
+    if (unshare(CLONE_NEWNS) != 0) {
+      cerr << "Failed to unshare mount namespace: "
+           << os::strerror(errno) << endl;
+      exitWithStatus(EXIT_FAILURE);
+    }
+  }
+
+  if (flags.namespace_mnt_target.isSome()) {
+    if (!launchInfo.mounts().empty()) {
+      cerr << "Mounts are not supported if "
+           << "'namespace_mnt_target' is set" << endl;
+      exitWithStatus(EXIT_FAILURE);
+    }
+
+    if (launchInfo.has_rootfs()) {
+      cerr << "Container rootfs is not supported if "
+           << "'namespace_mnt_target' is set" << endl;
+      exitWithStatus(EXIT_FAILURE);
+    }
+  }
+#endif // __linux__
+
+  // Verify that the rootfs is an absolute path.
+  if (launchInfo.has_rootfs()) {
+    const string& rootfs = launchInfo.rootfs();
+
+    cerr << "Preparing rootfs at '" << rootfs << "'" << endl;
+
+    Result<string> realpath = os::realpath(rootfs);
+    if (realpath.isError()) {
+      cerr << "Failed to determine if rootfs '" << rootfs
+           << "' is an absolute path: " << realpath.error() << endl;
+      exitWithStatus(EXIT_FAILURE);
+    } else if (realpath.isNone()) {
+      cerr << "Rootfs path '" << rootfs << "' does not exist" << endl;
+      exitWithStatus(EXIT_FAILURE);
+    } else if (realpath.get() != rootfs) {
+      cerr << "Rootfs path '" << rootfs << "' is not an absolute path" << endl;
+      exitWithStatus(EXIT_FAILURE);
+    }
+
+#ifdef __WINDOWS__
+    cerr << "Changing rootfs is not supported on Windows";
+    exitWithStatus(EXIT_FAILURE);
+#endif // __WINDOWS__
+  }
+
   Try<Nothing> mount = prepareMounts(launchInfo);
   if (mount.isError()) {
     cerr << "Failed to prepare mounts: " << mount.error() << endl;
     exitWithStatus(EXIT_FAILURE);
+  }
+
+  foreach (const string& target, launchInfo.masked_paths()) {
+    mount = maskPath(target);
+    if (mount.isError()) {
+      cerr << "Failed to mask container paths: " << mount.error() << endl;
+    }
+  }
+
+  foreach (const ContainerFileOperation& op, launchInfo.file_operations()) {
+    Try<Nothing> result = executeFileOperation(op);
+    if (result.isError()) {
+      cerr << result.error() << endl;
+      exitWithStatus(EXIT_FAILURE);
+    }
   }
 
   // Run additional preparation commands. These are run as the same
@@ -639,7 +872,7 @@ int MesosContainerizerLaunch::execute()
       exitWithStatus(EXIT_FAILURE);
     }
 
-    cout << "Executing pre-exec command '"
+    cerr << "Executing pre-exec command '"
          << JSON::protobuf(command) << "'" << endl;
 
     Option<int> status;
@@ -694,8 +927,8 @@ int MesosContainerizerLaunch::execute()
     }
 
     // No need to change user/groups if the specified user is the same
-    // as that of the current process.
-    if (_uid.get() != os::getuid().get()) {
+    // as the effective user of the current process.
+    if (_uid.get() != ::geteuid()) {
       Result<gid_t> _gid = os::getgid(launchInfo.user());
       if (!_gid.isSome()) {
         cerr << "Failed to get the gid of user '" << launchInfo.user() << "': "
@@ -709,6 +942,10 @@ int MesosContainerizerLaunch::execute()
              << launchInfo.user() << "': "
              << (_gids.isError() ? _gids.error() : "not found") << endl;
         exitWithStatus(EXIT_FAILURE);
+      }
+
+      foreach (uint32_t supplementaryGroup, launchInfo.supplementary_groups()) {
+        _gids->push_back(supplementaryGroup);
       }
 
       uid = _uid.get();
@@ -726,9 +963,10 @@ int MesosContainerizerLaunch::execute()
 #ifdef __linux__
   // Initialize capabilities support if necessary.
   Option<Capabilities> capabilitiesManager = None();
+  const bool needSetCapabilities = launchInfo.has_effective_capabilities() ||
+                                   launchInfo.has_bounding_capabilities();
 
-  if (launchInfo.has_effective_capabilities() ||
-      launchInfo.has_bounding_capabilities()) {
+  if (needSetCapabilities || launchInfo.has_seccomp_profile()) {
     Try<Capabilities> _capabilitiesManager = Capabilities::create();
     if (_capabilitiesManager.isError()) {
       cerr << "Failed to initialize capabilities support: "
@@ -737,15 +975,15 @@ int MesosContainerizerLaunch::execute()
     }
 
     capabilitiesManager = _capabilitiesManager.get();
+  }
 
-    // Prevent clearing of capabilities on `setuid`.
-    if (uid.isSome()) {
-      Try<Nothing> keepCaps = capabilitiesManager->setKeepCaps();
-      if (keepCaps.isError()) {
-        cerr << "Failed to set process control for keeping capabilities "
-             << "on potential uid change: " << keepCaps.error() << endl;
-        exitWithStatus(EXIT_FAILURE);
-      }
+  // Prevent clearing of capabilities on `setuid`.
+  if (needSetCapabilities && uid.isSome()) {
+    Try<Nothing> keepCaps = capabilitiesManager->setKeepCaps();
+    if (keepCaps.isError()) {
+      cerr << "Failed to set process control for keeping capabilities "
+           << "on potential uid change: " << keepCaps.error() << endl;
+      exitWithStatus(EXIT_FAILURE);
     }
   }
 #else
@@ -758,12 +996,6 @@ int MesosContainerizerLaunch::execute()
 
 #ifdef __linux__
   if (flags.namespace_mnt_target.isSome()) {
-    if (!launchInfo.mounts().empty()) {
-      cerr << "Mounts are not supported if "
-           << "'namespace_mnt_target' is set" << endl;
-      exitWithStatus(EXIT_FAILURE);
-    }
-
     string path = path::join(
         "/proc",
         stringify(flags.namespace_mnt_target.get()),
@@ -777,30 +1009,16 @@ int MesosContainerizerLaunch::execute()
       exitWithStatus(EXIT_FAILURE);
     }
   }
-
-  if (flags.unshare_namespace_mnt) {
-    if (!launchInfo.mounts().empty()) {
-      cerr << "Mounts are not supported if "
-           << "'unshare_namespace_mnt' is set" << endl;
-      exitWithStatus(EXIT_FAILURE);
-    }
-
-    if (unshare(CLONE_NEWNS) != 0) {
-      cerr << "Failed to unshare mount namespace: "
-           << os::strerror(errno) << endl;
-      exitWithStatus(EXIT_FAILURE);
-    }
-  }
 #endif // __linux__
 
   // Change root to a new root, if provided.
   if (launchInfo.has_rootfs()) {
-    cout << "Changing root to " << launchInfo.rootfs() << endl;
+    cerr << "Changing root to " << launchInfo.rootfs() << endl;
 
-    Try<Nothing> chroot = enterChroot(launchInfo.rootfs());
+    Try<Nothing> enter = enterChroot(launchInfo.rootfs());
 
-    if (chroot.isError()) {
-      cerr << chroot.error() << endl;
+    if (enter.isError()) {
+      cerr << enter.error() << endl;
       exitWithStatus(EXIT_FAILURE);
     }
   }
@@ -848,6 +1066,37 @@ int MesosContainerizerLaunch::execute()
     }
   }
 
+#ifdef ENABLE_SECCOMP_ISOLATOR
+  if (launchInfo.has_seccomp_profile()) {
+    CHECK_SOME(capabilitiesManager);
+
+    Try<ProcessCapabilities> capabilities = capabilitiesManager->get();
+    if (capabilities.isError()) {
+      cerr << "Failed to get capabilities for the current process: "
+           << capabilities.error() << endl;
+      exitWithStatus(EXIT_FAILURE);
+    }
+
+    calculateCapabilities(launchInfo, &capabilities.get());
+
+    Try<Owned<SeccompFilter>> seccompFilter = SeccompFilter::create(
+        launchInfo.seccomp_profile(),
+        capabilities.get());
+
+    if (seccompFilter.isError()) {
+      cerr << "Failed to create Seccomp filter: "
+           << seccompFilter.error() << endl;
+      exitWithStatus(EXIT_FAILURE);
+    }
+
+    Try<Nothing> load = seccompFilter.get()->load();
+    if (load.isError()) {
+      cerr << "Failed to load Seccomp filter: " << load.error() << endl;
+      exitWithStatus(EXIT_FAILURE);
+    }
+  }
+#endif // ENABLE_SECCOMP_ISOLATOR
+
 #ifndef __WINDOWS__
   // Change user if provided. Note that we do that after executing the
   // preparation commands so that those commands will be run with the
@@ -877,7 +1126,9 @@ int MesosContainerizerLaunch::execute()
 #endif // __WINDOWS__
 
 #ifdef __linux__
-  if (capabilitiesManager.isSome()) {
+  if (needSetCapabilities) {
+    CHECK_SOME(capabilitiesManager);
+
     Try<ProcessCapabilities> capabilities = capabilitiesManager->get();
     if (capabilities.isError()) {
       cerr << "Failed to get capabilities for the current process: "
@@ -898,40 +1149,19 @@ int MesosContainerizerLaunch::execute()
       exitWithStatus(EXIT_FAILURE);
     }
 
-    // If the task has any effective capabilities, grant them to all
-    // the capability sets.
-    if (launchInfo.has_effective_capabilities()) {
-      set<Capability> target =
-        capabilities::convert(launchInfo.effective_capabilities());
-
-      capabilities->set(capabilities::AMBIENT, target);
-      capabilities->set(capabilities::EFFECTIVE, target);
-      capabilities->set(capabilities::PERMITTED, target);
-      capabilities->set(capabilities::INHERITABLE, target);
-      capabilities->set(capabilities::BOUNDING, target);
-    }
-
-    // If we also have bounding capabilities, apply that in preference to
-    // the effective capabilities.
-    if (launchInfo.has_bounding_capabilities()) {
-      set<Capability> bounding =
-        capabilities::convert(launchInfo.bounding_capabilities());
-
-      capabilities->set(capabilities::BOUNDING, bounding);
-    }
-
-    // Force the inherited set to be the same as the bounding set. If we
-    // are root and capabilities have not been specified, then this is a
-    // no-op. If capabilities have been specified, then we need to clip the
-    // inherited set to prevent file-based capabilities granting privileges
-    // outside the bounding set.
-    capabilities->set(
-        capabilities::INHERITABLE,
-        capabilities->get(capabilities::BOUNDING));
+    calculateCapabilities(launchInfo, &capabilities.get());
 
     Try<Nothing> set = capabilitiesManager->set(capabilities.get());
     if (set.isError()) {
       cerr << "Failed to set process capabilities: " << set.error() << endl;
+      exitWithStatus(EXIT_FAILURE);
+    }
+  }
+
+  if (launchInfo.has_no_new_privileges()) {
+    const int val = launchInfo.no_new_privileges() ? 1 : 0;
+    if (prctl(PR_SET_NO_NEW_PRIVS, val, 0, 0, 0) == -1) {
+      cerr << "Failed to set NO_NEW_PRIVS: " << os::strerror(errno) << endl;
       exitWithStatus(EXIT_FAILURE);
     }
   }
@@ -983,7 +1213,7 @@ int MesosContainerizerLaunch::execute()
       // TODO(tillt): Once we have a solution for MESOS-7292, allow
       // logging of values.
       if (environment.contains(name) && environment[name] != value) {
-        cout << "Overwriting environment variable '" << name << "'" << endl;
+        cerr << "Overwriting environment variable '" << name << "'" << endl;
       }
 
       environment[name] = value;
@@ -997,6 +1227,14 @@ int MesosContainerizerLaunch::execute()
   }
 
 #ifndef __WINDOWS__
+  // Construct a set of file descriptors to close before `exec`'ing.
+  //
+  // On Windows all new processes create by Mesos go through the
+  // `create_process` wrapper which with the completion of MESOS-8926
+  // will prevent inadvertent leaks making this code unnecessary there.
+  Try<vector<int_fd>> fds = os::lsof();
+  CHECK_SOME(fds);
+
   // If we have `containerStatusFd` set, then we need to fork-exec the
   // command we are launching and checkpoint its status on exit. We
   // use fork-exec directly (as opposed to `process::subprocess()`) to
@@ -1066,6 +1304,21 @@ int MesosContainerizerLaunch::execute()
       signalSafeWriteStatus(status);
       os::close(containerStatusFd.get());
       ::_exit(EXIT_SUCCESS);
+    }
+
+    // Avoid leaking not required file descriptors into the forked process.
+    foreach (int_fd fd, fds.get()) {
+      if (fd != STDIN_FILENO && fd != STDOUT_FILENO && fd != STDERR_FILENO) {
+        // NOTE: Set "FD_CLOEXEC" on the fd, instead of closing it
+        // because exec below might exec a memfd.
+        int flags = ::fcntl(fd, F_GETFD);
+        if (flags == -1) {
+          ABORT("Failed to get FD flags");
+        }
+        if (::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1) {
+          ABORT("Failed to set FD_CLOEXEC");
+        }
+      }
     }
   }
 #endif // __WINDOWS__

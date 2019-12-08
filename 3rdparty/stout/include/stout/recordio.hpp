@@ -44,46 +44,35 @@
  * other "Record-IO" implementations use a fixed-size header
  * of 4 bytes to directly encode an unsigned 32 bit length.
  *
- * TODO(bmahler): Move this to libprocess and support async
- * consumption of data.
+ * TODO(bmahler): Make the encoder and decoder zero-copy,
+ * once they're just dealing with bytes. To make the encoder
+ * zero-copy, we need to make "writes" directly to an output
+ * (e.g. call a callback with bytes to write, or write to a
+ * provided "output stream" abstraction). For the decoder,
+ * we can provide a string view into the input data of the
+ * record.
  */
 namespace recordio {
 
 /**
- * Given an encoding function for individual records, this
- * provides encoding from typed records into "Record-IO" data.
+ * Returns the "Record-IO" encoded record. Unlike the
+ * decoder, this can just be a stateless function since
+ * we're taking entire records and each encoded record
+ * is independent.
  */
-template <typename T>
-class Encoder
+inline std::string encode(const std::string& record)\
 {
-public:
-  Encoder(std::function<std::string(const T&)> _serialize)
-    : serialize(_serialize) {}
-
-  /**
-   * Returns the "Record-IO" encoded record.
-   */
-  std::string encode(const T& record) const
-  {
-    std::string s = serialize(record);
-    return stringify(s.size()) + "\n" + s;
-  }
-
-private:
-  std::function<std::string(const T&)> serialize;
-};
+  return stringify(record.size()) + "\n" + record;
+}
 
 
 /**
- * Given a decoding function for individual records, this
- * provides decoding from "Record-IO" data into typed records.
+ * Decodes records from "Record-IO" data (see above).
  */
-template <typename T>
 class Decoder
 {
 public:
-  Decoder(std::function<Try<T>(const std::string&)> _deserialize)
-    : state(HEADER), deserialize(_deserialize) {}
+  Decoder() : state(HEADER) {}
 
   /**
    * Decodes another chunk of data from the "Record-IO" stream
@@ -97,13 +86,13 @@ public:
    * TODO(bmahler): Allow the caller to signal EOF, this allows
    * detection of invalid partial data at the end of the input.
    */
-  Try<std::deque<Try<T>>> decode(const std::string& data)
+  Try<std::deque<std::string>> decode(const std::string& data)
   {
     if (state == FAILED) {
       return Error("Decoder is in a FAILED state");
     }
 
-    std::deque<Try<T>> records;
+    std::deque<std::string> records;
 
     foreach (char c, data) {
       if (state == HEADER) {
@@ -130,7 +119,7 @@ public:
 
         // Note that for 0 length records, we immediately decode.
         if (numify.get() <= 0) {
-          records.push_back(deserialize(buffer));
+          records.push_back(buffer);
           state = HEADER;
         }
       } else if (state == RECORD) {
@@ -140,7 +129,7 @@ public:
         buffer += c;
 
         if (buffer.size() == length.get()) {
-          records.push_back(deserialize(buffer));
+          records.push_back(std::move(buffer));
           buffer.clear();
           state = HEADER;
         }
@@ -162,8 +151,6 @@ private:
   // its underlying memory allocation when we clear it.
   std::string buffer;
   Option<size_t> length;
-
-  std::function<Try<T>(const std::string&)> deserialize;
 };
 
 } // namespace recordio {

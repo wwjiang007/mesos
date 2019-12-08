@@ -86,7 +86,7 @@ class LogStorageProcess : public Process<LogStorageProcess>
 public:
   LogStorageProcess(Log* log, size_t diffsBetweenSnapshots);
 
-  virtual ~LogStorageProcess();
+  ~LogStorageProcess() override;
 
   // Storage implementation.
   Future<Option<Entry>> get(const string& name);
@@ -95,7 +95,7 @@ public:
   Future<std::set<string>> names();
 
 protected:
-  virtual void finalize();
+  void finalize() override;
 
 private:
   Future<Nothing> start();
@@ -566,7 +566,7 @@ Future<bool> LogStorageProcess::___set(
   // use the returned position (i.e., do nothing).
   if (diffs > 0) {
     CHECK(snapshots.contains(entry.name()));
-    position = snapshots.get(entry.name())->position;
+    position = snapshots.at(entry.name()).position;
   }
 
   Snapshot snapshot(position.get(), entry, diffs);

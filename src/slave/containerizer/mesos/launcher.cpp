@@ -38,7 +38,6 @@
 
 using namespace process;
 
-using std::list;
 using std::map;
 using std::string;
 using std::vector;
@@ -56,13 +55,13 @@ Try<Launcher*> SubprocessLauncher::create(const Flags& flags)
 
 
 Future<hashset<ContainerID>> SubprocessLauncher::recover(
-    const list<ContainerState>& states)
+    const vector<ContainerState>& states)
 {
   foreach (const ContainerState& state, states) {
     const ContainerID& containerId = state.container_id();
     pid_t pid = static_cast<pid_t>(state.pid());
 
-    if (pids.containsValue(pid)) {
+    if (pids.contains_value(pid)) {
       // This should (almost) never occur. There is the possibility
       // that a new executor is launched with the same pid as one that
       // just exited (highly unlikely) and the slave dies after the
@@ -85,13 +84,12 @@ Try<pid_t> SubprocessLauncher::fork(
     const ContainerID& containerId,
     const string& path,
     const vector<string>& argv,
-    const Subprocess::IO& in,
-    const Subprocess::IO& out,
-    const Subprocess::IO& err,
+    const mesos::slave::ContainerIO& containerIO,
     const flags::FlagsBase* flags,
     const Option<map<string, string>>& environment,
     const Option<int>& enterNamespaces,
-    const Option<int>& cloneNamespaces)
+    const Option<int>& cloneNamespaces,
+    const vector<int_fd>& whitelistFds)
 {
   if (enterNamespaces.isSome() && enterNamespaces.get() != 0) {
     return Error("Subprocess launcher does not support entering namespaces");
@@ -121,17 +119,24 @@ Try<pid_t> SubprocessLauncher::fork(
   parentHooks.emplace_back(Subprocess::ParentHook::CREATE_JOB());
 #endif // __linux__
 
+  vector<Subprocess::ChildHook> childHooks;
+
+#ifndef __WINDOWS__
+  childHooks.push_back(Subprocess::ChildHook::SETSID());
+#endif // __WINDOWS__
+
   Try<Subprocess> child = subprocess(
       path,
       argv,
-      in,
-      out,
-      err,
+      containerIO.in,
+      containerIO.out,
+      containerIO.err,
       flags,
       environment,
       None(),
       parentHooks,
-      {Subprocess::ChildHook::SETSID()});
+      childHooks,
+      whitelistFds);
 
   if (child.isError()) {
     return Error("Failed to fork a child process: " + child.error());
@@ -160,7 +165,7 @@ Future<Nothing> SubprocessLauncher::destroy(const ContainerID& containerId)
     return Nothing();
   }
 
-  pid_t pid = pids.get(containerId).get();
+  pid_t pid = pids.at(containerId);
 
   // Kill all processes in the session and process group.
   os::killtree(pid, SIGKILL, true, true);

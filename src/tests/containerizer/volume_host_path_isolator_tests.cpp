@@ -28,6 +28,8 @@
 
 #include "slave/containerizer/mesos/containerizer.hpp"
 
+#include "slave/containerizer/mesos/isolators/volume/utils.hpp"
+
 #include "tests/cluster.hpp"
 #include "tests/mesos.hpp"
 
@@ -47,6 +49,8 @@ using testing::WithParamInterface;
 using mesos::internal::slave::Containerizer;
 using mesos::internal::slave::Fetcher;
 using mesos::internal::slave::MesosContainerizer;
+
+using mesos::internal::slave::volume::HOST_PATH_WHITELIST_DELIM;
 
 using mesos::master::detector::MasterDetector;
 
@@ -113,6 +117,62 @@ TEST_F(VolumeHostPathIsolatorTest, ROOT_VolumeFromHost)
   ASSERT_SOME(wait.get());
   ASSERT_TRUE(wait->get().has_status());
   EXPECT_WEXITSTATUS_EQ(0, wait->get().status());
+}
+
+
+// This test verifies that a container launched with a
+// rootfs cannot write to a read-only HOST_PATH volume.
+TEST_F(VolumeHostPathIsolatorTest, ROOT_ReadOnlyVolumeFromHost)
+{
+  string registry = path::join(sandbox.get(), "registry");
+  AWAIT_READY(DockerArchive::create(registry, "test_image"));
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "filesystem/linux,docker/runtime";
+  flags.docker_registry = registry;
+  flags.docker_store_dir = path::join(sandbox.get(), "store");
+  flags.image_providers = "docker";
+
+  Fetcher fetcher(flags);
+
+  Try<MesosContainerizer*> create =
+    MesosContainerizer::create(flags, true, &fetcher);
+
+  ASSERT_SOME(create);
+
+  Owned<Containerizer> containerizer(create.get());
+
+  ContainerID containerId;
+  containerId.set_value(id::UUID::random().toString());
+
+  ExecutorInfo executor = createExecutorInfo(
+      "test_executor",
+      "echo abc > /tmp/dir/file");
+
+  executor.mutable_container()->CopyFrom(createContainerInfo(
+      "test_image",
+      {createVolumeHostPath("/tmp", sandbox.get(), Volume::RO)}));
+
+  string dir = path::join(sandbox.get(), "dir");
+  ASSERT_SOME(os::mkdir(dir));
+
+  string directory = path::join(flags.work_dir, "sandbox");
+  ASSERT_SOME(os::mkdir(directory));
+
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
+      containerId,
+      createContainerConfig(None(), executor, directory),
+      map<string, string>(),
+      None());
+
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
+
+  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+
+  AWAIT_READY(wait);
+  ASSERT_SOME(wait.get());
+  ASSERT_TRUE(wait->get().has_status());
+  EXPECT_WEXITSTATUS_NE(0, wait->get().status());
 }
 
 
@@ -286,6 +346,88 @@ TEST_F(VolumeHostPathIsolatorTest, ROOT_FileVolumeFromHostSandboxMountPoint)
   ASSERT_SOME(wait.get());
   ASSERT_TRUE(wait->get().has_status());
   EXPECT_WEXITSTATUS_EQ(0, wait->get().status());
+}
+
+
+// This test verifies that non-existing host paths under whitelist paths
+// specified by the `host_path_volume_force_creation` agent flag can be
+// properly created and mounted into container's mount namespace.
+TEST_F(VolumeHostPathIsolatorTest, ROOT_VolumeFromHostForceCreation)
+{
+  const string imageName = "test-image";
+  const string registryPath = path::join(sandbox.get(), "registry");
+  AWAIT_READY(DockerArchive::create(registryPath, imageName));
+
+  const string storePath = path::join(sandbox.get(), "store");
+  const string mntPath = path::join(sandbox.get(), "mnt");
+  const vector<string> whitelistedPaths = {
+    path::join(mntPath, "whitelist-01"),
+    path::join(mntPath, "whitelist-02")
+  };
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.docker_registry = registryPath;
+  flags.docker_store_dir = storePath;
+  flags.image_providers = "docker";
+  flags.isolation = "filesystem/linux,docker/runtime";
+  flags.host_path_volume_force_creation = strings::join(
+      HOST_PATH_WHITELIST_DELIM, whitelistedPaths);
+
+  Fetcher fetcher(flags);
+
+  const Try<MesosContainerizer*> create =
+      MesosContainerizer::create(flags, true, &fetcher);
+
+  ASSERT_SOME(create);
+
+  Owned<Containerizer> containerizer(create.get());
+
+  const string sandboxPath = path::join(flags.work_dir, "sandbox");
+  ASSERT_SOME(os::mkdir(sandboxPath));
+
+  // Specify non-existing paths.
+  const vector<string> hostPaths = {
+    path::join(mntPath, "whitelist-01", "a", "b", "c"),
+    path::join(mntPath, "whitelist-02", "d", "e", "f")
+  };
+
+  // Ensure none of `hostPaths` exists.
+  foreach (const string& hostPath, hostPaths) {
+    ASSERT_FALSE(os::exists(hostPath));
+  }
+
+  ContainerID containerId;
+  containerId.set_value(id::UUID::random().toString());
+
+  ContainerInfo containerInfo = createContainerInfo(imageName, {
+      createVolumeHostPath("/mnt/foo", hostPaths.front(), Volume::RW),
+      createVolumeHostPath("/mnt/bar", hostPaths.back(), Volume::RW)});
+
+  ExecutorInfo executor = createExecutorInfo(
+      "test-executor",
+      "test -d /mnt/foo -a -d /mnt/bar");
+  executor.mutable_container()->CopyFrom(containerInfo);
+
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
+      containerId,
+      createContainerConfig(None(), executor, sandboxPath),
+      map<string, string>(),
+      None());
+
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
+
+  Future<Option<ContainerTermination>> wait =
+      containerizer->wait(containerId);
+
+  AWAIT_READY(wait);
+  ASSERT_SOME(wait.get());
+  ASSERT_TRUE(wait->get().has_status());
+  EXPECT_WEXITSTATUS_EQ(0, wait->get().status());
+
+  // Expect `hostPath` was created and is a directory.
+  foreach (const string& hostPath, hostPaths) {
+    EXPECT_TRUE(os::stat::isdir(hostPath));
+  }
 }
 
 

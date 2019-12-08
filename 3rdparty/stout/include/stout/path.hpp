@@ -52,6 +52,63 @@ inline std::string from_uri(const std::string& uri)
 }
 
 
+// Normalizes a given pathname and removes redundant separators and up-level
+// references.
+//
+// Pathnames like `A/B/`, `A///B`, `A/./B`, 'A/foobar/../B` are all normalized
+// to `A/B`. An empty pathname is normalized to `.`. Up-level entry also cannot
+// escape a root path, in which case an error will be returned.
+//
+// This function follows the rules described in path_resolution(7) for Linux.
+// However, it only performs pure lexical processing without touching the
+// actual filesystem.
+inline Try<std::string> normalize(
+    const std::string& path,
+    const char _separator = os::PATH_SEPARATOR)
+{
+  if (path.empty()) {
+    return ".";
+  }
+
+  std::vector<std::string> components;
+  const bool isAbs = (path[0] == _separator);
+  const std::string separator(1, _separator);
+
+  // TODO(jasonlai): Handle pathnames (including absolute paths) in Windows.
+
+  foreach (const std::string& component, strings::tokenize(path, separator)) {
+    // Skips empty components and "." (current directory).
+    if (component == "." || component.empty()) {
+      continue;
+    }
+
+    if (component == "..") {
+      if (components.empty()) {
+        if (isAbs) {
+          return Error("Absolute path '" + path + "' tries to escape root");
+        }
+        components.push_back(component);
+      } else if (components.back() == "..") {
+        components.push_back(component);
+      } else {
+        components.pop_back();
+      }
+    } else {
+      components.push_back(component);
+    }
+  }
+
+  if (components.empty()) {
+    return isAbs ? separator : ".";
+  } else if (isAbs) {
+    // Make sure that a separator is prepended if it is an absolute path.
+    components.insert(components.begin(), "");
+  }
+
+  return strings::join(separator, components);
+}
+
+
 // Base case.
 inline std::string join(
     const std::string& path1,
@@ -145,10 +202,13 @@ inline bool absolute(const std::string& path)
 class Path
 {
 public:
-  Path() : value() {}
+  Path() : value(), separator(os::PATH_SEPARATOR) {}
 
-  explicit Path(const std::string& path)
-    : value(strings::remove(path, "file://", strings::PREFIX)) {}
+  explicit Path(
+      const std::string& path, const char path_separator = os::PATH_SEPARATOR)
+    : value(strings::remove(path, "file://", strings::PREFIX)),
+      separator(path_separator)
+  {}
 
   // TODO(cmaloney): Add more useful operations such as 'directoryname()',
   // 'filename()', etc.
@@ -185,18 +245,18 @@ public:
     size_t end = value.size() - 1;
 
     // Remove trailing slashes.
-    if (value[end] == os::PATH_SEPARATOR) {
-      end = value.find_last_not_of(os::PATH_SEPARATOR, end);
+    if (value[end] == separator) {
+      end = value.find_last_not_of(separator, end);
 
       // Paths containing only slashes result into "/".
       if (end == std::string::npos) {
-        return stringify(os::PATH_SEPARATOR);
+        return stringify(separator);
       }
     }
 
     // 'start' should point towards the character after the last slash
     // that is non trailing.
-    size_t start = value.find_last_of(os::PATH_SEPARATOR, end);
+    size_t start = value.find_last_of(separator, end);
 
     if (start == std::string::npos) {
       start = 0;
@@ -244,12 +304,12 @@ public:
     size_t end = value.size() - 1;
 
     // Remove trailing slashes.
-    if (value[end] == os::PATH_SEPARATOR) {
-      end = value.find_last_not_of(os::PATH_SEPARATOR, end);
+    if (value[end] == separator) {
+      end = value.find_last_not_of(separator, end);
     }
 
     // Remove anything trailing the last slash.
-    end = value.find_last_of(os::PATH_SEPARATOR, end);
+    end = value.find_last_of(separator, end);
 
     // Paths containing no slashes result in ".".
     if (end == std::string::npos) {
@@ -258,16 +318,16 @@ public:
 
     // Paths containing only slashes result in "/".
     if (end == 0) {
-      return stringify(os::PATH_SEPARATOR);
+      return stringify(separator);
     }
 
     // 'end' should point towards the last non slash character
     // preceding the last slash.
-    end = value.find_last_not_of(os::PATH_SEPARATOR, end);
+    end = value.find_last_not_of(separator, end);
 
     // Paths containing no non slash characters result in "/".
     if (end == std::string::npos) {
-      return stringify(os::PATH_SEPARATOR);
+      return stringify(separator);
     }
 
     return value.substr(0, end + 1);
@@ -321,6 +381,7 @@ public:
 
 private:
   std::string value;
+  char separator;
 };
 
 

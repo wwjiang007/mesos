@@ -70,7 +70,14 @@ public:
       "The message to send as the client.",
       "Hello World");
 
-    add(&Flags::server, "server", "IP address of server", "127.0.0.1");
+    add(&Flags::server,
+      "server",
+      "IP address of server",
+      "127.0.0.1");
+
+    add(&Flags::server_hostname,
+      "server_hostname",
+      "Hostname of server");
 
     add(&Flags::port, "port", "Port of server", 5050);
   }
@@ -78,6 +85,7 @@ public:
   bool use_ssl;
   string data;
   string server;
+  Option<string> server_hostname;
   uint16_t port;
 };
 
@@ -142,9 +150,19 @@ TEST_F(SSLClientTest, client)
   Try<net::IP> ip = net::IP::parse(flags.server, AF_INET);
   EXPECT_SOME(ip);
 
-  // Connect to the server socket located at `ip:port`.
-  const Future<Nothing> connect =
-    socket.connect(Address(ip.get(), flags.port));
+  // Connect to the server.
+  Address address(ip.get(), flags.port);
+  Future<Nothing> connect = [&]() {
+    switch(socket.kind()) {
+      case SocketImpl::Kind::POLL:
+        return socket.connect(address);
+      case SocketImpl::Kind::SSL:
+        return socket.connect(
+            address,
+            openssl::create_tls_client_config(flags.server_hostname));
+    }
+    UNREACHABLE();
+  }();
 
   // Verify that the client views the connection as established.
   AWAIT_EXPECT_READY(connect);

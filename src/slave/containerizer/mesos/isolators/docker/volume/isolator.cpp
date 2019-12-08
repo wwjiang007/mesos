@@ -24,6 +24,8 @@
 #include <stout/os/realpath.hpp>
 #include <stout/os/which.hpp>
 
+#include "common/protobuf_utils.hpp"
+
 #include "linux/ns.hpp"
 
 #include "slave/flags.hpp"
@@ -155,7 +157,7 @@ Try<Isolator*> DockerVolumeIsolatorProcess::_create(
 
 
 Future<Nothing> DockerVolumeIsolatorProcess::recover(
-    const list<ContainerState>& states,
+    const vector<ContainerState>& states,
     const hashset<ContainerID>& orphans)
 {
   if (!os::exists(rootDir)) {
@@ -266,8 +268,16 @@ Try<Nothing> DockerVolumeIsolatorProcess::_recover(
     paths::getVolumesPath(rootDir, containerId.value());
 
   if (!os::exists(volumesPath)) {
-    VLOG(1) << "The docker volumes checkpointed at '" << volumesPath
-            << "' for container " << containerId << " does not exist";
+    // This could happen if the slave died after creating the container
+    // directory but before it checkpointed anything in it.
+    LOG(WARNING) << "The docker volumes checkpointed at '" << volumesPath
+                 << "' for container " << containerId << " does not exist";
+
+    // Construct an info object with empty docker volumes since no docker
+    // volumes are mounted yet for this container, and this container will
+    // be cleaned up by containerizer (as known orphan container) or by
+    // `recover` (as unknown orphan container).
+    infos.put(containerId, Owned<Info>(new Info(hashset<DockerVolume>())));
 
     return Nothing();
   }
@@ -277,6 +287,21 @@ Try<Nothing> DockerVolumeIsolatorProcess::_recover(
     return Error(
         "Failed to read docker volumes checkpoint file '" +
         volumesPath + "': " + read.error());
+  }
+
+  if (read->empty()) {
+    // This could happen if the slave is hard rebooted after the file is
+    // created but before the data is synced on disk.
+    LOG(WARNING) << "The docker volumes checkpointed at '" << volumesPath
+                 << "' for container " << containerId << " is empty";
+
+    // Construct an info object with empty docker volumes since no docker
+    // volumes are mounted yet for this container, and this container will
+    // be cleaned up by containerizer (as known orphan container) or by
+    // `recover` (as unknown orphan container).
+    infos.put(containerId, Owned<Info>(new Info(hashset<DockerVolume>())));
+
+    return Nothing();
   }
 
   Try<JSON::Object> json = JSON::parse<JSON::Object>(read.get());
@@ -326,7 +351,7 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
 
   // The hashset is used to check if there are duplicated docker
   // volume for the same container.
-  hashset<DockerVolume> volumes;
+  hashset<DockerVolume> volumeSet;
 
   // Represents mounts that will be sent to the driver client.
   struct Mount
@@ -335,10 +360,16 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
     hashmap<string, string> options;
   };
 
+
+  // TODO(qianzhang): Here we use vector to ensure the order of mount target,
+  // mount source and volume mode which is kind of hacky, we could consider
+  // to introduce a dedicated struct for it in future.
   vector<Mount> mounts;
 
   // The mount points in the container.
   vector<string> targets;
+
+  vector<Volume::Mode> volumeModes;
 
   foreach (const Volume& _volume, containerConfig.container_info().volumes()) {
     if (!_volume.has_source()) {
@@ -366,7 +397,7 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
     volume.set_driver(driver);
     volume.set_name(name);
 
-    if (volumes.contains(volume)) {
+    if (volumeSet.contains(volume)) {
       return Failure(
           "Found duplicate docker volume with driver '" +
           driver + "' and name '" + name + "'");
@@ -443,15 +474,16 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
     mount.volume = volume;
     mount.options = options;
 
-    volumes.insert(volume);
+    volumeSet.insert(volume);
     mounts.push_back(mount);
     targets.push_back(target);
+    volumeModes.push_back(_volume.mode());
   }
 
   // It is possible that there is no external volume specified for
   // this container. We avoid checkpointing empty state and creating
   // an empty `Info`.
-  if (volumes.empty()) {
+  if (volumeSet.empty()) {
     return None();
   }
 
@@ -468,7 +500,7 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
 
   // Create DockerVolumes protobuf message to checkpoint.
   DockerVolumes state;
-  foreach (const DockerVolume& volume, volumes) {
+  foreach (const DockerVolume& volume, volumeSet) {
     state.add_volumes()->CopyFrom(volume);
   }
 
@@ -487,10 +519,11 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
 
   VLOG(1) << "Successfully created checkpoint at '" << volumesPath << "'";
 
-  infos.put(containerId, Owned<Info>(new Info(volumes)));
+  infos.put(containerId, Owned<Info>(new Info(volumeSet)));
 
   // Invoke driver client to create the mount.
-  list<Future<string>> futures;
+  vector<Future<string>> futures;
+  futures.reserve(mounts.size());
   foreach (const Mount& mount, mounts) {
     futures.push_back(this->mount(
         mount.volume.driver(),
@@ -507,6 +540,10 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
         &DockerVolumeIsolatorProcess::_prepare,
         containerId,
         targets,
+        volumeModes,
+        containerConfig.has_user()
+          ? containerConfig.user()
+          : Option<string>::none(),
         lambda::_1));
 }
 
@@ -514,7 +551,9 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
 Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::_prepare(
     const ContainerID& containerId,
     const vector<string>& targets,
-    const list<Future<string>>& futures)
+    const vector<Volume::Mode>& volumeModes,
+    const Option<string>& user,
+    const vector<Future<string>>& futures)
 {
   ContainerLaunchInfo launchInfo;
   launchInfo.add_clone_namespaces(CLONE_NEWNS);
@@ -535,18 +574,33 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::_prepare(
   }
 
   CHECK_EQ(sources.size(), targets.size());
+  CHECK_EQ(sources.size(), volumeModes.size());
 
   for (size_t i = 0; i < sources.size(); i++) {
     const string& source = sources[i];
     const string& target = targets[i];
+    const Volume::Mode volumeMode = volumeModes[i];
+
+    if (flags.docker_volume_chown && user.isSome() && user.get() != "root") {
+      LOG(INFO) << "Changing the ownership of the docker volume at '"
+                << source << "' to user '" << user.get() << "' for container "
+                << containerId;
+
+      Try<Nothing> chown = os::chown(user.get(), source, false);
+      if (chown.isError()) {
+        return Failure(
+            "Failed to set '" + user.get() + "' as the docker volume '" +
+            source + "' owner: " + chown.error());
+      }
+    }
 
     LOG(INFO) << "Mounting docker volume mount point '" << source
               << "' to '" << target << "' for container " << containerId;
 
-    ContainerMountInfo* mount = launchInfo.add_mounts();
-    mount->set_source(source);
-    mount->set_target(target);
-    mount->set_flags(MS_BIND | MS_REC);
+    *launchInfo.add_mounts() = protobuf::slave::createContainerMount(
+        source,
+        target,
+        MS_BIND | MS_REC | (volumeMode == Volume::RO ? MS_RDONLY : 0));
   }
 
   return launchInfo;
@@ -585,7 +639,7 @@ Future<Nothing> DockerVolumeIsolatorProcess::cleanup(
     }
   }
 
-  list<Future<Nothing>> futures;
+  vector<Future<Nothing>> futures;
 
   foreach (const DockerVolume& volume, infos[containerId]->volumes) {
     if (references.contains(volume) && references[volume] > 1) {
@@ -615,7 +669,7 @@ Future<Nothing> DockerVolumeIsolatorProcess::cleanup(
 
 Future<Nothing> DockerVolumeIsolatorProcess::_cleanup(
     const ContainerID& containerId,
-    const list<Future<Nothing>>& futures)
+    const vector<Future<Nothing>>& futures)
 {
   CHECK(infos.contains(containerId));
 

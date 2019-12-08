@@ -114,18 +114,25 @@ Try<vector<TResourceConversion>> getResourceConversions(
 
     case TOperation::LAUNCH:
     case TOperation::LAUNCH_GROUP:
-    case TOperation::CREATE_VOLUME:
-    case TOperation::DESTROY_VOLUME:
-    case TOperation::CREATE_BLOCK:
-    case TOperation::DESTROY_BLOCK:
+    case TOperation::CREATE_DISK:
+    case TOperation::DESTROY_DISK:
       return Error("Operation not supported");
 
     case TOperation::RESERVE: {
-      foreach (const TResource& reserved, operation.reserve().resources()) {
-        // Note that we only allow "pushing" a single reservation at time.
-        TResources consumed = TResources(reserved).popReservation();
-        conversions.emplace_back(consumed, reserved);
+      TResources reserved(operation.reserve().resources());
+
+      // If the operation explicitly specifies a `source` we use that,
+      // otherwise we assume that the operation is "pushing" a single
+      // reservation. At this point, the resources in the operation
+      // should have been already sanity checked, so we don't have to
+      // repeat that here.
+      TResources consumed;
+      if (operation.reserve().source_size() > 0) {
+        consumed = TResources(operation.reserve().source());
+      } else {
+        consumed = reserved.popReservation();
       }
+      conversions.emplace_back(consumed, reserved);
       break;
     }
 
@@ -195,6 +202,57 @@ Try<vector<TResourceConversion>> getResourceConversions(
       }
       break;
     }
+
+    case TOperation::GROW_VOLUME: {
+      const TResource& volume = operation.grow_volume().volume();
+      const TResource& addition = operation.grow_volume().addition();
+
+      if (TResources::hasResourceProvider(volume)) {
+        return Error("Operation not supported for resource provider");
+      }
+
+      // To grow a persistent volume, we consume the original volume and the
+      // additional resource and convert into a single volume with the new size.
+      TResource converted = volume;
+      *converted.mutable_scalar() += addition.scalar();
+
+      conversions.emplace_back(TResources(volume) + addition, converted);
+      break;
+    }
+
+    case TOperation::SHRINK_VOLUME: {
+      const TResource& volume = operation.shrink_volume().volume();
+
+      if (TResources::hasResourceProvider(volume)) {
+        return Error("Operation not supported for resource provider");
+      }
+
+      // To shrink a persistent volume, we consume the original volume and
+      // convert into a new volume with reduced size and a freed disk resource
+      // without persistent volume info.
+      TResource freed = volume;
+
+      *freed.mutable_scalar() = operation.shrink_volume().subtract();
+
+      // TODO(zhitao): Move this to helper function
+      // `Resources::stripPersistentVolume`.
+      if (freed.disk().has_source()) {
+        freed.mutable_disk()->clear_persistence();
+        freed.mutable_disk()->clear_volume();
+      } else {
+        freed.clear_disk();
+      }
+
+      // Since we only allow persistent volumes to be shared, the
+      // freed resource must be non-shared.
+      freed.clear_shared();
+
+      TResource shrunk = volume;
+      *shrunk.mutable_scalar() -= operation.shrink_volume().subtract();
+
+      conversions.emplace_back(volume, TResources(shrunk) + freed);
+      break;
+    }
   }
 
   return conversions;
@@ -259,17 +317,17 @@ Result<ResourceProviderID> getResourceProviderId(
       }
       resource = operation.destroy().volumes(0);
       break;
-    case Offer::Operation::CREATE_VOLUME:
-      resource = operation.create_volume().source();
+    case Offer::Operation::GROW_VOLUME:
+      resource = operation.grow_volume().volume();
       break;
-    case Offer::Operation::DESTROY_VOLUME:
-      resource = operation.destroy_volume().volume();
+    case Offer::Operation::SHRINK_VOLUME:
+      resource = operation.shrink_volume().volume();
       break;
-    case Offer::Operation::CREATE_BLOCK:
-      resource = operation.create_block().source();
+    case Offer::Operation::CREATE_DISK:
+      resource = operation.create_disk().source();
       break;
-    case Offer::Operation::DESTROY_BLOCK:
-      resource = operation.destroy_block().block();
+    case Offer::Operation::DESTROY_DISK:
+      resource = operation.destroy_disk().source();
       break;
     case Offer::Operation::UNKNOWN:
       return Error("Unknown offer operation");
@@ -285,33 +343,30 @@ Result<ResourceProviderID> getResourceProviderId(
 }
 
 
-Result<ResourceProviderID> getResourceProviderId(
-    const ResourceConversion& conversion)
+Result<ResourceProviderID> getResourceProviderId(const Resources& resources)
 {
-  if (conversion.consumed.empty()) {
-    return Error("Could not determine resource provider");
+  if (resources.empty()) {
+    return Error("Cannot determine resource provider for empty resources");
   }
 
-  const Resource& consumed = *conversion.consumed.begin();
-
+  const Resource resource = *resources.begin();
   const Option<ResourceProviderID> resourceProviderId =
-    consumed.has_provider_id()
-      ? consumed.provider_id()
-      : Option<ResourceProviderID>::none();
+    resource.has_provider_id() ? resource.provider_id()
+                               : Option<ResourceProviderID>::none();
 
-
-  foreach (const Resource& resource, conversion.consumed) {
+  foreach (const Resource& resource_, resources) {
     const Option<ResourceProviderID> resourceProviderId_ =
-      resource.has_provider_id()
-        ? resource.provider_id()
-        : Option<ResourceProviderID>::none();
+      resource_.has_provider_id() ? resource_.provider_id()
+                                  : Option<ResourceProviderID>::none();
+
     if (resourceProviderId_ != resourceProviderId) {
-      return Error("Conversion works on multiple resource providers");
+      return Error("Resources are from multiple resource providers");
     }
   }
 
   return resourceProviderId;
 }
+
 
 void convertResourceFormat(Resource* resource, ResourceFormat format)
 {
@@ -572,6 +627,12 @@ Option<Error> validateAndUpgradeResources(Offer::Operation* operation)
         return error;
       }
 
+      error = Resources::validate(operation->reserve().source());
+
+      if (error.isSome()) {
+        return error;
+      }
+
       break;
     }
     case Offer::Operation::UNRESERVE: {
@@ -624,6 +685,50 @@ Option<Error> validateAndUpgradeResources(Offer::Operation* operation)
 
       Option<Error> error =
         Resources::validate(operation->destroy().volumes());
+
+      if (error.isSome()) {
+        return error;
+      }
+
+      break;
+    }
+    case Offer::Operation::GROW_VOLUME: {
+      // TODO(mpark): Once we perform a sanity check validation for
+      // offer operations as specified in MESOS-7760, this should no
+      // longer have to be handled in this function.
+      if (!operation->has_grow_volume()) {
+        return Error(
+            "A GROW_VOLUME operation must have"
+            " the Offer.Operation.grow_volume field set");
+      }
+
+      Option<Error> error = Resources::validate(
+          operation->grow_volume().volume());
+
+      if (error.isSome()) {
+        return error;
+      }
+
+      error = Resources::validate(operation->grow_volume().addition());
+
+      if (error.isSome()) {
+        return error;
+      }
+
+      break;
+    }
+    case Offer::Operation::SHRINK_VOLUME: {
+      // TODO(mpark): Once we perform a sanity check validation for
+      // offer operations as specified in MESOS-7760, this should no
+      // longer have to be handled in this function.
+      if (!operation->has_shrink_volume()) {
+        return Error(
+            "A SHRINK_VOLUME offer operation must have"
+            " the Offer.Operation.shrink_volume field set");
+      }
+
+      Option<Error> error = Resources::validate(
+          operation->shrink_volume().volume());
 
       if (error.isSome()) {
         return error;
@@ -701,18 +806,18 @@ Option<Error> validateAndUpgradeResources(Offer::Operation* operation)
 
       break;
     }
-    case Offer::Operation::CREATE_VOLUME: {
+    case Offer::Operation::CREATE_DISK: {
       // TODO(mpark): Once we perform a sanity check validation for
       // offer operations as specified in MESOS-7760, this should no
       // longer have to be handled in this function.
-      if (!operation->has_create_volume()) {
+      if (!operation->has_create_disk()) {
         return Error(
-            "A CREATE_VOLUME offer operation must have"
-            " the Offer.Operation.create_volume field set.");
+            "A CREATE_DISK offer operation must have"
+            " the Offer.Operation.create_disk field set.");
       }
 
       Option<Error> error =
-        Resources::validate(operation->create_volume().source());
+        Resources::validate(operation->create_disk().source());
 
       if (error.isSome()) {
         return error;
@@ -720,56 +825,18 @@ Option<Error> validateAndUpgradeResources(Offer::Operation* operation)
 
       break;
     }
-    case Offer::Operation::DESTROY_VOLUME: {
+    case Offer::Operation::DESTROY_DISK: {
       // TODO(mpark): Once we perform a sanity check validation for
       // offer operations as specified in MESOS-7760, this should no
       // longer have to be handled in this function.
-      if (!operation->has_destroy_volume()) {
+      if (!operation->has_destroy_disk()) {
         return Error(
-            "A DESTROY_VOLUME offer operation must have"
-            " the Offer.Operation.destroy_volume field set.");
+            "A DESTROY_DISK offer operation must have"
+            " the Offer.Operation.destroy_disk field set.");
       }
 
       Option<Error> error =
-        Resources::validate(operation->destroy_volume().volume());
-
-      if (error.isSome()) {
-        return error;
-      }
-
-      break;
-    }
-    case Offer::Operation::CREATE_BLOCK: {
-      // TODO(mpark): Once we perform a sanity check validation for
-      // offer operations as specified in MESOS-7760, this should no
-      // longer have to be handled in this function.
-      if (!operation->has_create_block()) {
-        return Error(
-            "A CREATE_BLOCK offer operation must have"
-            " the Offer.Operation.create_block field set.");
-      }
-
-      Option<Error> error =
-        Resources::validate(operation->create_block().source());
-
-      if (error.isSome()) {
-        return error;
-      }
-
-      break;
-    }
-    case Offer::Operation::DESTROY_BLOCK: {
-      // TODO(mpark): Once we perform a sanity check validation for
-      // offer operations as specified in MESOS-7760, this should no
-      // longer have to be handled in this function.
-      if (!operation->has_destroy_block()) {
-        return Error(
-            "A DESTROY_BLOCK offer operation must have"
-            " the Offer.Operation.destroy_block field set.");
-      }
-
-      Option<Error> error =
-        Resources::validate(operation->destroy_block().block());
+        Resources::validate(operation->destroy_disk().source());
 
       if (error.isSome()) {
         return error;
@@ -851,5 +918,73 @@ Try<Nothing> downgradeResources(Message* message)
   return internal::convertResourcesImpl(
       message, downgradeResource, resourcesContainment);
 }
+
+
+Resources shrinkResources(const Resources& resources, ResourceQuantities target)
+{
+  if (target.empty()) {
+    return Resources();
+  }
+
+  // TODO(mzhu): Add a `shuffle()` method in `Resources` to avoid this copy.
+  google::protobuf::RepeatedPtrField<Resource> resourceVector = resources;
+
+  std::random_shuffle(resourceVector.begin(), resourceVector.end());
+
+  Resources result;
+  foreach (Resource& resource, resourceVector) {
+    Value::Scalar scalar = target.get(resource.name());
+
+    if (scalar == Value::Scalar()) {
+      // Resource that has zero quantity is dropped (shrunk to zero).
+      continue;
+    }
+
+    // Target can only be explicitly specified for scalar resources.
+    CHECK_EQ(Value::SCALAR, resource.type()) << " Resources: " << resources;
+
+    if (Resources::shrink(&resource, scalar)) {
+      target -= ResourceQuantities::fromScalarResource(resource);
+      result += std::move(resource);
+    }
+  }
+
+  return result;
+}
+
+
+Resources shrinkResources(const Resources& resources, ResourceLimits target)
+{
+  if (target.empty()) {
+    return resources;
+  }
+
+  // TODO(mzhu): Add a `shuffle()` method in `Resources` to avoid this copy.
+  google::protobuf::RepeatedPtrField<Resource> resourceVector = resources;
+
+  std::random_shuffle(resourceVector.begin(), resourceVector.end());
+
+  Resources result;
+  foreach (Resource resource, resourceVector) {
+    Option<Value::Scalar> limit = target.get(resource.name());
+
+    if (limit.isNone()) {
+      // Resource that has infinite limit is kept as is.
+      result += std::move(resource);
+      continue;
+    }
+
+    // Target can only be explicitly specified for scalar resources.
+    CHECK_EQ(Value::SCALAR, resource.type()) << " Resources: " << resources;
+
+    if (Resources::shrink(&resource, *limit)) {
+      target -= ResourceQuantities::fromScalarResource(resource);
+      result += std::move(resource);
+    }
+  }
+
+  return result;
+}
+
 
 } // namespace mesos {

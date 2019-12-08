@@ -25,6 +25,7 @@
 
 #include <stout/os/exists.hpp>
 #include <stout/os/mkdir.hpp>
+#include <stout/os/rename.hpp>
 #include <stout/os/rm.hpp>
 #include <stout/os/write.hpp>
 
@@ -38,7 +39,6 @@
 namespace http = process::http;
 namespace spec = docker::spec;
 
-using std::list;
 using std::string;
 using std::vector;
 
@@ -67,38 +67,59 @@ public:
       const Shared<uri::Fetcher>& _fetcher,
       SecretResolver* _secretResolver);
 
-  Future<vector<string>> pull(
+  Future<Image> pull(
       const spec::ImageReference& reference,
       const string& directory,
       const string& backend,
       const Option<Secret>& config);
 
 private:
-  Future<vector<string>> _pull(
+  Future<Image> _pull(
       const spec::ImageReference& reference,
       const string& directory,
       const string& backend,
       const Option<Secret::Value>& config = None());
 
-  Future<vector<string>> __pull(
+  Future<Image> __pull(
       const spec::ImageReference& reference,
       const string& directory,
       const string& backend,
       const Option<Secret::Value>& config);
 
-  Future<vector<string>> ___pull(
+  Future<Image> ___pull(
     const spec::ImageReference& reference,
     const string& directory,
     const spec::v2::ImageManifest& manifest,
     const hashset<string>& blobSums,
     const string& backend);
 
-  Future<hashset<string>> fetchBlobs(
+  Future<Image> ____pull(
     const spec::ImageReference& reference,
+    const string& directory,
+    const spec::v2_2::ImageManifest& manifest,
+    const hashset<string>& digests,
+    const string& backend);
+
+  Future<hashset<string>> fetchBlobs(
+    const spec::ImageReference& normalizedRef,
     const string& directory,
     const spec::v2::ImageManifest& manifest,
     const string& backend,
     const Option<Secret::Value>& config);
+
+  Future<hashset<string>> fetchBlobs(
+      const spec::ImageReference& normalizedRef,
+      const string& directory,
+      const spec::v2_2::ImageManifest& manifest,
+      const string& backend,
+      const Option<Secret::Value>& config);
+
+  Future<hashset<string>> fetchBlobs(
+      const spec::ImageReference& normalizedRef,
+      const string& directory,
+      const hashset<string>& digests,
+      const string& backend,
+      const Option<Secret::Value>& config);
 
   RegistryPullerProcess(const RegistryPullerProcess&) = delete;
   RegistryPullerProcess& operator=(const RegistryPullerProcess&) = delete;
@@ -154,7 +175,7 @@ RegistryPuller::~RegistryPuller()
 }
 
 
-Future<vector<string>> RegistryPuller::pull(
+Future<Image> RegistryPuller::pull(
     const spec::ImageReference& reference,
     const string& directory,
     const string& backend,
@@ -217,7 +238,7 @@ static spec::ImageReference normalize(
 }
 
 
-Future<vector<string>> RegistryPullerProcess::pull(
+Future<Image> RegistryPullerProcess::pull(
     const spec::ImageReference& reference,
     const string& directory,
     const string& backend,
@@ -237,32 +258,32 @@ Future<vector<string>> RegistryPullerProcess::pull(
 }
 
 
-Future<vector<string>> RegistryPullerProcess::_pull(
-    const spec::ImageReference& _reference,
+Future<Image> RegistryPullerProcess::_pull(
+    const spec::ImageReference& reference,
     const string& directory,
     const string& backend,
     const Option<Secret::Value>& config)
 {
-  spec::ImageReference reference = normalize(_reference, defaultRegistryUrl);
+  spec::ImageReference normalizedRef = normalize(reference, defaultRegistryUrl);
 
   URI manifestUri;
-  if (reference.has_registry()) {
-    Result<int> port = spec::getRegistryPort(reference.registry());
+  if (normalizedRef.has_registry()) {
+    Result<int> port = spec::getRegistryPort(normalizedRef.registry());
     if (port.isError()) {
       return Failure("Failed to get registry port: " + port.error());
     }
 
-    Try<string> scheme = spec::getRegistryScheme(reference.registry());
+    Try<string> scheme = spec::getRegistryScheme(normalizedRef.registry());
     if (scheme.isError()) {
       return Failure("Failed to get registry scheme: " + scheme.error());
     }
 
     manifestUri = uri::docker::manifest(
-        reference.repository(),
-        (reference.has_digest()
-          ? reference.digest()
-          : (reference.has_tag() ? reference.tag() : "latest")),
-        spec::getRegistryHost(reference.registry()),
+        normalizedRef.repository(),
+        (normalizedRef.has_digest()
+          ? normalizedRef.digest()
+          : (normalizedRef.has_tag() ? normalizedRef.tag() : "latest")),
+        spec::getRegistryHost(normalizedRef.registry()),
         scheme.get(),
         port.isSome() ? port.get() : Option<int>());
   } else {
@@ -275,19 +296,23 @@ Future<vector<string>> RegistryPullerProcess::_pull(
       : Option<int>();
 
     manifestUri = uri::docker::manifest(
-        reference.repository(),
-        (reference.has_digest()
-          ? reference.digest()
-          : (reference.has_tag() ? reference.tag() : "latest")),
+        normalizedRef.repository(),
+        (normalizedRef.has_digest()
+          ? normalizedRef.digest()
+          : (normalizedRef.has_tag() ? normalizedRef.tag() : "latest")),
         registry,
         defaultRegistryUrl.scheme,
         port);
   }
 
-  VLOG(1) << "Pulling image '" << reference
-          << "' from '" << manifestUri
-          << "' to '" << directory << "'";
+  LOG(INFO) << "Fetching manifest from '" << manifestUri << "' to '"
+            << directory << "' for image '" << normalizedRef << "'";
 
+  // Pass the original 'reference' along to subsequent methods
+  // because metadata manager may already has this reference in
+  // cache. This is necessary to ensure the backward compatibility
+  // after upgrading to the version including MESOS-9675 for
+  // docker manifest v2 schema2 support.
   return fetcher->fetch(
       manifestUri,
       directory,
@@ -296,7 +321,7 @@ Future<vector<string>> RegistryPullerProcess::_pull(
 }
 
 
-Future<vector<string>> RegistryPullerProcess::__pull(
+Future<Image> RegistryPullerProcess::__pull(
     const spec::ImageReference& reference,
     const string& directory,
     const string& backend,
@@ -307,13 +332,49 @@ Future<vector<string>> RegistryPullerProcess::__pull(
     return Failure("Failed to read the manifest: " + _manifest.error());
   }
 
-  Try<spec::v2::ImageManifest> manifest = spec::v2::parse(_manifest.get());
+  VLOG(1) << "The manifest for image '" << reference << "' is '"
+          << _manifest.get() << "'";
+
+  // To ensure backward compatibility in upgrade case for docker
+  // manifest v2 schema2 support, it is unavoidable to call
+  // 'normalize()' twice because some existing image may already
+  // be cached by metadata manager before upgrade and now metadata
+  // persists the cache from the image information constructed at
+  // registry puller. Please see MESOS-9675 for details.
+  spec::ImageReference normalizedRef = normalize(reference, defaultRegistryUrl);
+
+  Try<JSON::Object> json = JSON::parse<JSON::Object>(_manifest.get());
+  if (json.isError()) {
+    return Failure("Failed to parse the manifest JSON: " + json.error());
+  }
+
+  Result<JSON::Number> schemaVersion = json->at<JSON::Number>("schemaVersion");
+  if (schemaVersion.isError()) {
+    return Failure(
+        "Failed to find manifest schema version: " + schemaVersion.error());
+  }
+
+  if (schemaVersion.isSome() && schemaVersion->as<int>() == 2) {
+    Try<spec::v2_2::ImageManifest> manifest = spec::v2_2::parse(json.get());
+    if (manifest.isError()) {
+      return Failure("Failed to parse the manifest: " + manifest.error());
+    }
+
+    return fetchBlobs(normalizedRef, directory, manifest.get(), backend, config)
+      .then(defer(self(),
+                  &Self::____pull,
+                  reference,
+                  directory,
+                  manifest.get(),
+                  lambda::_1,
+                  backend));
+  }
+
+  // By default treat the manifest format as schema 1.
+  Try<spec::v2::ImageManifest> manifest = spec::v2::parse(json.get());
   if (manifest.isError()) {
     return Failure("Failed to parse the manifest: " + manifest.error());
   }
-
-  VLOG(1) << "The manifest for image '" << reference << "' is '"
-          << _manifest.get() << "'";
 
   // NOTE: This can be a CHECK (i.e., shouldn't happen). However, in
   // case docker has bugs, we return a Failure instead.
@@ -321,7 +382,7 @@ Future<vector<string>> RegistryPullerProcess::__pull(
     return Failure("'fsLayers' and 'history' have different size in manifest");
   }
 
-  return fetchBlobs(reference, directory, manifest.get(), backend, config)
+  return fetchBlobs(normalizedRef, directory, manifest.get(), backend, config)
     .then(defer(self(),
                 &Self::___pull,
                 reference,
@@ -332,7 +393,7 @@ Future<vector<string>> RegistryPullerProcess::__pull(
 }
 
 
-Future<vector<string>> RegistryPullerProcess::___pull(
+Future<Image> RegistryPullerProcess::___pull(
     const spec::ImageReference& reference,
     const string& directory,
     const spec::v2::ImageManifest& manifest,
@@ -359,7 +420,10 @@ Future<vector<string>> RegistryPullerProcess::___pull(
   // sure ids are unique.
   hashset<string> uniqueIds;
   vector<string> layerIds;
-  list<Future<Nothing>> futures;
+  vector<Future<Nothing>> futures;
+
+  LOG(INFO) << "Extracting layers to '" << directory
+            << "' for image '" << reference << "'";
 
   // The order of `fslayers` should be [child, parent, ...].
   //
@@ -392,8 +456,8 @@ Future<vector<string>> RegistryPullerProcess::___pull(
     const string rootfs = paths::getImageLayerRootfsPath(layerPath, backend);
     const string json = paths::getImageLayerManifestPath(layerPath);
 
-    VLOG(1) << "Extracting layer tar ball '" << tar
-            << " to rootfs '" << rootfs << "'";
+    VLOG(1) << "Extracting layer tar ball '" << tar << " to rootfs '"
+            << rootfs << "' for image '" << reference << "'";
 
     // NOTE: This will create 'layerPath' as well.
     Try<Nothing> mkdir = os::mkdir(rootfs, true);
@@ -414,7 +478,7 @@ Future<vector<string>> RegistryPullerProcess::___pull(
   }
 
   return collect(futures)
-    .then([=]() -> Future<vector<string>> {
+    .then([=]() -> Future<Image> {
       // Remove the tarballs after the extraction.
       foreach (const string& blobSum, blobSums) {
         const string tar = path::join(directory, blobSum);
@@ -427,13 +491,106 @@ Future<vector<string>> RegistryPullerProcess::___pull(
         }
       }
 
-      return layerIds;
+      Image image;
+      image.mutable_reference()->CopyFrom(reference);
+      foreach (const string& layerId, layerIds) {
+        image.add_layer_ids(layerId);
+      }
+
+      return image;
+    });
+}
+
+
+Future<Image> RegistryPullerProcess::____pull(
+    const spec::ImageReference& reference,
+    const string& directory,
+    const spec::v2_2::ImageManifest& manifest,
+    const hashset<string>& digests,
+    const string& backend)
+{
+  hashset<string> uniqueIds;
+  vector<string> layerIds;
+  vector<Future<Nothing>> futures;
+
+  LOG(INFO) << "Extracting layers to '" << directory
+            << "' for image '" << reference << "'";
+
+  for (int i = 0; i < manifest.layers_size(); i++) {
+    const string& digest = manifest.layers(i).digest();
+    if (uniqueIds.contains(digest)) {
+      continue;
+    }
+
+    layerIds.push_back(digest);
+    uniqueIds.insert(digest);
+
+    // Skip if the layer is already in the store.
+    if (os::exists(paths::getImageLayerRootfsPath(storeDir, digest, backend))) {
+      continue;
+    }
+
+    const string layerPath = path::join(directory, digest);
+    const string originalTar = path::join(directory, digest);
+    const string tar = path::join(directory, digest + "-archive");
+    const string rootfs = paths::getImageLayerRootfsPath(layerPath, backend);
+
+    VLOG(1) << "Moving layer tar ball '" << originalTar << "' to '"
+            << tar << "' for image '" << reference << "'";
+
+    // Move layer tar ball to use its name for the extracted layer directory.
+    Try<Nothing> rename = os::rename(originalTar, tar);
+    if (rename.isError()) {
+      return Failure(
+          "Failed to move the layer tar ball from '" + originalTar +
+          "' to '" + tar + "': " + rename.error());
+    }
+
+    VLOG(1) << "Extracting layer tar ball '" << tar << "' to rootfs '"
+            << rootfs << "' for image '" << reference << "'";
+
+    // NOTE: This will create 'layerPath' as well.
+    Try<Nothing> mkdir = os::mkdir(rootfs, true);
+    if (mkdir.isError()) {
+      return Failure(
+          "Failed to create rootfs directory '" + rootfs + "' "
+          "for layer '" + digest + "': " + mkdir.error());
+    }
+
+    futures.push_back(command::untar(Path(tar), Path(rootfs)));
+  }
+
+  return collect(futures)
+    .then([=]() -> Future<Image> {
+      // Remove the tarballs after the extraction.
+      foreach (const string& digest, digests) {
+        // Skip if the digest represents the image manifest config.
+        if (digest == manifest.config().digest()) {
+          continue;
+        }
+
+        const string tar = path::join(directory, digest + "-archive");
+        Try<Nothing> rm = os::rm(tar);
+        if (rm.isError()) {
+          return Failure(
+              "Failed to remove '" + tar + "' after extraction: " + rm.error());
+        }
+      }
+
+      Image image;
+      image.set_config_digest(manifest.config().digest());
+      image.mutable_reference()->CopyFrom(reference);
+      foreach (const string& layerId, layerIds) {
+        image.add_layer_ids(layerId);
+      }
+
+      return image;
     });
 }
 
 
 Future<hashset<string>> RegistryPullerProcess::fetchBlobs(
-    const spec::ImageReference& reference,
+    const spec::ImageReference& normalizedRef,
     const string& directory,
     const spec::v2::ImageManifest& manifest,
     const string& backend,
@@ -444,6 +601,9 @@ Future<hashset<string>> RegistryPullerProcess::fetchBlobs(
   // NOTE: There might exist duplicated blob sums in 'fsLayers'. We
   // just need to fetch one of them.
   hashset<string> blobSums;
+
+  LOG(INFO) << "Fetching blobs to '" << directory << "' for image '"
+            << normalizedRef << "'";
 
   for (int i = 0; i < manifest.fslayers_size(); i++) {
     CHECK(manifest.history(i).has_v1());
@@ -458,25 +618,78 @@ Future<hashset<string>> RegistryPullerProcess::fetchBlobs(
 
     const string& blobSum = manifest.fslayers(i).blobsum();
 
-    VLOG(1) << "Fetching blob '" << blobSum << "' for layer '"
-            << v1.id() << "' of image '" << reference << "'";
+    VLOG(1) << "Fetching blob '" << blobSum << "' for layer '" << v1.id()
+            << "' of image '" << normalizedRef << "' to '" << directory << "'";
 
     blobSums.insert(blobSum);
   }
 
-  // Now, actually fetch the blobs.
-  list<Future<Nothing>> futures;
+  return fetchBlobs(normalizedRef, directory, blobSums, backend, config);
+}
 
-  foreach (const string& blobSum, blobSums) {
+
+Future<hashset<string>> RegistryPullerProcess::fetchBlobs(
+    const spec::ImageReference& normalizedRef,
+    const string& directory,
+    const spec::v2_2::ImageManifest& manifest,
+    const string& backend,
+    const Option<Secret::Value>& config)
+{
+  // First, find all the blobs that need to be fetched.
+  //
+  // NOTE: There might exist duplicated digests in 'layers'. We
+  // just need to fetch one of them.
+  hashset<string> digests;
+
+  const string& configDigest = manifest.config().digest();
+  if (!os::exists(paths::getImageLayerPath(storeDir, configDigest))) {
+    LOG(INFO) << "Fetching config '" << configDigest << "' to '" << directory
+              << "' for image '" << normalizedRef << "'";
+
+    digests.insert(configDigest);
+  }
+
+  LOG(INFO) << "Fetching layers to '" << directory << "' for image '"
+            << normalizedRef << "'";
+
+  for (int i = 0; i < manifest.layers_size(); i++) {
+    const string& digest = manifest.layers(i).digest();
+
+    // Check if the layer is in the store or not. If yes, skip the unnecessary
+    // fetching.
+    if (os::exists(paths::getImageLayerRootfsPath(storeDir, digest, backend))) {
+      continue;
+    }
+
+    VLOG(1) << "Fetching layer '" << digest << "' to '" << directory
+            << "' for image '" << normalizedRef << "'";
+
+    digests.insert(digest);
+  }
+
+  return fetchBlobs(normalizedRef, directory, digests, backend, config);
+}
+
+
+Future<hashset<string>> RegistryPullerProcess::fetchBlobs(
+    const spec::ImageReference& normalizedRef,
+    const string& directory,
+    const hashset<string>& digests,
+    const string& backend,
+    const Option<Secret::Value>& config)
+{
+  vector<Future<Nothing>> futures;
+
+  foreach (const string& digest, digests) {
     URI blobUri;
 
-    if (reference.has_registry()) {
-      Result<int> port = spec::getRegistryPort(reference.registry());
+    if (normalizedRef.has_registry()) {
+      Result<int> port = spec::getRegistryPort(normalizedRef.registry());
       if (port.isError()) {
         return Failure("Failed to get registry port: " + port.error());
       }
 
-      Try<string> scheme = spec::getRegistryScheme(reference.registry());
+      Try<string> scheme = spec::getRegistryScheme(normalizedRef.registry());
       if (scheme.isError()) {
         return Failure("Failed to get registry scheme: " + scheme.error());
       }
@@ -485,9 +698,9 @@ Future<hashset<string>> RegistryPullerProcess::fetchBlobs(
       // an URL scheme must be specified in '--docker_registry', because
       // there is no scheme allowed in docker image name.
       blobUri = uri::docker::blob(
-          reference.repository(),
-          blobSum,
-          spec::getRegistryHost(reference.registry()),
+          normalizedRef.repository(),
+          digest,
+          spec::getRegistryHost(normalizedRef.registry()),
           scheme.get(),
           port.isSome() ? port.get() : Option<int>());
     } else {
@@ -500,8 +713,8 @@ Future<hashset<string>> RegistryPullerProcess::fetchBlobs(
         : Option<int>();
 
       blobUri = uri::docker::blob(
-          reference.repository(),
-          blobSum,
+          normalizedRef.repository(),
+          digest,
           registry,
           defaultRegistryUrl.scheme,
           port);
@@ -514,7 +727,7 @@ Future<hashset<string>> RegistryPullerProcess::fetchBlobs(
   }
 
   return collect(futures)
-    .then([blobSums]() -> hashset<string> { return blobSums; });
+    .then([digests]() -> hashset<string> { return digests; });
 }
 
 } // namespace docker {

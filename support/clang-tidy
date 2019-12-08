@@ -7,6 +7,10 @@ clang-analyzer-*,\
 -clang-analyzer-core.CallAndMessage,\
 -clang-analyzer-core.NonNullParamChecker,\
 -clang-analyzer-core.NullDereference,\
+-clang-analyzer-core.UndefinedBinaryOperatorResult,\
+-clang-analyzer-core.uninitialized.Assign,\
+-clang-analyzer-core.uninitialized.UndefReturn,\
+-clang-analyzer-cplusplus.Move,\
 -clang-analyzer-cplusplus.NewDelete,\
 -clang-analyzer-cplusplus.NewDeleteLeaks,\
 -clang-analyzer-optin.cplusplus.VirtualCall,\
@@ -16,6 +20,7 @@ google-*,\
 -google-default-arguments,\
 -google-explicit-constructor,\
 -google-global-names-in-headers,\
+-google-readability-avoid-underscore-in-googletest-name,\
 -google-readability-namespace-comments,\
 -google-runtime-int,\
 -google-runtime-member-string-references,\
@@ -25,6 +30,9 @@ google-*,\
 mesos-*,\
 \
 misc-use-after-move,\
+\
+modernize-use-nullptr,\
+modernize-use-override,\
 \
 readability-redundant-string-cstr\
 "

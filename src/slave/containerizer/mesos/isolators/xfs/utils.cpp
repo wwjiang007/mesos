@@ -107,14 +107,16 @@ static Try<struct fsxattr> getAttributes(int fd)
 }
 
 
-// Return the path of the device backing the filesystem containing
-// the given path.
-static Try<string> getDeviceForPath(const string& path)
+Try<string> getDeviceForPath(const string& path)
 {
   struct stat statbuf;
 
   if (::lstat(path.c_str(), &statbuf) == -1) {
     return ErrnoError("Unable to access '" + path + "'");
+  }
+
+  if (S_ISBLK(statbuf.st_mode)) {
+    return path;
   }
 
   char* name = blkid_devno_to_devname(statbuf.st_dev);
@@ -134,7 +136,8 @@ namespace internal {
 static Try<Nothing> setProjectQuota(
     const string& path,
     prid_t projectId,
-    Bytes limit)
+    Bytes softLimit,
+    Bytes hardLimit)
 {
   Try<string> devname = getDeviceForPath(path);
   if (devname.isError()) {
@@ -148,17 +151,13 @@ static Try<Nothing> setProjectQuota(
   // Specify that we are setting a project quota for this ID.
   quota.d_id = projectId;
   quota.d_flags = FS_PROJ_QUOTA;
-
-  // Set both the hard and the soft limit to the same quota. Functionally
-  // all we need is the hard limit. The soft limit has no effect when it
-  // is the same as the hard limit but we set it for explicitness.
   quota.d_fieldmask = FS_DQ_BSOFT | FS_DQ_BHARD;
 
-  quota.d_blk_hardlimit = BasicBlocks(limit).blocks();
-  quota.d_blk_softlimit = BasicBlocks(limit).blocks();
+  quota.d_blk_hardlimit = BasicBlocks(hardLimit).blocks();
+  quota.d_blk_softlimit = BasicBlocks(softLimit).blocks();
 
   if (::quotactl(QCMD(Q_XSETQLIM, PRJQUOTA),
-                 devname.get().c_str(),
+                 devname->c_str(),
                  projectId,
                  reinterpret_cast<caddr_t>(&quota)) == -1) {
     return ErrnoError("Failed to set quota for project ID " +
@@ -233,7 +232,7 @@ Result<QuotaInfo> getProjectQuota(
   // date.
 
   if (::quotactl(QCMD(Q_XGETQUOTA, PRJQUOTA),
-                 devname.get().c_str(),
+                 devname->c_str(),
                  projectId,
                  reinterpret_cast<caddr_t>(&quota)) == -1) {
     return ErrnoError("Failed to get quota for project ID " +
@@ -246,7 +245,8 @@ Result<QuotaInfo> getProjectQuota(
   }
 
   QuotaInfo info;
-  info.limit = BasicBlocks(quota.d_blk_hardlimit).bytes();
+  info.softLimit = BasicBlocks(quota.d_blk_softlimit).bytes();
+  info.hardLimit = BasicBlocks(quota.d_blk_hardlimit).bytes();
   info.used = BasicBlocks(quota.d_bcount).bytes();
 
   return info;
@@ -256,7 +256,8 @@ Result<QuotaInfo> getProjectQuota(
 Try<Nothing> setProjectQuota(
     const string& path,
     prid_t projectId,
-    Bytes limit)
+    Bytes softLimit,
+    Bytes hardLimit)
 {
   if (projectId == NON_PROJECT_ID) {
     return nonProjectError();
@@ -264,11 +265,34 @@ Try<Nothing> setProjectQuota(
 
   // A 0 limit deletes the quota record. If that's desired, the
   // caller should use clearProjectQuota().
-  if (limit == 0) {
-    return Error( "Quota limit must be greater than 0");
+  if (hardLimit == 0) {
+    return Error("Quota hard limit must be greater than 0");
   }
 
-  return internal::setProjectQuota(path, projectId, limit);
+  if (softLimit == 0) {
+    return Error("Quota soft limit must be greater than 0");
+  }
+
+  return internal::setProjectQuota(path, projectId, softLimit, hardLimit);
+}
+
+
+Try<Nothing> setProjectQuota(
+    const string& path,
+    prid_t projectId,
+    Bytes hardLimit)
+{
+  if (projectId == NON_PROJECT_ID) {
+    return nonProjectError();
+  }
+
+  // A 0 limit deletes the quota record. If that's desired, the
+  // caller should use clearProjectQuota().
+  if (hardLimit == 0) {
+    return Error("Quota limit must be greater than 0");
+  }
+
+  return internal::setProjectQuota(path, projectId, hardLimit, hardLimit);
 }
 
 
@@ -280,7 +304,7 @@ Try<Nothing> clearProjectQuota(
     return nonProjectError();
   }
 
-  return internal::setProjectQuota(path, projectId, Bytes(0));
+  return internal::setProjectQuota(path, projectId, Bytes(0), Bytes(0));
 }
 
 
@@ -332,6 +356,29 @@ static Try<Nothing> setProjectIdRecursively(
 
   for (FTSENT *node = ::fts_read(tree);
        node != nullptr; node = ::fts_read(tree)) {
+    // FTS handles crossing devices (because we use the FTS_XDEV flag), but
+    // doesn't know anything about bind mounts made on the same device. Linux
+    // doesn't have a direct API for detecting whether a vnode is a mount
+    // point, and we prefer to not take the performance cost of looking up
+    // each directory in /proc/mounts. We take advantage of the contract
+    // that the path lookup checks mount crossings before checking whether
+    // the rename is valid. This means that if we attempt an invalid rename
+    // operation (i.e. renaming the parent directory to its child), checking
+    // for EXDEV tells us whether a mount was crossed.
+    //
+    // See http://blog.schmorp.de/2016-03-03-detecting-a-mount-point.html
+    if (node->fts_info == FTS_D && node->fts_level > 0) {
+      CHECK_EQ(-1, ::rename(
+          path::join(node->fts_path, "..").c_str(), node->fts_path));
+
+      // If this is a mount point, don't descend any further. Once we skip,
+      // FTS will not show us any of the files in this directory.
+      if (errno == EXDEV) {
+        ::fts_set(tree, node, FTS_SKIP);
+        continue;
+      }
+    }
+
     if (node->fts_info == FTS_D || node->fts_info == FTS_F) {
       Try<Nothing> status = internal::setProjectId(
           node->fts_path, *node->fts_statp, projectId);
@@ -407,7 +454,7 @@ Try<bool> isQuotaEnabled(const string& path)
   // because we are getting global information rather than information for
   // a specific identity (eg. a projectId).
   if (::quotactl(QCMD(Q_XGETQSTATV, 0),
-                 devname.get().c_str(),
+                 devname->c_str(),
                  0, // id
                  reinterpret_cast<caddr_t>(&statv)) == -1) {
     // ENOSYS means that quotas are not enabled at all.

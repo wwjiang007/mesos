@@ -84,6 +84,18 @@ using mesos::internal::slave::Slave;
 
 using mesos::slave::ContainerTermination;
 
+#ifndef __WINDOWS__
+namespace process {
+
+void reinitialize(
+    const Option<string>& delegate,
+    const Option<string>& readonlyAuthenticationRealm,
+    const Option<string>& readwriteAuthenticationRealm);
+
+} // namespace process {
+#endif // __WINDOWS__
+
+
 namespace mesos {
 namespace internal {
 namespace tests {
@@ -220,6 +232,118 @@ TEST_P(DefaultExecutorTest, TaskRunning)
 }
 
 
+// This is a regression test for MESOS-9332. It launches a nested container as
+// a non-root user which is inherited from its parent container, and verifies
+// that the nested container's user is same as the owner of its sandbox.
+TEST_P(DefaultExecutorTest, ROOT_UNPRIVILEGED_USER_SandboxOwnership)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.containerizers = GetParam();
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  Option<string> user = os::getenv("SUDO_USER");
+  ASSERT_SOME(user);
+
+  // Set the framework user to a non-root user so the default executor will
+  // also be run as this non-root user since the default executor always runs
+  // as the same user of the framework.
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_user(user.get());
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  v1::Resources resources =
+    v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
+
+  Future<v1::scheduler::Event::Update> startingUpdate;
+  Future<v1::scheduler::Event::Update> runningUpdate;
+  Future<v1::scheduler::Event::Update> finishedUpdate;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&runningUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&finishedUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  // Launch a task without specifying user in its `commandInfo` so the
+  // corresponding nested container will inherit user from its parent
+  // container (i.e., the default executor). The task will run a command
+  // to verify its user is same as the owner of its sandbox.
+  v1::TaskInfo taskInfo = v1::createTask(
+      agentId,
+      resources,
+      "test `stat -c \"%U\" .` = " + user.get());
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({taskInfo}))}));
+
+  AWAIT_READY(startingUpdate);
+  ASSERT_EQ(v1::TASK_STARTING, startingUpdate->status().state());
+  ASSERT_EQ(taskInfo.task_id(), startingUpdate->status().task_id());
+
+  AWAIT_READY(runningUpdate);
+  ASSERT_EQ(v1::TASK_RUNNING, runningUpdate->status().state());
+  ASSERT_EQ(taskInfo.task_id(), runningUpdate->status().task_id());
+
+  AWAIT_READY(finishedUpdate);
+  ASSERT_EQ(v1::TASK_FINISHED, finishedUpdate->status().state());
+  ASSERT_EQ(taskInfo.task_id(), finishedUpdate->status().task_id());
+}
+
+
 // This test verifies that if the default executor is asked
 // to kill a task from a task group, it kills all tasks in
 // the group and sends TASK_KILLED updates for them.
@@ -289,7 +413,7 @@ TEST_P(DefaultExecutorTest, KillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(task1)
     .WillOnce(
@@ -300,7 +424,7 @@ TEST_P(DefaultExecutorTest, KillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(task1)
     .WillOnce(
@@ -311,7 +435,7 @@ TEST_P(DefaultExecutorTest, KillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_KILLED))))
     .InSequence(task1)
     .WillOnce(
@@ -327,7 +451,7 @@ TEST_P(DefaultExecutorTest, KillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(task2)
     .WillOnce(
@@ -338,7 +462,7 @@ TEST_P(DefaultExecutorTest, KillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(task2)
     .WillOnce(
@@ -349,7 +473,7 @@ TEST_P(DefaultExecutorTest, KillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_KILLED))))
     .InSequence(task2)
     .WillOnce(
@@ -396,7 +520,7 @@ TEST_P(DefaultExecutorTest, KillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo3),
+          TaskStatusUpdateTaskIdEq(taskInfo3.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(task3)
     .WillOnce(
@@ -407,7 +531,7 @@ TEST_P(DefaultExecutorTest, KillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo3),
+          TaskStatusUpdateTaskIdEq(taskInfo3.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(task3)
     .WillOnce(
@@ -418,7 +542,7 @@ TEST_P(DefaultExecutorTest, KillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo3),
+          TaskStatusUpdateTaskIdEq(taskInfo3.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_KILLED))))
     .InSequence(task3)
     .WillOnce(
@@ -543,7 +667,7 @@ TEST_P(DefaultExecutorTest, KillMultipleTasks)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(task1)
     .WillOnce(
@@ -554,7 +678,7 @@ TEST_P(DefaultExecutorTest, KillMultipleTasks)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(task1)
     .WillOnce(
@@ -565,7 +689,7 @@ TEST_P(DefaultExecutorTest, KillMultipleTasks)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_KILLED))))
     .InSequence(task1)
     .WillOnce(
@@ -581,7 +705,7 @@ TEST_P(DefaultExecutorTest, KillMultipleTasks)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(task2)
     .WillOnce(
@@ -592,7 +716,7 @@ TEST_P(DefaultExecutorTest, KillMultipleTasks)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(task2)
     .WillOnce(
@@ -603,7 +727,7 @@ TEST_P(DefaultExecutorTest, KillMultipleTasks)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_KILLED))))
     .InSequence(task2)
     .WillOnce(
@@ -703,7 +827,7 @@ TEST_P(DefaultExecutorTest, KillTaskGroupOnTaskFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(task1)
     .WillOnce(
@@ -714,7 +838,7 @@ TEST_P(DefaultExecutorTest, KillTaskGroupOnTaskFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(task1)
     .WillOnce(
@@ -725,7 +849,7 @@ TEST_P(DefaultExecutorTest, KillTaskGroupOnTaskFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_FAILED))))
     .InSequence(task1)
     .WillOnce(
@@ -741,7 +865,7 @@ TEST_P(DefaultExecutorTest, KillTaskGroupOnTaskFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(task2)
     .WillOnce(
@@ -752,7 +876,7 @@ TEST_P(DefaultExecutorTest, KillTaskGroupOnTaskFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(task2)
     .WillOnce(
@@ -763,7 +887,7 @@ TEST_P(DefaultExecutorTest, KillTaskGroupOnTaskFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_KILLED))))
     .InSequence(task2)
     .WillOnce(
@@ -938,7 +1062,7 @@ TEST_P(DefaultExecutorTest, ROOT_ContainerStatusForTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(task1)
     .WillOnce(
@@ -949,7 +1073,7 @@ TEST_P(DefaultExecutorTest, ROOT_ContainerStatusForTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(task1)
     .WillOnce(
@@ -964,7 +1088,7 @@ TEST_P(DefaultExecutorTest, ROOT_ContainerStatusForTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(task2)
     .WillOnce(
@@ -975,7 +1099,7 @@ TEST_P(DefaultExecutorTest, ROOT_ContainerStatusForTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(task2)
     .WillOnce(
@@ -1185,7 +1309,7 @@ TEST_P(DefaultExecutorTest, CommitSuicideOnKillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(task1)
     .WillOnce(
@@ -1196,7 +1320,7 @@ TEST_P(DefaultExecutorTest, CommitSuicideOnKillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(task1)
     .WillOnce(
@@ -1207,7 +1331,7 @@ TEST_P(DefaultExecutorTest, CommitSuicideOnKillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo1),
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_FINISHED))))
     .InSequence(task1)
     .WillOnce(
@@ -1223,7 +1347,7 @@ TEST_P(DefaultExecutorTest, CommitSuicideOnKillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(task2)
     .WillOnce(
@@ -1234,7 +1358,7 @@ TEST_P(DefaultExecutorTest, CommitSuicideOnKillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(task2)
     .WillOnce(
@@ -1245,7 +1369,7 @@ TEST_P(DefaultExecutorTest, CommitSuicideOnKillTask)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo2),
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_KILLED))))
     .InSequence(task2)
     .WillOnce(
@@ -1619,7 +1743,8 @@ TEST_P(DefaultExecutorTest, SigkillExecutor)
 
   Future<v1::scheduler::Event::Offers> offers;
   EXPECT_CALL(*scheduler, offers(_, _))
-    .WillOnce(FutureArg<1>(&offers));
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore further offers.
 
   EXPECT_CALL(*scheduler, heartbeat(_))
     .WillRepeatedly(Return()); // Ignore heartbeats.
@@ -1704,6 +1829,229 @@ TEST_P(DefaultExecutorTest, SigkillExecutor)
   ASSERT_TRUE(wait.get()->has_status());
 }
 
+
+// This test verifies that the default executor terminates the entire group
+// when some task exceeded its `max_completion_time`.
+TEST_P(DefaultExecutorTest, MaxCompletionTime)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  v1::Resources resources =
+    v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
+
+  // Task 1 will finish before its max_completion_time.
+  v1::TaskInfo taskInfo1 = v1::createTask(agentId, resources, "exit 0");
+
+  taskInfo1.mutable_max_completion_time()->set_nanoseconds(Seconds(2).ns());
+
+  // Task 2 will trigger its max_completion_time.
+  v1::TaskInfo taskInfo2 =
+    v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
+
+  taskInfo2.mutable_max_completion_time()->set_nanoseconds(Seconds(2).ns());
+
+  // Task 3 has no max_completion_time.
+  v1::TaskInfo taskInfo3 =
+    v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
+
+  Future<v1::scheduler::Event::Update> startingUpdate1;
+  Future<v1::scheduler::Event::Update> runningUpdate1;
+  Future<v1::scheduler::Event::Update> finishedUpdate1;
+
+  testing::Sequence task1;
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_STARTING))))
+    .InSequence(task1)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingUpdate1),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .InSequence(task1)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&runningUpdate1),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_FINISHED))))
+    .InSequence(task1)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&finishedUpdate1),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  Future<v1::scheduler::Event::Update> startingUpdate2;
+  Future<v1::scheduler::Event::Update> runningUpdate2;
+  Future<v1::scheduler::Event::Update> failedUpdate2;
+
+  testing::Sequence task2;
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_STARTING))))
+    .InSequence(task2)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingUpdate2),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .InSequence(task2)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&runningUpdate2),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_FAILED))))
+    .InSequence(task2)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&failedUpdate2),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  Future<v1::scheduler::Event::Update> startingUpdate3;
+  Future<v1::scheduler::Event::Update> runningUpdate3;
+  Future<v1::scheduler::Event::Update> killedUpdate3;
+
+  testing::Sequence task3;
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo3.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_STARTING))))
+    .InSequence(task3)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingUpdate3),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo3.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .InSequence(task3)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&runningUpdate3),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo3.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_KILLED))))
+    .InSequence(task3)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&killedUpdate3),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  Future<v1::scheduler::Event::Failure> executorFailure;
+  EXPECT_CALL(*scheduler, failure(_, _))
+    .WillOnce(FutureArg<1>(&executorFailure));
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo(
+                  {taskInfo1, taskInfo2, taskInfo3}))}));
+
+  AWAIT_READY(startingUpdate1);
+  AWAIT_READY(runningUpdate1);
+  AWAIT_READY(finishedUpdate1);
+
+  AWAIT_READY(startingUpdate2);
+  AWAIT_READY(runningUpdate2);
+  AWAIT_READY(failedUpdate2);
+
+  EXPECT_EQ(
+      v1::TaskStatus::REASON_MAX_COMPLETION_TIME_REACHED,
+      failedUpdate2->status().reason());
+
+  AWAIT_READY(startingUpdate3);
+  AWAIT_READY(runningUpdate3);
+  AWAIT_READY(killedUpdate3);
+
+  EXPECT_NE(
+      v1::TaskStatus::REASON_MAX_COMPLETION_TIME_REACHED,
+      killedUpdate3->status().reason());
+
+  // The executor should commit suicide after the task is killed.
+  AWAIT_READY(executorFailure);
+
+  // Even though the task failed, the executor should exit gracefully.
+  ASSERT_TRUE(executorFailure->has_status());
+  ASSERT_EQ(0, executorFailure->status());
+}
 
 // TODO(qianzhang): Kill policy helpers are not yet enabled on Windows. See
 // MESOS-8168.
@@ -1947,7 +2295,7 @@ TEST_P(DefaultExecutorTest, ROOT_MultiTaskgroupSharePidNamespace)
   v1::TaskInfo taskInfo1 = v1::createTask(
       agentId,
       v1::Resources::parse("cpus:0.1;mem:32;disk:32").get(),
-      "stat -Lc %i /proc/self/ns/pid > ns && sleep 1000");
+      "stat -Lc %i /proc/1/ns/pid > ns && sleep 1000");
 
   mesos::v1::ContainerInfo* containerInfo = taskInfo1.mutable_container();
   containerInfo->set_type(mesos::v1::ContainerInfo::MESOS);
@@ -1989,7 +2337,7 @@ TEST_P(DefaultExecutorTest, ROOT_MultiTaskgroupSharePidNamespace)
   v1::TaskInfo taskInfo2 = v1::createTask(
       agentId,
       v1::Resources::parse("cpus:0.1;mem:32;disk:32").get(),
-      "stat -Lc %i /proc/self/ns/pid > ns && sleep 1000");
+      "stat -Lc %i /proc/1/ns/pid > ns && sleep 1000");
 
   containerInfo = taskInfo2.mutable_container();
   containerInfo->set_type(mesos::v1::ContainerInfo::MESOS);
@@ -2820,6 +3168,303 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
 }
 
 
+#ifndef __WINDOWS__
+// This test verifies that the default executor mounts the local
+// persistent volume in the task container when it is set on a
+// task launched with a non-root user in the task group, and the
+// task can write to the local persistent volume.
+TEST_P(
+    PersistentVolumeDefaultExecutor,
+    ROOT_UNPRIVILEGED_USER_TaskSandboxLocalPersistentVolume)
+{
+  if (!strings::contains(param.isolation, "filesystem/linux")) {
+    // Only run this test when the `filesystem/linux` isolator is enabled
+    // since that is the only case the `volume/sandbox_path` isolator will
+    // call volume gid manager.
+    return;
+  }
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.launcher = param.launcher;
+  flags.isolation = param.isolation;
+  flags.volume_gid_range = "[10000-20000]";
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, DEFAULT_TEST_ROLE);
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  v1::Resources unreserved =
+    v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      unreserved,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+
+  // Create a local persistent volume, and then launch a task with
+  // a non-root user in a task group to write a file to the volume.
+  v1::Resource volume = v1::createPersistentVolume(
+      Megabytes(1),
+      frameworkInfo.roles(0),
+      "id1",
+      "task_volume_path",
+      frameworkInfo.principal(),
+      None(),
+      frameworkInfo.principal());
+
+  v1::Resources reserved =
+    unreserved.pushReservation(v1::createDynamicReservationInfo(
+        frameworkInfo.roles(0), frameworkInfo.principal()));
+
+  Option<string> user = os::getenv("SUDO_USER");
+  ASSERT_SOME(user);
+
+  v1::CommandInfo command =
+      v1::createCommandInfo("echo abc > task_volume_path/file");
+
+  command.set_user(user.get());
+
+  v1::TaskInfo taskInfo = v1::createTask(
+      offer.agent_id(),
+      reserved.apply(v1::CREATE(volume)).get(),
+      command);
+
+  v1::Offer::Operation reserve = v1::RESERVE(reserved);
+  v1::Offer::Operation create = v1::CREATE(volume);
+  v1::Offer::Operation launchGroup = v1::LAUNCH_GROUP(
+      executorInfo,
+      v1::createTaskGroupInfo({taskInfo}));
+
+  Future<Event::Update> updateStarting;
+  Future<Event::Update> updateRunning;
+  Future<Event::Update> updateFinished;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(DoAll(FutureArg<1>(&updateStarting),
+                    v1::scheduler::SendAcknowledge(
+                        frameworkId,
+                        offer.agent_id())))
+    .WillOnce(DoAll(FutureArg<1>(&updateRunning),
+                    v1::scheduler::SendAcknowledge(
+                        frameworkId,
+                        offer.agent_id())))
+    .WillOnce(DoAll(FutureArg<1>(&updateFinished),
+                    v1::scheduler::SendAcknowledge(
+                        frameworkId,
+                        offer.agent_id())));
+
+  mesos.send(v1::createCallAccept(
+      frameworkId,
+      offer,
+      {reserve, create, launchGroup}));
+
+  AWAIT_READY(updateStarting);
+  ASSERT_EQ(v1::TASK_STARTING, updateStarting->status().state());
+  ASSERT_EQ(taskInfo.task_id(), updateStarting->status().task_id());
+
+  AWAIT_READY(updateRunning);
+  ASSERT_EQ(v1::TASK_RUNNING, updateRunning->status().state());
+  ASSERT_EQ(taskInfo.task_id(), updateRunning->status().task_id());
+
+  AWAIT_READY(updateFinished);
+  ASSERT_EQ(v1::TASK_FINISHED, updateFinished->status().state());
+  ASSERT_EQ(taskInfo.task_id(), updateFinished->status().task_id());
+}
+
+
+// This test verifies that the default executor mounts the shared
+// persistent volume in the task container when it is set on a task
+// launched with a non-root user in the task group, and the task can
+// write to the shared persistent volume.
+TEST_P(
+    PersistentVolumeDefaultExecutor,
+    ROOT_UNPRIVILEGED_USER_TaskSandboxSharedPersistentVolume)
+{
+  if (!strings::contains(param.isolation, "filesystem/linux")) {
+    // Only run this test when the `filesystem/linux` isolator is enabled
+    // since that is the only case the `volume/sandbox_path` isolator will
+    // call volume gid manager.
+    return;
+  }
+
+  // Reinitialize libprocess to ensure volume gid manager's metrics
+  // can be added in each iteration of this test (i.e., run this test
+  // repeatedly with the `--gtest_repeat` option).
+  process::reinitialize(None(), None(), None());
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.launcher = param.launcher;
+  flags.isolation = param.isolation;
+  flags.volume_gid_range = "[10000-20000]";
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  Option<string> user = os::getenv("SUDO_USER");
+  ASSERT_SOME(user);
+
+  // Set the framework user to a non-root user and the task will
+  // be launched with this user by default.
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, DEFAULT_TEST_ROLE);
+  frameworkInfo.set_user(user.get());
+  frameworkInfo.add_capabilities()->set_type(
+      v1::FrameworkInfo::Capability::SHARED_RESOURCES);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  v1::Resources unreserved =
+    v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      unreserved,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+
+  // Create a shared persistent volume, and then launch a
+  // task in a task group to write a file to the volume.
+  v1::Resource volume = v1::createPersistentVolume(
+      Megabytes(1),
+      frameworkInfo.roles(0),
+      "id1",
+      "task_volume_path",
+      frameworkInfo.principal(),
+      None(),
+      frameworkInfo.principal(),
+      true);
+
+  v1::Resources reserved =
+    unreserved.pushReservation(v1::createDynamicReservationInfo(
+        frameworkInfo.roles(0), frameworkInfo.principal()));
+
+  v1::TaskInfo taskInfo = v1::createTask(
+      offer.agent_id(),
+      reserved.apply(v1::CREATE(volume)).get(),
+      "echo abc > task_volume_path/file");
+
+  v1::Offer::Operation reserve = v1::RESERVE(reserved);
+  v1::Offer::Operation create = v1::CREATE(volume);
+  v1::Offer::Operation launchGroup = v1::LAUNCH_GROUP(
+      executorInfo,
+      v1::createTaskGroupInfo({taskInfo}));
+
+  Future<Event::Update> updateStarting;
+  Future<Event::Update> updateRunning;
+  Future<Event::Update> updateFinished;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(DoAll(FutureArg<1>(&updateStarting),
+                    v1::scheduler::SendAcknowledge(
+                        frameworkId,
+                        offer.agent_id())))
+    .WillOnce(DoAll(FutureArg<1>(&updateRunning),
+                    v1::scheduler::SendAcknowledge(
+                        frameworkId,
+                        offer.agent_id())))
+    .WillOnce(DoAll(FutureArg<1>(&updateFinished),
+                    v1::scheduler::SendAcknowledge(
+                        frameworkId,
+                        offer.agent_id())));
+
+  mesos.send(v1::createCallAccept(
+      frameworkId,
+      offer,
+      {reserve, create, launchGroup}));
+
+  AWAIT_READY(updateStarting);
+  ASSERT_EQ(v1::TASK_STARTING, updateStarting->status().state());
+  ASSERT_EQ(taskInfo.task_id(), updateStarting->status().task_id());
+
+  AWAIT_READY(updateRunning);
+  ASSERT_EQ(v1::TASK_RUNNING, updateRunning->status().state());
+  ASSERT_EQ(taskInfo.task_id(), updateRunning->status().task_id());
+
+  AWAIT_READY(updateFinished);
+  ASSERT_EQ(v1::TASK_FINISHED, updateFinished->status().state());
+  ASSERT_EQ(taskInfo.task_id(), updateFinished->status().task_id());
+
+  // One gid should have been allocated to the volume. Please note that shared
+  // persistent volume's gid will be deallocated only when it is destroyed.
+  JSON::Object metrics = Metrics();
+  EXPECT_EQ(
+      metrics.at<JSON::Number>("volume_gid_manager/volume_gids_total")
+        ->as<int>() - 1,
+      metrics.at<JSON::Number>("volume_gid_manager/volume_gids_free")
+        ->as<int>());
+}
+#endif // __WINDOWS__
+
+
 // This test verifies that sibling tasks in the same task group can share a
 // Volume owned by their parent executor using 'sandbox_path' volumes.
 TEST_P_TEMP_DISABLED_ON_WINDOWS(
@@ -3515,7 +4160,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(DefaultExecutorTest, ROOT_LaunchGroupFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(sleepTaskInfo1),
+          TaskStatusUpdateTaskIdEq(sleepTaskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(sleepTask1)
     .WillOnce(
@@ -3526,7 +4171,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(DefaultExecutorTest, ROOT_LaunchGroupFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(sleepTaskInfo1),
+          TaskStatusUpdateTaskIdEq(sleepTaskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(sleepTask1)
     .WillOnce(
@@ -3537,7 +4182,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(DefaultExecutorTest, ROOT_LaunchGroupFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(sleepTaskInfo1),
+          TaskStatusUpdateTaskIdEq(sleepTaskInfo1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_KILLED))))
     .InSequence(sleepTask1)
     .WillOnce(
@@ -3553,7 +4198,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(DefaultExecutorTest, ROOT_LaunchGroupFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(sleepTaskInfo2),
+          TaskStatusUpdateTaskIdEq(sleepTaskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(sleepTask2)
     .WillOnce(
@@ -3564,7 +4209,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(DefaultExecutorTest, ROOT_LaunchGroupFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(sleepTaskInfo2),
+          TaskStatusUpdateTaskIdEq(sleepTaskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(sleepTask2)
     .WillOnce(
@@ -3575,7 +4220,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(DefaultExecutorTest, ROOT_LaunchGroupFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(sleepTaskInfo2),
+          TaskStatusUpdateTaskIdEq(sleepTaskInfo2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_KILLED))))
     .InSequence(sleepTask2)
     .WillOnce(
@@ -3590,7 +4235,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(DefaultExecutorTest, ROOT_LaunchGroupFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(failingTaskInfo),
+          TaskStatusUpdateTaskIdEq(failingTaskInfo.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(failingTask)
     .WillOnce(
@@ -3601,7 +4246,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(DefaultExecutorTest, ROOT_LaunchGroupFailure)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(failingTaskInfo),
+          TaskStatusUpdateTaskIdEq(failingTaskInfo.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_FAILED))))
     .InSequence(failingTask)
     .WillOnce(
@@ -3663,6 +4308,113 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(DefaultExecutorTest, ROOT_LaunchGroupFailure)
   // The executor should commit suicide after all the tasks have been
   // killed.
   AWAIT_READY(executorFailure);
+}
+
+
+// This test verifies that the `MESOS_ALLOCATION_ROLE`
+// environment variable is set properly.
+TEST_P(DefaultExecutorTest, AllocationRoleEnvironmentVariable)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.containerizers = GetParam();
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  // Start the framework with a role specified.
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.clear_roles();
+  frameworkInfo.add_roles("role1");
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  v1::Resources resources =
+    v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
+
+  Future<v1::scheduler::Event::Update> startingUpdate;
+  Future<v1::scheduler::Event::Update> runningUpdate;
+  Future<v1::scheduler::Event::Update> finishedUpdate;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&runningUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&finishedUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  v1::TaskInfo taskInfo = v1::createTask(
+      agentId,
+      resources,
+#ifdef __WINDOWS__
+      "if %MESOS_ALLOCATION_ROLE% == \"role1\" (exit 1)");
+#else
+      "if [ \"$MESOS_ALLOCATION_ROLE\" != \"role1\" ]; then exit 1; fi");
+#endif // __WINDOWS__
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({taskInfo}))}));
+
+  AWAIT_READY(startingUpdate);
+  ASSERT_EQ(v1::TASK_STARTING, startingUpdate->status().state());
+  ASSERT_EQ(taskInfo.task_id(), startingUpdate->status().task_id());
+
+  AWAIT_READY(runningUpdate);
+  ASSERT_EQ(v1::TASK_RUNNING, runningUpdate->status().state());
+  ASSERT_EQ(taskInfo.task_id(), runningUpdate->status().task_id());
+
+  AWAIT_READY(finishedUpdate);
+  ASSERT_EQ(v1::TASK_FINISHED, finishedUpdate->status().state());
+  ASSERT_EQ(taskInfo.task_id(), finishedUpdate->status().task_id());
 }
 
 } // namespace tests {

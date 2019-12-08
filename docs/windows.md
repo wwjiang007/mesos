@@ -21,29 +21,26 @@ Mesos 1.0.0 introduced experimental support for Windows.
 3. Install [GNU patch for Windows](http://gnuwin32.sourceforge.net/packages/patch.htm).
 
 4. If building from source, install [Git](https://git-scm.com/download/win).
-   During installation, keep the defaults to "Use Git from the Windows
-   Command Prompt", and "Checkout Windows-style, commit Unix-style
-   line endings" (i.e. `git config core.autocrlf true`).
 
 5. Make sure there are no spaces in your build directory.
    For example, `C:/Program Files (x86)/mesos` is an invalid build directory.
 
-6. If developing Mesos, install [Python 2](https://www.python.org/downloads/)
-   (not Python 3), in order to use our support scripts (e.g. to post and apply
-   patches, or lint source code).
+6. If developing Mesos, install [Python 3](https://www.python.org/downloads/)
+   (not Python 2), in order to use our `support` scripts (e.g.
+   to post and apply patches, or lint source code).
 
 ### Build Instructions
 
 Following are the instructions for Windows 10.
 
     # Clone (or extract) Mesos.
-    git clone https://git-wip-us.apache.org/repos/asf/mesos.git
+    git clone https://gitbox.apache.org/repos/asf/mesos.git
     cd mesos
 
     # Configure using CMake for an out-of-tree build.
     mkdir build
     cd build
-    cmake .. -G "Visual Studio 15 2017 Win64" -T "host=x64" -DENABLE_LIBEVENT=1
+    cmake .. -G "Visual Studio 15 2017 Win64" -T "host=x64"
 
     # Build Mesos.
     # To build just the Mesos agent, add `--target mesos-agent`.
@@ -52,7 +49,7 @@ Following are the instructions for Windows 10.
     # The Windows agent exposes new isolators that must be used as with
     # the `--isolation` flag. To get started point the agent to a working
     # master, using eiher an IP address or zookeeper information.
-    src\mesos-agent.exe --master=<master> --work_dir=<work folder> --launcher_dir=<repository>\build\src
+    .\src\mesos-agent.exe --master=<master> --work_dir=<work folder> --launcher_dir=<repository>\build\src
 
 ## Running Mesos
 
@@ -96,8 +93,7 @@ ensure `ninja.exe` is in your `PATH`.
 * Open an "x64 Native Tools Command Prompt for VS 2017" to set your
   environment.
 * In that command prompt, type `powershell` to use a better shell.
-* Similar to above, configure CMake with
-  `cmake .. -G Ninja -DENABLE_LIBEVENT=1`.
+* Similar to above, configure CMake with `cmake .. -G Ninja`.
 * Now you can use `ninja` to build the various targets.
 * You may want to use `ninja -v` to make it verbose, as it's otherwise
   very quiet.
@@ -166,7 +162,12 @@ of OpenSSL for Windows. A commonly chosen distribution is
 As of this writing, OpenSSL 1.1.x is not yet supported, but 1.0.2M has been
 tested.
 
-Use `-DENABLE_SSL=ON` when running CMake to build with OpenSSL.
+Use `-DENABLE_SSL=ON -DENABLE_LIBEVENT=ON` to build with OpenSSL.
+
+> Warning: This currently requires the use of libevent instead of the
+> native Windows Thread Pool API. However, the use of libevent on
+> Windows is NOT recommended, as it is buggy and will be unsupported
+> in the future.
 
 Note that it will link to OpenSSL dynamically, so if the built executables are
 deployed elsewhere, that machine also needs OpenSSL installed.

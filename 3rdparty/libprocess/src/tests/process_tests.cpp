@@ -63,6 +63,8 @@
 #include <stout/os/killtree.hpp>
 #include <stout/os/write.hpp>
 
+#include <stout/tests/utils.hpp>
+
 #include "encoder.hpp"
 
 namespace http = process::http;
@@ -76,7 +78,10 @@ using process::defer;
 using process::Deferred;
 using process::Event;
 using process::Executor;
+using process::DispatchEvent;
 using process::ExitedEvent;
+using process::TerminateEvent;
+using process::Failure;
 using process::Future;
 using process::Message;
 using process::MessageEncoder;
@@ -85,6 +90,7 @@ using process::Owned;
 using process::PID;
 using process::Process;
 using process::ProcessBase;
+using process::Promise;
 using process::run;
 using process::Subprocess;
 using process::TerminateEvent;
@@ -110,7 +116,10 @@ using testing::ReturnArg;
 
 // TODO(bmahler): Move tests into their own files as appropriate.
 
-TEST(ProcessTest, Event)
+class ProcessTest : public TemporaryDirectoryTest {};
+
+
+TEST_F(ProcessTest, Event)
 {
   Owned<Event> event(new TerminateEvent(UPID(), false));
   EXPECT_FALSE(event->is<MessageEvent>());
@@ -127,7 +136,7 @@ public:
 };
 
 
-TEST(ProcessTest, Spawn)
+TEST_F(ProcessTest, Spawn)
 {
   SpawnProcess process;
 
@@ -175,7 +184,7 @@ public:
 };
 
 
-TEST(ProcessTest, Dispatch)
+TEST_F(ProcessTest, Dispatch)
 {
   DispatchProcess process;
 
@@ -211,7 +220,7 @@ TEST(ProcessTest, Dispatch)
 }
 
 
-TEST(ProcessTest, Defer1)
+TEST_F(ProcessTest, Defer1)
 {
   DispatchProcess process;
 
@@ -331,7 +340,7 @@ private:
 };
 
 
-TEST(ProcessTest, Defer2)
+TEST_F(ProcessTest, Defer2)
 {
   DeferProcess process;
 
@@ -363,7 +372,7 @@ void set(T* t1, const T& t2)
 }
 
 
-TEST(ProcessTest, Defer3)
+TEST_F(ProcessTest, Defer3)
 {
   std::atomic_bool bool1(false);
   std::atomic_bool bool2(false);
@@ -395,7 +404,7 @@ public:
 };
 
 
-TEST(ProcessTest, Handlers)
+TEST_F(ProcessTest, Handlers)
 {
   HandlersProcess process;
 
@@ -418,7 +427,7 @@ TEST(ProcessTest, Handlers)
 
 // Tests DROP_MESSAGE and DROP_DISPATCH and in particular that an
 // event can get dropped before being processed.
-TEST(ProcessTest, Expect)
+TEST_F(ProcessTest, Expect)
 {
   HandlersProcess process;
 
@@ -447,7 +456,7 @@ TEST(ProcessTest, Expect)
 
 
 // Tests the FutureArg<N> action.
-TEST(ProcessTest, Action)
+TEST_F(ProcessTest, Action)
 {
   HandlersProcess process;
 
@@ -492,7 +501,7 @@ public:
 };
 
 
-TEST(ProcessTest, Inheritance)
+TEST_F(ProcessTest, Inheritance)
 {
   DerivedProcess process;
 
@@ -520,7 +529,7 @@ TEST(ProcessTest, Inheritance)
 }
 
 
-TEST(ProcessTest, Thunk)
+TEST_F(ProcessTest, Thunk)
 {
   struct Thunk
   {
@@ -563,7 +572,7 @@ public:
 };
 
 
-TEST(ProcessTest, Delegate)
+TEST_F(ProcessTest, Delegate)
 {
   DelegateeProcess delegatee;
   DelegatorProcess delegator(delegatee.self());
@@ -594,7 +603,7 @@ public:
 };
 
 
-TEST(ProcessTest, Delay)
+TEST_F(ProcessTest, Delay)
 {
   Clock::pause();
 
@@ -631,7 +640,7 @@ public:
 };
 
 
-TEST(ProcessTest, Order)
+TEST_F(ProcessTest, Order)
 {
   Clock::pause();
 
@@ -684,7 +693,7 @@ public:
 };
 
 
-TEST(ProcessTest, Donate)
+TEST_F(ProcessTest, Donate)
 {
   DonateProcess process;
   spawn(process);
@@ -696,12 +705,14 @@ TEST(ProcessTest, Donate)
 }
 
 
+// TODO(bmahler): Use an RAII-wrapper here to prevent crashes
+// during test assertion failures.
 class ExitedProcess : public Process<ExitedProcess>
 {
 public:
   explicit ExitedProcess(const UPID& _pid) : pid(_pid) {}
 
-  virtual void initialize()
+  void initialize() override
   {
     link(pid);
   }
@@ -713,7 +724,7 @@ private:
 };
 
 
-TEST(ProcessTest, Exited)
+TEST_F(ProcessTest, Exited)
 {
   UPID pid = spawn(new ProcessBase(), true);
 
@@ -735,7 +746,7 @@ TEST(ProcessTest, Exited)
 }
 
 
-TEST(ProcessTest, InjectExited)
+TEST_F(ProcessTest, InjectExited)
 {
   UPID pid = spawn(new ProcessBase(), true);
 
@@ -757,13 +768,63 @@ TEST(ProcessTest, InjectExited)
 }
 
 
+// TODO(bmahler): Move all message interception / dropping tests
+// (of the gmock.hpp functionality) into a separate file.
+TEST_F(ProcessTest, FutureExited)
+{
+  UPID linkee = spawn(new ProcessBase(), true);
+  ExitedProcess linker(linkee);
+
+  Future<Nothing> exited = FUTURE_EXITED(linkee, linker.self());
+
+  Future<UPID> exitedPid;
+  EXPECT_CALL(linker, exited(linkee))
+    .WillOnce(FutureArg<0>(&exitedPid));
+
+  spawn(linker);
+
+  terminate(linkee);
+
+  AWAIT_READY(exited);
+  AWAIT_ASSERT_EQ(linkee, exitedPid);
+
+  terminate(linker);
+  wait(linker);
+}
+
+
+// TODO(bmahler): Move all message interception / dropping tests
+// (of the gmock.hpp functionality) into a separate file.
+TEST_F(ProcessTest, DropExited)
+{
+  UPID linkee = spawn(new ProcessBase(), true);
+  ExitedProcess linker(linkee);
+
+  Future<Nothing> exited = DROP_EXITED(linkee, linker.self());
+
+  Future<UPID> exitedPid;
+  EXPECT_CALL(linker, exited(linkee))
+    .WillRepeatedly(FutureArg<0>(&exitedPid));
+
+  spawn(linker);
+
+  terminate(linkee);
+
+  AWAIT_READY(exited);
+  EXPECT_TRUE(exitedPid.isPending());
+
+  terminate(linker);
+  wait(linker);
+}
+
+
 class MessageEventProcess : public Process<MessageEventProcess>
 {
 public:
   // This is a workaround for mocking methods taking
   // rvalue reference parameters.
   // See https://github.com/google/googletest/issues/395
-  void consume(MessageEvent&& event) { consume_(event.message); }
+  void consume(MessageEvent&& event) override { consume_(event.message); }
   MOCK_METHOD1(consume_, void(const Message&));
 };
 
@@ -771,7 +832,7 @@ public:
 class ProcessRemoteLinkTest : public ::testing::Test
 {
 protected:
-  virtual void SetUp()
+  void SetUp() override
   {
     // Spawn a process to coordinate with the subprocess (test-linkee).
     // The `test-linkee` will send us a message when it has finished
@@ -783,9 +844,29 @@ protected:
     EXPECT_CALL(coordinator, consume_(_))
       .WillOnce(FutureArg<0>(&message));
 
+    // TODO(andschwa): Clean this up so that `BUILD_DIR` has the correct
+    // separator at compilation time.
+#ifdef __WINDOWS__
+    const std::string buildDir = strings::replace(BUILD_DIR, "/", "\\");
+#else
+    const std::string buildDir = BUILD_DIR;
+#endif // __WINDOWS__
+
+#ifdef __WINDOWS__
+    constexpr char LINKEENAME[] = "test-linkee.exe";
+#else
+    constexpr char LINKEENAME[] = "test-linkee";
+#endif // __WINDOWS__
+
+    const std::string linkeePath = path::join(buildDir, LINKEENAME);
+    ASSERT_TRUE(os::exists(linkeePath));
+
+    // NOTE: Because of the differences between Windows and POSIX
+    // shells when interpreting quotes, we use the second form of
+    // `subprocess` to call `test-linkee` directly with a set of
+    // arguments, rather than through the shell.
     Try<Subprocess> s = process::subprocess(
-        path::join(BUILD_DIR, "test-linkee") +
-          " '" + stringify(coordinator.self()) + "'");
+        linkeePath, {linkeePath, stringify(coordinator.self())});
     ASSERT_SOME(s);
     linkee = s.get();
 
@@ -820,10 +901,10 @@ protected:
     }
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     if (linkee.isSome()) {
-      os::killtree(linkee->pid(), SIGKILL);
+      os::kill(linkee->pid(), SIGKILL);
       reap_linkee();
       linkee = None();
     }
@@ -837,9 +918,7 @@ public:
 
 // Verifies that linking to a remote process will correctly detect
 // the associated `ExitedEvent`.
-// TODO(hausdorff): Test fails on Windows. Fix and enable. Linkee never sends a
-// message because "no such program exists". See MESOS-5941.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteLink)
+TEST_F(ProcessRemoteLinkTest, RemoteLink)
 {
   // Link to the remote subprocess.
   ExitedProcess process(pid);
@@ -851,7 +930,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteLink)
 
   spawn(process);
 
-  os::killtree(linkee->pid(), SIGKILL);
+  os::kill(linkee->pid(), SIGKILL);
   reap_linkee();
   linkee = None();
 
@@ -892,9 +971,7 @@ private:
 // Verifies that calling `link` with "relink" semantics will have the
 // same behavior as `link` with "normal" semantics, when there is no
 // existing persistent connection.
-// TODO(hausdorff): Test fails on Windows. Fix and enable. Linkee never sends a
-// message because "no such program exists". See MESOS-5941.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteRelink)
+TEST_F(ProcessRemoteLinkTest, RemoteRelink)
 {
   RemoteLinkTestProcess process(pid);
 
@@ -906,7 +983,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteRelink)
   spawn(process);
   process.relink();
 
-  os::killtree(linkee->pid(), SIGKILL);
+  os::kill(linkee->pid(), SIGKILL);
   reap_linkee();
   linkee = None();
 
@@ -919,9 +996,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteRelink)
 
 // Verifies that linking and relinking a process will retain monitoring
 // on the linkee.
-// TODO(hausdorff): Test fails on Windows. Fix and enable. Linkee never sends a
-// message because "no such program exists". See MESOS-5941.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteLinkRelink)
+TEST_F(ProcessRemoteLinkTest, RemoteLinkRelink)
 {
   RemoteLinkTestProcess process(pid);
 
@@ -934,7 +1009,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteLinkRelink)
   process.linkup();
   process.relink();
 
-  os::killtree(linkee->pid(), SIGKILL);
+  os::kill(linkee->pid(), SIGKILL);
   reap_linkee();
   linkee = None();
 
@@ -947,9 +1022,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteLinkRelink)
 
 // Verifies that relinking a remote process will not affect the
 // monitoring of the process by other linkers.
-// TODO(hausdorff): Test fails on Windows. Fix and enable. Linkee never sends a
-// message because "no such program exists". See MESOS-5941.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteDoubleLinkRelink)
+TEST_F(ProcessRemoteLinkTest, RemoteDoubleLinkRelink)
 {
   ExitedProcess linker(pid);
   RemoteLinkTestProcess relinker(pid);
@@ -968,7 +1041,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteDoubleLinkRelink)
   relinker.linkup();
   relinker.relink();
 
-  os::killtree(linkee->pid(), SIGKILL);
+  os::kill(linkee->pid(), SIGKILL);
   reap_linkee();
   linkee = None();
 
@@ -986,6 +1059,12 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteDoubleLinkRelink)
 // Verifies that remote links will trigger an `ExitedEvent` if the link
 // fails during socket creation. The test instigates a socket creation
 // failure by hogging all available file descriptors.
+//
+// TODO(andschwa): Enable this test. The current logic will not work on Windows
+// as " The Microsoft Winsock provider limits the maximum number of sockets
+// supported only by available memory on the local computer." See MESOS-9093.
+//
+// https://docs.microsoft.com/en-us/windows/desktop/WinSock/maximum-number-of-sockets-supported-2 // NOLINT(whitespace/line_length)
 TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteLinkLeak)
 {
   RemoteLinkTestProcess relinker(pid);
@@ -1156,7 +1235,7 @@ class SettleProcess : public Process<SettleProcess>
 public:
   SettleProcess() : calledDispatch(false) {}
 
-  virtual void initialize()
+  void initialize() override
   {
     os::sleep(Milliseconds(10));
     delay(Seconds(0), self(), &SettleProcess::afterDelay);
@@ -1182,7 +1261,7 @@ public:
 };
 
 
-TEST(ProcessTest, Settle)
+TEST_F(ProcessTest, Settle)
 {
   Clock::pause();
   SettleProcess process;
@@ -1195,7 +1274,7 @@ TEST(ProcessTest, Settle)
 }
 
 
-TEST(ProcessTest, Pid)
+TEST_F(ProcessTest, Pid)
 {
   TimeoutProcess process;
 
@@ -1228,7 +1307,7 @@ public:
 };
 
 
-TEST(ProcessTest, Listener)
+TEST_F(ProcessTest, Listener)
 {
   MultipleListenerProcess process;
 
@@ -1254,7 +1333,7 @@ public:
 };
 
 
-TEST(ProcessTest, Executor_Defer)
+TEST_F(ProcessTest, Executor_Defer)
 {
   EventReceiver receiver;
   Executor executor;
@@ -1293,7 +1372,7 @@ TEST(ProcessTest, Executor_Defer)
 }
 
 
-TEST(ProcessTest, Executor_Execute)
+TEST_F(ProcessTest, Executor_Execute)
 {
   Executor executor;
 
@@ -1361,7 +1440,7 @@ public:
 };
 
 
-TEST(ProcessTest, Remote)
+TEST_F(ProcessTest, Remote)
 {
   RemoteProcess process;
   spawn(process);
@@ -1397,7 +1476,7 @@ TEST(ProcessTest, Remote)
 
 
 // Like the 'remote' test but uses http::connect.
-TEST(ProcessTest, Http1)
+TEST_F(ProcessTest, Http1)
 {
   RemoteProcess process;
   spawn(process);
@@ -1450,9 +1529,7 @@ TEST(ProcessTest, Http1)
 
 // Like 'http1' but uses the 'Libprocess-From' header. We can
 // also use http::post here since we expect a 202 response.
-//
-// TODO(neilc): This test currently does not work on Windows (MESOS-7527).
-TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Http2)
+TEST_F(ProcessTest, Http2)
 {
   RemoteProcess process;
   spawn(process);
@@ -1562,7 +1639,7 @@ static string itoa2(int* const& i)
 }
 
 
-TEST(ProcessTest, Async)
+TEST_F(ProcessTest, Async)
 {
   // Non-void functions with different no.of args.
   EXPECT_EQ(1, async(&foo).get());
@@ -1586,7 +1663,7 @@ public:
   explicit FileServer(const string& _path)
     : path(_path) {}
 
-  virtual void initialize()
+  void initialize() override
   {
     provide("", path);
   }
@@ -1595,14 +1672,8 @@ public:
 };
 
 
-// TODO(hausdorff): Enable test when `os::rmdir` is semantically equivalent to
-// the POSIX version. In this case, it behaves poorly when we try to use it to
-// delete a file instead of a directory. See MESOS-5942.
-TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Provide)
+TEST_F(ProcessTest, Provide)
 {
-  const Try<string> mkdtemp = os::mkdtemp();
-  ASSERT_SOME(mkdtemp);
-
   const string LOREM_IPSUM =
       "Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do "
       "eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad "
@@ -1612,7 +1683,7 @@ TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Provide)
       "sint occaecat cupidatat non proident, sunt in culpa qui officia "
       "deserunt mollit anim id est laborum.";
 
-  const string path = path::join(mkdtemp.get(), "lorem.txt");
+  const string path = path::join(sandbox.get(), "lorem.txt");
   ASSERT_SOME(os::write(path, LOREM_IPSUM));
 
   FileServer server(path);
@@ -1637,9 +1708,7 @@ static int baz(string s) { return 42; }
 static Future<int> bam(string s) { return 42; }
 
 
-// MSVC can't compile the call to std::invoke.
-#ifndef __WINDOWS__
-TEST(ProcessTest, Defers)
+TEST_F(ProcessTest, Defers)
 {
   {
     std::function<Future<int>(string)> f =
@@ -1776,7 +1845,6 @@ TEST(ProcessTest, Defers)
   Future<int> future13 = Future<string>().then(
       defer(functor));
 }
-#endif // __WINDOWS__
 
 
 class PercentEncodedIDProcess : public Process<PercentEncodedIDProcess>
@@ -1785,7 +1853,7 @@ public:
   PercentEncodedIDProcess()
     : ProcessBase("id(42)") {}
 
-  virtual void initialize()
+  void initialize() override
   {
     install("handler1", &Self::handler1);
     route("/handler2", None(), &Self::handler2);
@@ -1796,7 +1864,7 @@ public:
 };
 
 
-TEST(ProcessTest, PercentEncodedURLs)
+TEST_F(ProcessTest, PercentEncodedURLs)
 {
   PercentEncodedIDProcess process;
   spawn(process);
@@ -1856,7 +1924,7 @@ public:
   explicit HTTPEndpointProcess(const string& id)
     : ProcessBase(id) {}
 
-  virtual void initialize()
+  void initialize() override
   {
     route(
         "/handler1",
@@ -1880,18 +1948,15 @@ public:
 
 // Sets firewall rules which disable endpoints on a process and then
 // attempts to connect to those endpoints.
-// TODO(hausdorff): Routing logic is broken on Windows. Fix and enable test. In
-// this case, we fail to set up the firewall routes. See MESOS-5904.
-TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, FirewallDisablePaths)
+TEST_F(ProcessTest, FirewallDisablePaths)
 {
   const string id = "testprocess";
 
   hashset<string> endpoints = {
-    path::join("", id, "handler1"),
-    path::join("", id, "handler2/nested"),
+    strings::join("/", "", id, "handler1"),
+    strings::join("/", "", id, "handler2", "nested"),
     // Patterns are not supported, so this should do nothing.
-    path::join("", id, "handler3/*")
-  };
+    strings::join("/", "", id, "handler3", "*")};
 
   process::firewall::install(
       {Owned<FirewallRule>(new DisabledEndpointsFirewallRule(endpoints))});
@@ -1967,16 +2032,12 @@ TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, FirewallDisablePaths)
 
 // Test that firewall rules can be changed by changing the vector.
 // An empty vector should allow all paths.
-// TODO(hausdorff): Routing logic is broken on Windows. Fix and enable test. In
-// this case, we fail to set up the firewall routes. See MESOS-5904.
-TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, FirewallUninstall)
+TEST_F(ProcessTest, FirewallUninstall)
 {
   const string id = "testprocess";
 
-  hashset<string> endpoints = {
-    path::join("", id, "handler1"),
-    path::join("", id, "handler2")
-  };
+  hashset<string> endpoints = {strings::join("/", "", id, "handler1"),
+                               strings::join("/", "", id, "handler2")};
 
   process::firewall::install(
       {Owned<FirewallRule>(new DisabledEndpointsFirewallRule(endpoints))});
@@ -2023,4 +2084,66 @@ TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, FirewallUninstall)
 
   terminate(process);
   wait(process);
+}
+
+
+// This ensures that the `/__processes__` endpoint does not hang
+// if one of the dispatches is abandoned. This can occur if a
+// process is terminated with `inject == true` after the
+// `/__processes__` endpoint handler has dispatched to it.
+TEST_F(ProcessTest, ProcessesEndpointNoHang)
+{
+  // This process will hold itself in a dispatch handler
+  // until both are present in its event queue:
+  //   (1) an injected terminate event, and
+  //   (2) a dispatch event from the `__processes__` endpoint.
+  //
+  // At that point, we know that the future for (2) will get
+  // abandoned.
+  class TestProcess : public Process<TestProcess>
+  {
+  public:
+    Future<Nothing> wait_for_terminate(Promise<Nothing>&& p)
+    {
+      p.set(Nothing()); // Notify that we're inside the function.
+
+      Time start = Clock::now();
+
+      while (Clock::now() - start < process::TEST_AWAIT_TIMEOUT) {
+        if (eventCount<TerminateEvent>() == 1 &&
+            eventCount<DispatchEvent>() == 1) {
+          return Nothing();
+        }
+
+        os::sleep(Milliseconds(1));
+      }
+
+      return Failure("Timed out waiting for terminate and dispatch");
+    }
+  };
+
+  PID<TestProcess> process = spawn(new TestProcess(), true);
+
+  Promise<Nothing> promise;
+  Future<Nothing> inside = promise.future();
+
+  Future<Nothing> waited =
+    dispatch(process, &TestProcess::wait_for_terminate, std::move(promise));
+
+  AWAIT_READY(inside);
+
+  http::URL url = http::URL(
+      "http",
+      process::address().ip,
+      process::address().port,
+      "/__processes__");
+
+  Future<http::Response> response = http::get(url);
+
+  terminate(process, true);
+
+  AWAIT_READY(waited);
+
+  AWAIT_READY(response);
+  EXPECT_EQ(http::Status::OK, response->code);
 }

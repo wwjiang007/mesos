@@ -70,6 +70,8 @@
 
 #include "authorizer/local/authorizer.hpp"
 
+#include "common/authorization.hpp"
+#include "common/future_tracker.hpp"
 #include "common/http.hpp"
 
 #include "files/files.hpp"
@@ -92,8 +94,11 @@
 #include "slave/slave.hpp"
 #include "slave/task_status_update_manager.hpp"
 
+#include "slave/containerizer/composing.hpp"
 #include "slave/containerizer/containerizer.hpp"
 #include "slave/containerizer/fetcher.hpp"
+
+#include "slave/volume_gid_manager/volume_gid_manager.hpp"
 
 #include "tests/cluster.hpp"
 #include "tests/mock_registrar.hpp"
@@ -394,7 +399,7 @@ MasterInfo Master::getMasterInfo()
 void Master::setAuthorizationCallbacks(Authorizer* authorizer)
 {
   process::http::authorization::setCallbacks(
-      mesos::createAuthorizationCallbacks(authorizer));
+      authorization::createAuthorizationCallbacks(authorizer));
 
   authorizationCallbacksSet = true;
 }
@@ -411,6 +416,7 @@ Try<process::Owned<Slave>> Slave::create(
     const Option<mesos::slave::QoSController*>& qosController,
     const Option<mesos::SecretGenerator*>& secretGenerator,
     const Option<Authorizer*>& providedAuthorizer,
+    const Option<PendingFutureTracker*>& futureTracker,
     bool mock)
 {
   process::Owned<Slave> slave(new Slave());
@@ -420,6 +426,39 @@ Try<process::Owned<Slave>> Slave::create(
   slave->flags = flags;
   slave->detector = detector;
 
+  // If the garbage collector is not provided, create a default one.
+  if (gc.isNone()) {
+    slave->gc.reset(new slave::GarbageCollector(flags.work_dir));
+  }
+
+  // If the flag `--volume_gid_range` is specified, create a volume gid manager.
+  slave::VolumeGidManager* volumeGidManager = nullptr;
+
+#ifndef __WINDOWS__
+  if (flags.volume_gid_range.isSome()) {
+    Try<slave::VolumeGidManager*> _volumeGidManager =
+      slave::VolumeGidManager::create(flags);
+
+    if (_volumeGidManager.isError()) {
+      return Error(
+          "Failed to create volume gid manager: " + _volumeGidManager.error());
+    }
+
+    volumeGidManager = _volumeGidManager.get();
+  }
+#endif // __WINDOWS__
+
+  // If the future tracker is not provided, create a default one.
+  if (futureTracker.isNone()) {
+    Try<PendingFutureTracker*> _futureTracker = PendingFutureTracker::create();
+    if (_futureTracker.isError()) {
+      return Error(
+          "Failed to create pending future tracker: " + _futureTracker.error());
+    }
+
+    slave->futureTracker.reset(_futureTracker.get());
+  }
+
   // If the containerizer is not provided, create a default one.
   if (containerizer.isSome()) {
     slave->containerizer = containerizer.get();
@@ -428,14 +467,39 @@ Try<process::Owned<Slave>> Slave::create(
     slave->fetcher.reset(new slave::Fetcher(flags));
 
     Try<slave::Containerizer*> _containerizer =
-      slave::Containerizer::create(flags, true, slave->fetcher.get());
+      slave::Containerizer::create(
+          flags,
+          true,
+          slave->fetcher.get(),
+          gc.getOrElse(slave->gc.get()),
+          nullptr,
+          volumeGidManager,
+          futureTracker.getOrElse(slave->futureTracker.get()));
 
     if (_containerizer.isError()) {
       return Error("Failed to create containerizer: " + _containerizer.error());
     }
 
-    slave->ownedContainerizer.reset(_containerizer.get());
     slave->containerizer = _containerizer.get();
+  }
+
+  // As composing containerizer doesn't affect behaviour of underlying
+  // containerizers, we can always use composing containerizer turned on
+  // by default in tests.
+  if (!dynamic_cast<slave::ComposingContainerizer*>(slave->containerizer)) {
+    Try<slave::ComposingContainerizer*> composing =
+      slave::ComposingContainerizer::create({slave->containerizer});
+
+    if (composing.isError()) {
+      return Error(
+          "Failed to create composing containerizer: " + composing.error());
+    }
+
+    slave->containerizer = composing.get();
+  }
+
+  if (containerizer.isNone()) {
+    slave->ownedContainerizer.reset(slave->containerizer);
   }
 
   Option<Authorizer*> authorizer = providedAuthorizer;
@@ -484,11 +548,6 @@ Try<process::Owned<Slave>> Slave::create(
     slave->setAuthorizationCallbacks(providedAuthorizer.get());
   }
 
-  // If the garbage collector is not provided, create a default one.
-  if (gc.isNone()) {
-    slave->gc.reset(new slave::GarbageCollector());
-  }
-
   // If the resource estimator is not provided, create a default one.
   if (resourceEstimator.isNone()) {
     Try<mesos::slave::ResourceEstimator*> _resourceEstimator =
@@ -515,7 +574,7 @@ Try<process::Owned<Slave>> Slave::create(
     slave->qosController.reset(_qosController.get());
   }
 
-  // If the QoS controller is not provided, create a default one.
+  // If the secret generator is not provided, create a default one.
   if (secretGenerator.isNone()) {
     SecretGenerator* _secretGenerator = nullptr;
 
@@ -567,6 +626,8 @@ Try<process::Owned<Slave>> Slave::create(
         resourceEstimator.getOrElse(slave->resourceEstimator.get()),
         qosController.getOrElse(slave->qosController.get()),
         secretGenerator.getOrElse(slave->secretGenerator.get()),
+        volumeGidManager,
+        futureTracker.getOrElse(slave->futureTracker.get()),
         authorizer));
   } else {
     slave->slave.reset(new slave::Slave(
@@ -580,6 +641,8 @@ Try<process::Owned<Slave>> Slave::create(
         resourceEstimator.getOrElse(slave->resourceEstimator.get()),
         qosController.getOrElse(slave->qosController.get()),
         secretGenerator.getOrElse(slave->secretGenerator.get()),
+        volumeGidManager,
+        futureTracker.getOrElse(slave->futureTracker.get()),
         authorizer));
   }
 
@@ -600,6 +663,8 @@ Slave::~Slave()
       slave::READWRITE_HTTP_AUTHENTICATION_REALM);
   process::http::authentication::unsetAuthenticator(
       slave::EXECUTOR_HTTP_AUTHENTICATION_REALM);
+  process::http::authentication::unsetAuthenticator(
+      slave::RESOURCE_PROVIDER_HTTP_AUTHENTICATION_REALM);
 
   // If either `shutdown()` or `terminate()` were called already,
   // skip the below container cleanup logic.  Additionally, we can skip
@@ -652,23 +717,32 @@ Slave::~Slave()
     }
 
     foreach (const ContainerID& containerId, containers.get()) {
-      process::Future<Option<ContainerTermination>> wait =
-        containerizer->wait(containerId);
-
-      process::Future<Option<ContainerTermination>> destroy =
+      process::Future<Option<ContainerTermination>> termination =
         containerizer->destroy(containerId);
 
-      AWAIT(destroy);
-      AWAIT(wait);
+      AWAIT(termination);
 
-      if (!wait.isReady()) {
+      if (!termination.isReady()) {
         LOG(ERROR) << "Failed to destroy container " << containerId << ": "
-                   << (wait.isFailed() ? wait.failure() : "discarded");
+                   << (termination.isFailed() ?
+                       termination.failure() :
+                       "discarded");
       }
     }
 
-    if (paused) {
-      process::Clock::pause();
+    // When using the composing containerizer, the assertion checking
+    // `containers->empty()` below is racy, since the containers are
+    // not yet removed from that containerizer's internal data structures
+    // when the future becomes ready. Instead, an internal function to clean
+    // up these internal data structures is dispatched when the future
+    // becomes ready.
+    // To work around this, we wait for the clock to settle here. This can
+    // be removed once MESOS-9413 is resolved.
+    process::Clock::pause();
+    process::Clock::settle();
+
+    if (!paused) {
+      process::Clock::resume();
     }
 
     containers = containerizer->containers();
@@ -683,7 +757,7 @@ Slave::~Slave()
 void Slave::setAuthorizationCallbacks(Authorizer* authorizer)
 {
   process::http::authorization::setCallbacks(
-      mesos::createAuthorizationCallbacks(authorizer));
+      authorization::createAuthorizationCallbacks(authorizer));
 
   authorizationCallbacksSet = true;
 }
