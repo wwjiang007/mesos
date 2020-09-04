@@ -53,7 +53,7 @@
 using mesos::internal::slave::Containerizer;
 using mesos::internal::slave::Fetcher;
 using mesos::internal::slave::MesosContainerizer;
-
+using mesos::internal::slave::containerizer::paths::getCgroupPath;
 using mesos::internal::slave::containerizer::paths::getContainerConfig;
 using mesos::internal::slave::containerizer::paths::getRuntimePath;
 using mesos::internal::slave::containerizer::paths::getSandboxPath;
@@ -87,7 +87,8 @@ namespace internal {
 namespace tests {
 
 class NestedMesosContainerizerTest
-  : public ContainerizerTest<slave::MesosContainerizer>
+  : public ContainerizerTest<slave::MesosContainerizer>,
+    public ::testing::WithParamInterface<bool>
 {
 protected:
   Try<SlaveState> createSlaveState(
@@ -135,7 +136,37 @@ protected:
 
     return slaveState;
   }
+
+  template <typename... Args>
+  mesos::slave::ContainerConfig createNestedContainerConfig(
+      const string& resources, Args... args) const
+  {
+    mesos::slave::ContainerConfig containerConfig =
+      createContainerConfig(std::forward<Args>(args)...);
+
+    const bool shareCgroups = GetParam();
+
+    ContainerInfo* container = containerConfig.mutable_container_info();
+    container->set_type(ContainerInfo::MESOS);
+    container->mutable_linux_info()->set_share_cgroups(shareCgroups);
+
+    if (!shareCgroups) {
+      containerConfig.mutable_resources()->CopyFrom(
+        Resources::parse(resources).get());
+    }
+
+    return containerConfig;
+  }
 };
+
+
+// Some nested containerizer tests are parameterized by the boolean
+// `shared_cgroups` flag that specifies whether cgroups are shared
+// between nested containers and their parent container.
+INSTANTIATE_TEST_CASE_P(
+    NestedContainerShareCgroups,
+    NestedMesosContainerizerTest,
+    ::testing::Values(true, false));
 
 
 TEST_F(NestedMesosContainerizerTest, NestedContainerID)
@@ -173,7 +204,7 @@ TEST_F(NestedMesosContainerizerTest, NestedContainerID)
 }
 
 
-TEST_F(NestedMesosContainerizerTest, ROOT_CGROUPS_LaunchNested)
+TEST_P(NestedMesosContainerizerTest, ROOT_CGROUPS_LaunchNested)
 {
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "linux";
@@ -219,7 +250,7 @@ TEST_F(NestedMesosContainerizerTest, ROOT_CGROUPS_LaunchNested)
 
   launch = containerizer->launch(
       nestedContainerId,
-      createContainerConfig(createCommandInfo("exit 42")),
+      createNestedContainerConfig("cpus:0.1", createCommandInfo("exit 42")),
       map<string, string>(),
       None());
 
@@ -240,6 +271,93 @@ TEST_F(NestedMesosContainerizerTest, ROOT_CGROUPS_LaunchNested)
   ASSERT_SOME(termination.get());
   ASSERT_TRUE(termination.get()->has_status());
   EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
+}
+
+
+// This test verifies that a separate cgroup is created for a nested
+// container only if it does not share cgroups with its parent container.
+TEST_P(NestedMesosContainerizerTest, ROOT_CGROUPS_LaunchNestedShareCgroups)
+{
+  const bool shareCgroups = GetParam();
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.launcher = "linux";
+  flags.isolation = "cgroups/cpu,filesystem/linux,namespaces/pid";
+
+  Fetcher fetcher(flags);
+
+  Try<MesosContainerizer*> create = MesosContainerizer::create(
+      flags,
+      false,
+      &fetcher);
+
+  ASSERT_SOME(create);
+
+  Owned<MesosContainerizer> containerizer(create.get());
+
+  SlaveState state;
+  state.id = SlaveID();
+
+  AWAIT_READY(containerizer->recover(state));
+
+  ContainerID containerId;
+  containerId.set_value(id::UUID::random().toString());
+
+  Try<string> directory = environment->mkdtemp();
+  ASSERT_SOME(directory);
+
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
+      containerId,
+      createContainerConfig(
+          None(),
+          createExecutorInfo("executor", "sleep 1000", "cpus:1"),
+          directory.get()),
+      map<string, string>(),
+      None());
+
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
+
+  // Now launch nested container.
+  ContainerID nestedContainerId;
+  nestedContainerId.mutable_parent()->CopyFrom(containerId);
+  nestedContainerId.set_value(id::UUID::random().toString());
+
+  launch = containerizer->launch(
+      nestedContainerId,
+      createNestedContainerConfig("cpus:0.1", createCommandInfo("sleep 1000")),
+      map<string, string>(),
+      None());
+
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
+
+  // Check that a separate cgroup is created for a nested container only
+  // if `share_cgroups` field is set to false.
+  Result<string> cpuHierarchy = cgroups::hierarchy("cpu");
+  ASSERT_SOME(cpuHierarchy);
+
+  const string cgroup = getCgroupPath(flags.cgroups_root, nestedContainerId);
+
+  ASSERT_NE(shareCgroups, cgroups::exists(cpuHierarchy.get(), cgroup));
+
+  Future<Option<ContainerTermination>> nestedTermination =
+    containerizer->destroy(nestedContainerId);
+
+  AWAIT_READY(nestedTermination);
+  ASSERT_SOME(nestedTermination.get());
+  ASSERT_TRUE(nestedTermination.get()->has_status());
+  EXPECT_WTERMSIG_EQ(SIGKILL, nestedTermination.get()->status());
+
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
+
+  AWAIT_READY(termination);
+  ASSERT_SOME(termination.get());
+  ASSERT_TRUE(termination.get()->has_status());
+  EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
+
+  // Check that the cgroups isolator cleaned up a nested cgroup
+  // for the nested container.
+  ASSERT_FALSE(cgroups::exists(cpuHierarchy.get(), cgroup));
 }
 
 
@@ -1600,7 +1718,7 @@ TEST_F(NestedMesosContainerizerTest, ROOT_CGROUPS_ParentSigterm)
 }
 
 
-TEST_F(NestedMesosContainerizerTest, ROOT_CGROUPS_RecoverNested)
+TEST_P(NestedMesosContainerizerTest, ROOT_CGROUPS_RecoverNested)
 {
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "linux";
@@ -1659,7 +1777,7 @@ TEST_F(NestedMesosContainerizerTest, ROOT_CGROUPS_RecoverNested)
 
   launch = containerizer->launch(
       nestedContainerId,
-      createContainerConfig(createCommandInfo("sleep 1000")),
+      createNestedContainerConfig("cpus:0.1", createCommandInfo("sleep 1000")),
       map<string, string>(),
       None());
 
@@ -1740,7 +1858,7 @@ TEST_F(NestedMesosContainerizerTest, ROOT_CGROUPS_RecoverNested)
 // This test verifies that the agent could recover if the agent
 // metadata is empty but container runtime dir is not cleaned
 // up. This is a regression test for MESOS-8416.
-TEST_F(NestedMesosContainerizerTest,
+TEST_P(NestedMesosContainerizerTest,
        ROOT_CGROUPS_RecoverNestedWithoutSlaveState)
 {
   slave::Flags flags = CreateSlaveFlags();
@@ -1798,7 +1916,7 @@ TEST_F(NestedMesosContainerizerTest,
 
   launch = containerizer->launch(
       nestedContainerId,
-      createContainerConfig(createCommandInfo("sleep 1000")),
+      createNestedContainerConfig("cpus:0.1", createCommandInfo("sleep 1000")),
       map<string, string>(),
       None());
 
@@ -1844,7 +1962,7 @@ TEST_F(NestedMesosContainerizerTest,
 }
 
 
-TEST_F(NestedMesosContainerizerTest, ROOT_CGROUPS_RecoverNestedWithoutConfig)
+TEST_P(NestedMesosContainerizerTest, ROOT_CGROUPS_RecoverNestedWithoutConfig)
 {
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "linux";
@@ -1903,7 +2021,7 @@ TEST_F(NestedMesosContainerizerTest, ROOT_CGROUPS_RecoverNestedWithoutConfig)
 
   launch = containerizer->launch(
       nestedContainerId,
-      createContainerConfig(createCommandInfo("sleep 1000")),
+      createNestedContainerConfig("cpus:0.1", createCommandInfo("sleep 1000")),
       map<string, string>(),
       None());
 

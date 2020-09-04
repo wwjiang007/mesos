@@ -211,8 +211,119 @@ JSON::Object model(const ExecutorInfo& executorInfo);
 JSON::Array model(const Labels& labels);
 JSON::Object model(const Task& task);
 JSON::Object model(const FileInfo& fileInfo);
+JSON::Object model(const google::protobuf::Map<std::string, Value_Scalar>& map);
 
 void json(JSON::ObjectWriter* writer, const Task& task);
+
+
+// NOTE: The `metrics` object provided as an argument must outlive
+// the returned function, since the function captures `metrics`
+// by reference to avoid a really expensive map copy. This is a
+// rather unsafe approach, but in typical jsonify usage this is
+// not an issue.
+//
+// TODO(bmahler): Use std::enable_if with std::is_same to check
+// that T is either the master or agent GetMetrics.
+template <typename T>
+std::function<void(JSON::ObjectWriter*)> jsonifyGetMetrics(
+    const std::map<std::string, double>& metrics)
+{
+  // Serialize the following message:
+  //
+  //   mesos::master::Response::GetMetrics getMetrics;
+  //   // or: mesos::agent::Response::GetMetrics getMetrics;
+  //
+  //   foreachpair (const string& key, double value, metrics) {
+  //     Metric* metric = getMetrics->add_metrics();
+  //     metric->set_name(key);
+  //     metric->set_value(value);
+  //   }
+
+  return [&](JSON::ObjectWriter* writer) {
+    const google::protobuf::Descriptor* descriptor = T::descriptor();
+
+    int field = T::kMetricsFieldNumber;
+
+    writer->field(
+        descriptor->FindFieldByNumber(field)->name(),
+        [&](JSON::ArrayWriter* writer) {
+          foreachpair (const std::string& key, double value, metrics) {
+            writer->element([&](JSON::ObjectWriter* writer) {
+              const google::protobuf::Descriptor* descriptor =
+                v1::Metric::descriptor();
+
+              int field;
+
+              field = v1::Metric::kNameFieldNumber;
+              writer->field(
+                  descriptor->FindFieldByNumber(field)->name(), key);
+
+              field = v1::Metric::kValueFieldNumber;
+              writer->field(
+                  descriptor->FindFieldByNumber(field)->name(), value);
+            });
+          }
+        });
+  };
+}
+
+
+// TODO(bmahler): Use std::enable_if with std::is_same to check
+// that T is either the master or agent GetMetrics.
+template <typename T>
+std::string serializeGetMetrics(
+    const std::map<std::string, double>& metrics)
+{
+  // Serialize the following message:
+  //
+  //   v1::master::Response::GetMetrics getMetrics;
+  //   // or: v1::agent::Response::GetMetrics getMetrics;
+  //
+  //   foreachpair (const string& key, double value, metrics) {
+  //     Metric* metric = getMetrics->add_metrics();
+  //     metric->set_name(key);
+  //     metric->set_value(value);
+  //   }
+
+  auto serializeMetric = [](const std::string& key, double value) {
+    std::string output;
+    google::protobuf::io::StringOutputStream stream(&output);
+    google::protobuf::io::CodedOutputStream writer(&stream);
+
+    google::protobuf::internal::WireFormatLite::WriteString(
+        v1::Metric::kNameFieldNumber, key, &writer);
+    google::protobuf::internal::WireFormatLite::WriteDouble(
+        v1::Metric::kValueFieldNumber, value, &writer);
+
+    // While an explicit Trim() isn't necessary (since the coded
+    // output stream is destructed before the string is returned),
+    // it's a quite tricky bug to diagnose if Trim() is missed, so
+    // we always do it explicitly to signal the reader about this
+    // subtlety.
+    writer.Trim();
+    return output;
+  };
+
+  std::string output;
+  google::protobuf::io::StringOutputStream stream(&output);
+  google::protobuf::io::CodedOutputStream writer(&stream);
+
+  foreachpair (const std::string& key, double value, metrics) {
+    google::protobuf::internal::WireFormatLite::WriteBytes(
+        T::kMetricsFieldNumber,
+        serializeMetric(key, value),
+        &writer);
+  }
+
+  // While an explicit Trim() isn't necessary (since the coded
+  // output stream is destructed before the string is returned),
+  // it's a quite tricky bug to diagnose if Trim() is missed, so
+  // we always do it explicitly to signal the reader about this
+  // subtlety.
+  writer.Trim();
+  return output;
+}
+
 
 } // namespace internal {
 
@@ -260,49 +371,71 @@ public:
       const Option<process::http::authentication::Principal>& principal,
       std::initializer_list<authorization::Action> actions);
 
-  template <authorization::Action action, typename... Args>
-  bool approved(const Args&... args)
+  Try<bool> approved(
+      authorization::Action action,
+      const ObjectApprover::Object& object) const
   {
     if (!approvers.contains(action)) {
-      LOG(WARNING) << "Attempted to authorize " << principal
-                   << " for unexpected action " << stringify(action);
+      LOG(WARNING)
+        << "Attempted to authorize principal "
+        << " '" << (principal.isSome() ? stringify(*principal) : "") << "'"
+        << " for unexpected action " << authorization::Action_Name(action);
+
       return false;
     }
 
-    Try<bool> approved = approvers[action]->approved(
-        ObjectApprover::Object(args...));
-
-    if (approved.isError()) {
-      // TODO(joerg84): Expose these errors back to the caller.
-      LOG(WARNING) << "Failed to authorize principal " << principal
-                   << "for action " << stringify(action) << ": "
-                   << approved.error();
-      return false;
-    }
-
-    return approved.get();
+    return approvers.at(action)->approved(object);
   }
+
+  // Constructs one (or more) authorization objects, depending on the
+  // action, and returns true if all action-object pairs are authorized.
+  //
+  // NOTE: This template has specializations that actually check
+  // more than one action-object pair.
+  template <authorization::Action action, typename... Args>
+  bool approved(const Args&... args) const
+  {
+    const Try<bool> approval =
+      approved(action, ObjectApprover::Object(args...));
+
+    if (approval.isError()) {
+      // NOTE: Silently dropping errors here creates a potential for
+      // _transient_ authorization errors to make API events subscriber's view
+      // inconsistent (see MESOS-10085). Also, this creates potential for an
+      // object to silently disappear from Operator API endpoint response in
+      // case of an authorization error (see MESOS-10099).
+      //
+      // TODO(joerg84): Expose these errors back to the caller.
+      LOG(WARNING) << "Failed to authorize principal "
+                   << " '" << (principal.isSome() ? stringify(*principal) : "")
+                   << "' for action " << authorization::Action_Name(action)
+                   << ": " << approval.error();
+
+      return false;
+    }
+
+    return approval.get();
+  }
+
+  const Option<process::http::authentication::Principal> principal;
 
 private:
   ObjectApprovers(
       hashmap<
           authorization::Action,
-          process::Owned<ObjectApprover>>&& _approvers,
+          std::shared_ptr<const ObjectApprover>>&& _approvers,
       const Option<process::http::authentication::Principal>& _principal)
-    : approvers(std::move(_approvers)),
-      principal(_principal.isSome()
-          ? "'" + stringify(_principal.get()) + "'"
-          : "")
-    {}
+    : principal(_principal),
+      approvers(std::move(_approvers)) {}
 
-  hashmap<authorization::Action, process::Owned<ObjectApprover>> approvers;
-  const std::string principal; // Only used for logging.
+  hashmap<authorization::Action, std::shared_ptr<const ObjectApprover>>
+    approvers;
 };
 
 
 template <>
 inline bool ObjectApprovers::approved<authorization::VIEW_ROLE>(
-    const Resource& resource)
+    const Resource& resource) const
 {
   // Necessary because recovered agents are presented in old format.
   if (resource.has_role() && resource.role() != "*" &&

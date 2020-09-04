@@ -33,18 +33,24 @@
 
 #include <mesos/slave/resource_estimator.hpp>
 
+#include <process/network.hpp>
 #include <process/owned.hpp>
 #include <process/process.hpp>
+
+#include <process/ssl/flags.hpp>
 
 #include <stout/check.hpp>
 #include <stout/flags.hpp>
 #include <stout/hashset.hpp>
 #include <stout/nothing.hpp>
 #include <stout/os.hpp>
+#include <stout/strings.hpp>
 
 #include <stout/os/permissions.hpp>
 
 #ifdef __linux__
+#include <linux/systemd.hpp>
+
 #include <stout/proc.hpp>
 #endif // __linux__
 
@@ -58,6 +64,11 @@
 
 #include "common/authorization.hpp"
 #include "common/build.hpp"
+
+#ifndef __WINDOWS__
+#include "common/domain_sockets.hpp"
+#endif // __WINDOWS__
+
 #include "common/http.hpp"
 
 #include "hook/manager.hpp"
@@ -74,6 +85,8 @@
 
 #include "module/manager.hpp"
 
+#include "slave/constants.hpp"
+#include "slave/csi_server.hpp"
 #include "slave/gc.hpp"
 #include "slave/slave.hpp"
 #include "slave/task_status_update_manager.hpp"
@@ -101,10 +114,16 @@ using mesos::Authorizer;
 using mesos::SecretResolver;
 using mesos::SlaveInfo;
 
+using net::IP;
+
 using process::Owned;
 
 using process::firewall::DisabledEndpointsFirewallRule;
 using process::firewall::FirewallRule;
+
+#ifndef __WINDOWS__
+using process::network::unix::Socket;
+#endif // __WINDOWS__
 
 using std::cerr;
 using std::cout;
@@ -344,6 +363,22 @@ int main(int argc, char** argv)
     os::setenv("LIBPROCESS_ADVERTISE_PORT", flags.advertise_port.get());
   }
 
+#ifndef __WINDOWS__
+  if (flags.http_executor_domain_sockets) {
+    if (flags.domain_socket_location.isNone()) {
+      flags.domain_socket_location =
+        flags.runtime_dir + "/" + AGENT_EXECUTORS_SOCKET_FILENAME;
+    }
+
+    if (flags.domain_socket_location->size() >=
+        common::DOMAIN_SOCKET_MAX_PATH_LENGTH) {
+      EXIT(EXIT_FAILURE)
+        << "Domain socket location '" << *flags.domain_socket_location << "'"
+        << " must have less than 108 characters.";
+    }
+  }
+#endif // __WINDOWS__
+
   os::setenv("LIBPROCESS_MEMORY_PROFILING", stringify(flags.memory_profiling));
 
   // Log build information.
@@ -498,6 +533,69 @@ int main(int argc, char** argv)
                        << futureTracker.error();
   }
 
+  SecretGenerator* secretGenerator = nullptr;
+
+#ifdef USE_SSL_SOCKET
+  if (flags.jwt_secret_key.isSome()) {
+    Try<string> jwtSecretKey = os::read(flags.jwt_secret_key.get());
+    if (jwtSecretKey.isError()) {
+      EXIT(EXIT_FAILURE) << "Failed to read the file specified by "
+                         << "--jwt_secret_key";
+    }
+
+    // TODO(greggomann): Factor the following code out into a common helper,
+    // since we also do this when loading credentials.
+    Try<os::Permissions> permissions =
+      os::permissions(flags.jwt_secret_key.get());
+    if (permissions.isError()) {
+      LOG(WARNING) << "Failed to stat jwt secret key file '"
+                   << flags.jwt_secret_key.get()
+                   << "': " << permissions.error();
+    } else if (permissions->others.rwx) {
+      LOG(WARNING) << "Permissions on executor secret key file '"
+                   << flags.jwt_secret_key.get()
+                   << "' are too open; it is recommended that your"
+                   << " key file is NOT accessible by others";
+    }
+
+    secretGenerator = new JWTSecretGenerator(jwtSecretKey.get());
+  }
+#endif // USE_SSL_SOCKET
+
+  // The agent will hold ownership of the CSI server, but we also pass a pointer
+  // to it into the containerizer for use by the 'volume/csi' isolator.
+  Owned<CSIServer> csiServer;
+
+  if (flags.csi_plugin_config_dir.isSome()) {
+    // Initialize the CSI server, which manages any configured CSI plugins.
+    string scheme = "http";
+
+#ifdef USE_SSL_SOCKET
+    if (process::network::openssl::flags().enabled) {
+      scheme = "https";
+    }
+#endif
+
+    const process::http::URL agentUrl(
+        scheme,
+        process::address().ip,
+        process::address().port,
+        id + "/api/v1");
+
+    Try<Owned<CSIServer>> csiServer_ = CSIServer::create(
+        flags,
+        agentUrl,
+        secretGenerator,
+        secretResolver.get());
+
+    if (csiServer_.isError()) {
+      EXIT(EXIT_FAILURE)
+        << "Failed to initialize the CSI server: " << csiServer_.error();
+    }
+
+    csiServer = std::move(csiServer_.get());
+  }
+
   Try<Containerizer*> containerizer = Containerizer::create(
       flags,
       false,
@@ -505,7 +603,8 @@ int main(int argc, char** argv)
       gc,
       secretResolver.get(),
       volumeGidManager,
-      futureTracker.get());
+      futureTracker.get(),
+      csiServer.get());
 
   if (containerizer.isError()) {
     EXIT(EXIT_FAILURE)
@@ -578,34 +677,78 @@ int main(int argc, char** argv)
                        << qosController.error();
   }
 
-  SecretGenerator* secretGenerator = nullptr;
+#ifndef __WINDOWS__
+  // Create executor domain socket if the user so desires.
+  Option<Socket> executorSocket = None();
+  if (flags.http_executor_domain_sockets) {
+    // If `http_executor_domain_sockets` is true, then the location should have
+    // been set by the user or automatically during startup.
+    CHECK_SOME(flags.domain_socket_location);
 
-#ifdef USE_SSL_SOCKET
-  if (flags.jwt_secret_key.isSome()) {
-    Try<string> jwtSecretKey = os::read(flags.jwt_secret_key.get());
-    if (jwtSecretKey.isError()) {
-      EXIT(EXIT_FAILURE) << "Failed to read the file specified by "
-                         << "--jwt_secret_key";
+    if (strings::startsWith(*flags.domain_socket_location, "systemd:")) {
+      LOG(INFO) << "Expecting domain socket to be passed by systemd";
+
+      // Chop off `systemd:` prefix.
+      std::string name = flags.domain_socket_location->substr(8);
+#ifdef __linux__
+      // NOTE: Some systemd versions do not support FileDescriptorName,
+      // thus we also need to listen on descriptors with name "unknown",
+      // which is used for sockets where no name could be determined.
+      Try<std::vector<int>> socketFds =
+        systemd::socket_activation::listenFdsWithNames({name, "unknown"});
+#else
+      Try<std::vector<int>> socketFds =
+        Try<std::vector<int>>({}); // Dummy to avoid compile errors.
+      EXIT(EXIT_FAILURE)
+        << "Systemd socket passing is only supported on linux.";
+#endif
+
+      if (socketFds.isError()) {
+        EXIT(EXIT_FAILURE)
+          << "Could not get passed file descriptors from systemd: "
+          << socketFds.error();
+      }
+
+      if (socketFds->size() != 1u) {
+        EXIT(EXIT_FAILURE)
+          << "Expected exactly one socket with name " << name
+          << ", got " << socketFds->size() << " instead.";
+      }
+
+      int sockfd = socketFds->at(0);
+
+      // Don't use SSLSocketImpl for unix domain sockets.
+      Try<Socket> socket = Socket::create(
+          sockfd, process::network::internal::SocketImpl::Kind::POLL);
+
+      if (socket.isError()) {
+        EXIT(EXIT_FAILURE)
+          << "Failed to create domain socket: " << socket.error();
+      }
+
+      executorSocket = socket.get();
+
+      // Adjust socket location to point to the *path*, not the systemd
+      // identifier.
+      auto addr = process::network::convert<process::network::unix::Address>(
+          process::network::address(sockfd).get()).get();
+
+      flags.domain_socket_location = addr.path();
+    } else {
+      Try<Socket> socket =
+        common::createDomainSocket(*flags.domain_socket_location);
+
+      if (socket.isError()) {
+        EXIT(EXIT_FAILURE)
+          << "Failed to create domain socket: " << socket.error();
+      }
+
+      executorSocket = socket.get();
     }
 
-    // TODO(greggomann): Factor the following code out into a common helper,
-    // since we also do this when loading credentials.
-    Try<os::Permissions> permissions =
-      os::permissions(flags.jwt_secret_key.get());
-    if (permissions.isError()) {
-      LOG(WARNING) << "Failed to stat jwt secret key file '"
-                   << flags.jwt_secret_key.get()
-                   << "': " << permissions.error();
-    } else if (permissions->others.rwx) {
-      LOG(WARNING) << "Permissions on executor secret key file '"
-                   << flags.jwt_secret_key.get()
-                   << "' are too open; it is recommended that your"
-                   << " key file is NOT accessible by others";
-    }
-
-    secretGenerator = new JWTSecretGenerator(jwtSecretKey.get());
+    LOG(INFO) << "Using domain socket at " << *flags.domain_socket_location;
   }
-#endif // USE_SSL_SOCKET
+#endif // __WINDOWS__
 
   Slave* slave = new Slave(
       id,
@@ -620,6 +763,10 @@ int main(int argc, char** argv)
       secretGenerator,
       volumeGidManager,
       futureTracker.get(),
+      std::move(csiServer),
+#ifndef __WINDOWS__
+      executorSocket,
+#endif // __WINDOWS__
       authorizer_);
 
   process::spawn(slave);

@@ -252,7 +252,7 @@ public:
       const Option<Duration>& reconciliationInterval = None())
   {
     const string testCsiPluginPath =
-      path::join(tests::flags.build_dir, "src", "test-csi-plugin");
+      path::join(getTestHelperDir(), "test-csi-plugin");
 
     Try<string> resourceProviderConfig = strings::format(
         R"~(
@@ -1030,7 +1030,7 @@ TEST_P(StorageLocalResourceProviderTest, CreateDestroyDisk)
 
   ASSERT_TRUE(created.disk().source().has_mount());
   ASSERT_TRUE(created.disk().source().mount().has_root());
-  EXPECT_FALSE(path::absolute(created.disk().source().mount().root()));
+  EXPECT_FALSE(path::is_absolute(created.disk().source().mount().root()));
 
   // Check if the volume is actually created by the test CSI plugin.
   const string& volumePath = created.disk().source().id();
@@ -1160,7 +1160,7 @@ TEST_P(StorageLocalResourceProviderTest, CreateDestroyDiskWithRecovery)
 
   ASSERT_TRUE(created.disk().source().has_mount());
   ASSERT_TRUE(created.disk().source().mount().has_root());
-  EXPECT_FALSE(path::absolute(created.disk().source().mount().root()));
+  EXPECT_FALSE(path::is_absolute(created.disk().source().mount().root()));
 
   // Check if the volume is actually created by the test CSI plugin.
   const string& volumePath = created.disk().source().id();
@@ -2301,7 +2301,7 @@ TEST_P(
 
   ASSERT_TRUE(created.disk().source().has_mount());
   ASSERT_TRUE(created.disk().source().mount().has_root());
-  EXPECT_FALSE(path::absolute(created.disk().source().mount().root()));
+  EXPECT_FALSE(path::is_absolute(created.disk().source().mount().root()));
 
   // Check if the CSI volume is actually created.
   const string& volumePath = created.disk().source().id();
@@ -3103,7 +3103,7 @@ TEST_P(
   ASSERT_TRUE(volume->disk().source().has_id());
   ASSERT_TRUE(volume->disk().source().has_mount());
   ASSERT_TRUE(volume->disk().source().mount().has_root());
-  EXPECT_FALSE(path::absolute(volume->disk().source().mount().root()));
+  EXPECT_FALSE(path::is_absolute(volume->disk().source().mount().root()));
 
   // Check if the volume is actually created by the test CSI plugin.
   const string& volumePath = volume->disk().source().id();
@@ -5060,7 +5060,7 @@ TEST_P(StorageLocalResourceProviderTest, OperationStateMetrics)
   ASSERT_TRUE(volume->disk().source().has_id());
   ASSERT_TRUE(volume->disk().source().has_mount());
   ASSERT_TRUE(volume->disk().source().mount().has_root());
-  EXPECT_FALSE(path::absolute(volume->disk().source().mount().root()));
+  EXPECT_FALSE(path::is_absolute(volume->disk().source().mount().root()));
 
   snapshot = Metrics();
 
@@ -5274,7 +5274,7 @@ TEST_P(StorageLocalResourceProviderTest, CsiPluginRpcMetrics)
   ASSERT_TRUE(volume->disk().source().has_id());
   ASSERT_TRUE(volume->disk().source().has_mount());
   ASSERT_TRUE(volume->disk().source().mount().has_root());
-  EXPECT_FALSE(path::absolute(volume->disk().source().mount().root()));
+  EXPECT_FALSE(path::is_absolute(volume->disk().source().mount().root()));
 
   // An additional `CreateVolume` RPC call is now finished.
   EXPECT_TRUE(metricEquals(

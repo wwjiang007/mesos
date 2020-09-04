@@ -97,7 +97,9 @@ public:
 
   process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources) override;
+      const Resources& resourceRequests,
+      const google::protobuf::Map<
+          std::string, Value::Scalar>& resourceLimits = {}) override;
 
   process::Future<ResourceStatistics> usage(
       const ContainerID& containerId) override;
@@ -151,7 +153,8 @@ public:
   // for the container, even if they match what it has cached.
   virtual process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources,
+      const Resources& resourceRequests,
+      const google::protobuf::Map<std::string, Value::Scalar>& resourceLimits,
       bool force);
 
   virtual process::Future<ResourceStatistics> usage(
@@ -253,12 +256,14 @@ private:
 #ifdef __linux__
   process::Future<Nothing> _update(
       const ContainerID& containerId,
-      const Resources& resources,
+      const Resources& resourceRequests,
+      const google::protobuf::Map<std::string, Value::Scalar>& resourceLimits,
       const Docker::Container& container);
 
   process::Future<Nothing> __update(
       const ContainerID& containerId,
-      const Resources& resources);
+      const Resources& resourceRequests,
+      const google::protobuf::Map<std::string, Value::Scalar>& resourceLimits);
 #endif // __linux__
 
   process::Future<Nothing> mountPersistentVolumes(
@@ -350,7 +355,8 @@ private:
         symlinked(symlinked),
         containerWorkDir(containerWorkDir),
         containerName(name(id)),
-        launchesExecutorContainer(launchesExecutorContainer)
+        launchesExecutorContainer(launchesExecutorContainer),
+        generatedForCommandTask(_containerConfig.has_task_info())
     {
       // NOTE: The task's resources are included in the executor's
       // resources in order to make sure when launching the executor
@@ -362,10 +368,12 @@ private:
       // perfect check because an executor might always have a subset
       // of it's resources that match a task, nevertheless, it's
       // better than nothing).
-      resources = containerConfig.resources();
+      resourceRequests = containerConfig.resources();
+      resourceLimits = containerConfig.limits();
 
       if (containerConfig.has_task_info()) {
-        CHECK(resources.contains(containerConfig.task_info().resources()));
+        CHECK(
+            resourceRequests.contains(containerConfig.task_info().resources()));
       }
 
       if (_command.isSome()) {
@@ -502,7 +510,8 @@ private:
     // the ResourceStatistics limits in usage(). Note that this is
     // different than just what we might get from TaskInfo::resources
     // or ExecutorInfo::resources because they can change dynamically.
-    Resources resources;
+    Resources resourceRequests;
+    google::protobuf::Map<std::string, Value::Scalar> resourceLimits;
 
     // The docker pull future is stored so we can discard when
     // destroy is called while docker is pulling the image.
@@ -528,6 +537,8 @@ private:
     // Marks if this container launches an executor in a docker
     // container.
     bool launchesExecutorContainer;
+
+    bool generatedForCommandTask;
   };
 
   hashmap<ContainerID, Container*> containers_;

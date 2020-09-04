@@ -162,6 +162,7 @@ using process::Failure;
 using process::Future;
 using process::Owned;
 using process::PID;
+using process::Promise;
 using process::Time;
 using process::UPID;
 
@@ -187,6 +188,11 @@ static CommandInfo defaultExecutorCommandInfo(
     const Option<std::string>& user);
 
 
+// Sets the executor resource limit (the `limit` parameter) based on the resource
+// passed in (the `value` parameter).
+static void setLimit(Option<Value::Scalar>& limit, const Value::Scalar& value);
+
+
 Slave::Slave(const string& id,
              const slave::Flags& _flags,
              MasterDetector* _detector,
@@ -199,6 +205,10 @@ Slave::Slave(const string& id,
              SecretGenerator* _secretGenerator,
              VolumeGidManager* _volumeGidManager,
              PendingFutureTracker* _futureTracker,
+             Owned<CSIServer>&& _csiServer,
+#ifndef __WINDOWS__
+             const Option<process::network::unix::Socket>& _executorSocket,
+#endif // __WINDOWS__
              const Option<Authorizer*>& _authorizer)
   : ProcessBase(id),
     state(RECOVERING),
@@ -230,6 +240,10 @@ Slave::Slave(const string& id,
     secretGenerator(_secretGenerator),
     volumeGidManager(_volumeGidManager),
     futureTracker(_futureTracker),
+    csiServer(std::move(_csiServer)),
+#ifndef __WINDOWS__
+    executorSocket(_executorSocket),
+#endif // __WINDOWS__
     authorizer(_authorizer),
     resourceVersion(protobuf::createUUID()) {}
 
@@ -773,6 +787,70 @@ void Slave::initialize()
         },
         options);
 
+#ifndef __WINDOWS__
+  if (executorSocket.isSome()) {
+    // We use `http::Server` to manage the communication channel.
+    // Since `http::Server` currently doesn't offer support for
+    // authentication we then inject the request received by the
+    // server into normal agent rounting logic.
+    Try<http::Server> server = http::Server::create(
+        *executorSocket,
+        process::defer(
+            self(),
+            [this](const process::network::Socket&, http::Request request)
+              -> Future<http::Response> {
+              // Restrict access to only allow `/slave(N)/api/v1/executor`
+              // and `/slave(N)/api/v1`. Executors need to be able to
+              // access the first to subscribe and the latter to e.g.,
+              // launch containers or perform other operator API calls.
+              string selfPrefix = "/" + self().id;
+              if (request.url.path != selfPrefix + "/api/v1/executor" &&
+                  request.url.path != selfPrefix + "/api/v1") {
+                LOG(INFO)
+                  << "Blocking request for " << request.url.path
+                  << " over executor socket";
+                return http::Forbidden();
+              }
+
+              // Create an `HttpEvent` with the needed information which we can
+              // be consumed by the agent. The event contains e.g., the
+              // requested path so the expected route `/api/v1/executor` is
+              // routed when consuming the event.
+              std::unique_ptr<Promise<http::Response>> promise(
+                  new Promise<http::Response>());
+
+              Future<http::Response> response = promise->future();
+
+              process::HttpEvent event(
+                  std::unique_ptr<http::Request>(new http::Request(request)),
+                  std::move(promise));
+
+              std::move(event).consume(this);
+
+              return response;
+            }),
+        {
+          /* .scheme =*/process::http::Scheme::HTTP_UNIX,
+          /* .backlog =*/16384,
+        });
+
+    if (server.isError()) {
+      LOG(FATAL) << "Could not start listening on executor socket: "
+                 << server.error();
+    } else {
+      executorSocketServer = std::move(*server);
+
+      Future<Nothing> executorSocketServerTerminated =
+        executorSocketServer->run();
+
+      if (executorSocketServerTerminated.isFailed()) {
+        LOG(FATAL) << "Could not start listening on executor socket: "
+                   << executorSocketServerTerminated.failure();
+      }
+    }
+  }
+#endif // __WINDOWS__
+
   route("/api/v1/executor",
         EXECUTOR_HTTP_AUTHENTICATION_REALM,
         Http::EXECUTOR_HELP(),
@@ -998,10 +1076,54 @@ void Slave::drain(
     const UPID& from,
     DrainSlaveMessage&& drainSlaveMessage)
 {
+  if (operations.empty() && frameworks.empty()) {
+    LOG(INFO)
+      << "Received DrainConfig " << drainSlaveMessage.config()
+      << (drainConfig.isSome()
+          ? "; previously stored DrainConfig " + stringify(*drainConfig)
+          : "")
+      << "; agent has no stored frameworks, tasks, or operations,"
+         " so draining is already complete";
+
+    return;
+  }
+
+  hashmap<FrameworkID, hashset<TaskID>> pendingTaskIds;
+  foreachvalue (Framework* framework, frameworks) {
+    foreachvalue (const auto& taskMap, framework->pendingTasks) {
+      pendingTaskIds[framework->id()] = taskMap.keys();
+    }
+  }
+
+  hashmap<FrameworkID, hashset<TaskID>> queuedTaskIds;
+  foreachvalue (Framework* framework, frameworks) {
+    foreachvalue (Executor* executor, framework->executors) {
+      foreachkey (const TaskID& taskId, executor->queuedTasks) {
+        queuedTaskIds[framework->id()].insert(taskId);
+      }
+    }
+  }
+
+  hashmap<FrameworkID, hashset<TaskID>> launchedTaskIds;
+  foreachvalue (Framework* framework, frameworks) {
+    foreachvalue (Executor* executor, framework->executors) {
+      foreachkey (const TaskID& taskId, executor->launchedTasks) {
+        launchedTaskIds[framework->id()].insert(taskId);
+      }
+    }
+  }
+
   LOG(INFO)
-    << "Checkpointing DrainConfig. Previous drain config was "
-    << (drainConfig.isSome() ? stringify(drainConfig.get()) : "NONE")
-    << ", new drain config is " << drainSlaveMessage.config();
+    << "Initiating drain with DrainConfig " << drainSlaveMessage.config()
+    << (drainConfig.isSome()
+        ? "; overwriting previous DrainConfig " + stringify(*drainConfig)
+        : "")
+    << "; agent has (pending tasks, queued tasks, launched tasks, operations)"
+    << " == ("
+    << stringify(pendingTaskIds) << ", "
+    << stringify(queuedTaskIds) << ", "
+    << stringify(launchedTaskIds) << ", "
+    << stringify(operations.keys()) << ")";
 
   CHECK_SOME(state::checkpoint(
       paths::getDrainConfigPath(metaDir, info.id()),
@@ -1621,6 +1743,14 @@ void Slave::registered(
       // running, so the resource providers can use the agent API.
       localResourceProviderDaemon->start(info.id());
 
+      if (csiServer.get()) {
+        csiServer->start(info.id())
+          .onFailed([=](const string& failure) {
+            EXIT(EXIT_FAILURE)
+              << "CSI server initialization failed: " << failure;
+          });
+      }
+
       // Setup a timer so that the agent attempts to reregister if it
       // doesn't receive a ping from the master for an extended period
       // of time. This needs to be done once registered, in case we
@@ -1705,6 +1835,14 @@ void Slave::reregistered(
       // We start the local resource providers daemon once the agent is
       // running, so the resource providers can use the agent API.
       localResourceProviderDaemon->start(info.id());
+
+      if (csiServer.get()) {
+        csiServer->start(info.id())
+          .onFailed([=](const string& failure) {
+            EXIT(EXIT_FAILURE)
+              << "CSI server initialization failed: " << failure;
+          });
+      }
 
       // Setup a timer so that the agent attempts to reregister if it
       // doesn't receive a ping from the master for an extended period
@@ -2047,13 +2185,44 @@ void Slave::runTask(
 
   const ExecutorInfo executorInfo = getExecutorInfo(frameworkInfo, task);
 
+  bool executorGeneratedForCommandTask = !task.has_executor();
+
   run(frameworkInfo,
       executorInfo,
       task,
       None(),
       resourceVersionUuids,
       pid,
-      launchExecutor);
+      launchExecutor,
+      executorGeneratedForCommandTask);
+}
+
+
+Option<Error> Slave::validateResourceLimitsAndIsolators(
+    const vector<TaskInfo>& tasks)
+{
+  foreach (const TaskInfo& task, tasks) {
+    if (!(task.has_container() &&
+          task.container().type() == ContainerInfo::DOCKER)) {
+      if (task.limits().count("cpus") &&
+          !(strings::contains(flags.isolation, "cgroups/cpu") ||
+            strings::contains(flags.isolation, "cgroups/all"))) {
+        return Error(
+            "CPU limits can only be set on tasks launched in Mesos containers"
+            " when the agent has loaded the 'cgroups/cpu' isolator");
+      }
+
+      if (task.limits().count("mem") &&
+          !(strings::contains(flags.isolation, "cgroups/mem") ||
+            strings::contains(flags.isolation, "cgroups/all"))) {
+        return Error(
+            "Memory limits can only be set on tasks launched in Mesos"
+            " containers when the agent has loaded the 'cgroups/mem' isolator");
+      }
+    }
+  }
+
+  return None();
 }
 
 
@@ -2064,7 +2233,8 @@ void Slave::run(
     Option<TaskGroupInfo> taskGroup,
     const vector<ResourceVersionUUID>& resourceVersionUuids,
     const UPID& pid,
-    const Option<bool>& launchExecutor)
+    const Option<bool>& launchExecutor,
+    bool executorGeneratedForCommandTask)
 {
   CHECK_NE(task.isSome(), taskGroup.isSome())
     << "Either task or task group should be set but not both";
@@ -2208,6 +2378,40 @@ void Slave::run(
     }
   }
 
+  CHECK_NOTNULL(framework);
+
+  Option<Error> error = validateResourceLimitsAndIsolators(tasks);
+  if (error.isSome()) {
+    // We report TASK_DROPPED to the framework because the task was
+    // never launched. For non-partition-aware frameworks, we report
+    // TASK_LOST for backward compatibility.
+    mesos::TaskState taskState = TASK_DROPPED;
+    if (!protobuf::frameworkHasCapability(
+            frameworkInfo, FrameworkInfo::Capability::PARTITION_AWARE)) {
+      taskState = TASK_LOST;
+    }
+
+    foreach (const TaskInfo& _task, tasks) {
+      const StatusUpdate update = protobuf::createStatusUpdate(
+          frameworkId,
+          info.id(),
+          _task.task_id(),
+          taskState,
+          TaskStatus::SOURCE_SLAVE,
+          id::UUID::random(),
+          error->message,
+          TaskStatus::REASON_GC_ERROR);
+
+      statusUpdate(update, UPID());
+    }
+
+    if (framework->idle()) {
+      removeFramework(framework);
+    }
+
+    return;
+  }
+
   const ExecutorID& executorId = executorInfo.executor_id();
 
   if (HookManager::hooksAvailable()) {
@@ -2229,8 +2433,6 @@ void Slave::run(
       }
     }
   }
-
-  CHECK_NOTNULL(framework);
 
   // Track the pending task / task group to ensure the framework is
   // not removed and the framework and top level executor directories
@@ -2382,7 +2584,8 @@ void Slave::run(
             task,
             taskGroup,
             resourceVersionUuids,
-            launchExecutor))
+            launchExecutor,
+            executorGeneratedForCommandTask))
         .onFailed(defer(self(), [=](const string& failure) {
           Framework* _framework = getFramework(frameworkId);
           if (_framework == nullptr) {
@@ -2612,7 +2815,8 @@ void Slave::__run(
     const Option<TaskInfo>& task,
     const Option<TaskGroupInfo>& taskGroup,
     const vector<ResourceVersionUUID>& resourceVersionUuids,
-    const Option<bool>& launchExecutor)
+    const Option<bool>& launchExecutor,
+    bool executorGeneratedForCommandTask)
 {
   CHECK_NE(task.isSome(), taskGroup.isSome())
     << "Either task or task group should be set but not both";
@@ -3064,7 +3268,8 @@ void Slave::__run(
   // or we are in the legacy case of launching one if there wasn't
   // one already. Either way, let's launch executor now.
   if (executor == nullptr) {
-    Try<Executor*> added = framework->addExecutor(executorInfo);
+    Try<Executor*> added =
+      framework->addExecutor(executorInfo, executorGeneratedForCommandTask);
 
     if (added.isError()) {
       CHECK(framework->getExecutor(executorId) == nullptr);
@@ -3145,6 +3350,7 @@ void Slave::__run(
           lambda::_1,
           frameworkId,
           executorInfo_,
+          computeExecutorLimits(executorInfo.resources(), tasks),
           taskGroup.isNone() ? task.get() : Option<TaskInfo>::none()));
   }
 
@@ -3231,15 +3437,23 @@ void Slave::__run(
                 << " for executor " << *executor;
 
       const ContainerID& containerId = executor->containerId;
-      const Resources& resources = executor->allocatedResources();
+      const Resources& resourceRequests = executor->allocatedResources();
+      const google::protobuf::Map<string, Value::Scalar>& resourceLimits =
+        computeExecutorLimits(
+            executor->info.resources(),
+            executor->queuedTasks.values(),
+            executor->launchedTasks.values());
 
-      publishResources(containerId, resources)
-        .then(defer(self(), [this, containerId, resources] {
-          // NOTE: The executor struct could have been removed before
-          // containerizer update, so we use the captured container ID and
-          // resources here. If this happens, the containerizer would simply
-          // skip updating a destroyed container.
-          return containerizer->update(containerId, resources);
+      publishResources(containerId, resourceRequests)
+        .then(defer(
+            self(),
+            [this, containerId, resourceRequests, resourceLimits] {
+              // NOTE: The executor struct could have been removed before
+              // containerizer update, so we use the captured container ID,
+              // resource requests and limits here. If this happens, the
+              // containerizer would simply skip updating a destroyed container.
+              return containerizer->update(
+                  containerId, resourceRequests, resourceLimits);
         }))
         .onAny(defer(self(),
                      &Self::___run,
@@ -3525,6 +3739,7 @@ void Slave::launchExecutor(
     const Future<Option<Secret>>& authenticationToken,
     const FrameworkID& frameworkId,
     const ExecutorInfo& executorInfo,
+    const google::protobuf::Map<string, Value::Scalar>& executorLimits,
     const Option<TaskInfo>& taskInfo)
 {
   Framework* framework = getFramework(frameworkId);
@@ -3605,6 +3820,10 @@ void Slave::launchExecutor(
   *containerConfig.mutable_command_info() = executorInfo.command();
   *containerConfig.mutable_resources() = executorInfo.resources();
   containerConfig.set_directory(executor->directory);
+
+  if (!executorLimits.empty()) {
+    *containerConfig.mutable_limits() = executorLimits;
+  }
 
   if (executor->user.isSome()) {
     containerConfig.set_user(executor->user.get());
@@ -3729,13 +3948,17 @@ void Slave::runTaskGroup(
     return;
   }
 
+  // Executors for task groups are injected by the master, not the agent.
+  constexpr bool executorGeneratedForCommandTask = false;
+
   run(frameworkInfo,
       executorInfo,
       None(),
       taskGroupInfo,
       resourceVersionUuids,
       UPID(),
-      launchExecutor);
+      launchExecutor,
+      executorGeneratedForCommandTask);
 }
 
 
@@ -5204,7 +5427,12 @@ void Slave::subscribe(
       }
 
       const ContainerID& containerId = executor->containerId;
-      const Resources& resources = executor->allocatedResources();
+      const Resources& resourceRequests = executor->allocatedResources();
+      const google::protobuf::Map<string, Value::Scalar>& resourceLimits =
+        computeExecutorLimits(
+            executor->info.resources(),
+            executor->queuedTasks.values(),
+            executor->launchedTasks.values());
 
       Future<Nothing> resourcesPublished;
       if (executor->queuedTasks.empty()) {
@@ -5218,16 +5446,19 @@ void Slave::subscribe(
         // after use. See comments in `publishResources` for details.
         resourcesPublished = Nothing();
       } else {
-        resourcesPublished = publishResources(containerId, resources);
+        resourcesPublished = publishResources(containerId, resourceRequests);
       }
 
       resourcesPublished
-        .then(defer(self(), [this, containerId, resources] {
-          // NOTE: The executor struct could have been removed before
-          // containerizer update, so we use the captured container ID and
-          // resources here. If this happens, the containerizer would simply
-          // skip updating a destroyed container.
-          return containerizer->update(containerId, resources);
+        .then(defer(
+            self(),
+            [this, containerId, resourceRequests, resourceLimits] {
+              // NOTE: The executor struct could have been removed before
+              // containerizer update, so we use the captured container ID,
+              // resource requests and limits here. If this happens, the
+              // containerizer would simply skip updating a destroyed container.
+              return containerizer->update(
+                  containerId, resourceRequests, resourceLimits);
         }))
         .onAny(defer(self(),
                      &Self::___run,
@@ -5381,15 +5612,23 @@ void Slave::registerExecutor(
       }
 
       const ContainerID& containerId = executor->containerId;
-      const Resources& resources = executor->allocatedResources();
+      const Resources& resourceRequests = executor->allocatedResources();
+      const google::protobuf::Map<string, Value::Scalar>& resourceLimits =
+        computeExecutorLimits(
+            executor->info.resources(),
+            executor->queuedTasks.values(),
+            executor->launchedTasks.values());
 
-      publishResources(containerId, resources)
-        .then(defer(self(), [this, containerId, resources] {
-          // NOTE: The executor struct could have been removed before
-          // containerizer update, so we use the captured container ID and
-          // resources here. If this happens, the containerizer would simply
-          // skip updating a destroyed container.
-          return containerizer->update(containerId, resources);
+      publishResources(containerId, resourceRequests)
+        .then(defer(
+            self(),
+            [this, containerId, resourceRequests, resourceLimits] {
+              // NOTE: The executor struct could have been removed before
+              // containerizer update, so we use the captured container ID,
+              // resource requests and limits here. If this happens, the
+              // containerizer would simply skip updating a destroyed container.
+              return containerizer->update(
+                  containerId, resourceRequests, resourceLimits);
         }))
         .onAny(defer(self(),
                      &Self::___run,
@@ -5530,7 +5769,11 @@ void Slave::reregisterExecutor(
       // Tell the containerizer to update the resources.
       containerizer->update(
           executor->containerId,
-          executor->allocatedResources())
+          executor->allocatedResources(),
+          computeExecutorLimits(
+              executor->info.resources(),
+              executor->queuedTasks.values(),
+              executor->launchedTasks.values()))
         .onAny(defer(self(),
                      &Self::_reregisterExecutor,
                      lambda::_1,
@@ -6074,7 +6317,13 @@ void Slave::_statusUpdate(
     // have been updated before sending the status update. Note that
     // duplicate terminal updates are not possible here because they
     // lead to an error from `Executor::updateTaskState`.
-    containerizer->update(executor->containerId, executor->allocatedResources())
+    containerizer->update(
+        executor->containerId,
+        executor->allocatedResources(),
+        computeExecutorLimits(
+            executor->info.resources(),
+            executor->queuedTasks.values(),
+            executor->launchedTasks.values()))
       .onAny(defer(self(),
                    &Slave::__statusUpdate,
                    lambda::_1,
@@ -9853,6 +10102,129 @@ void Slave::initializeResourceProviderManager(
 }
 
 
+google::protobuf::Map<string, Value::Scalar> Slave::computeExecutorLimits(
+    const Resources& executorResources,
+    const vector<TaskInfo>& taskInfos,
+    const vector<Task*>& tasks) const
+{
+  Option<Value::Scalar> executorCpuLimit, executorMemLimit;
+  Value::Scalar cpuRequest, memRequest;
+  foreach (const TaskInfo& taskInfo, taskInfos) {
+    // Count the task's CPU limit into the executor's CPU limit.
+    if (taskInfo.limits().count("cpus")) {
+      setLimit(executorCpuLimit, taskInfo.limits().at("cpus"));
+    } else {
+      Option<Value::Scalar> taskCpus =
+        Resources(taskInfo.resources()).get<Value::Scalar>("cpus");
+
+      if (taskCpus.isSome()) {
+        cpuRequest += taskCpus.get();
+      }
+    }
+
+    // Count the task's memory limit into the executor's memory limit.
+    if (taskInfo.limits().count("mem")) {
+      setLimit(executorMemLimit, taskInfo.limits().at("mem"));
+    } else {
+      Option<Value::Scalar> taskMem =
+        Resources(taskInfo.resources()).get<Value::Scalar>("mem");
+
+      if (taskMem.isSome()) {
+        memRequest += taskMem.get();
+      }
+    }
+  }
+
+  foreach (const Task* task, tasks) {
+    CHECK_NOTNULL(task);
+
+    // Count the task's CPU limit into the executor's CPU limit.
+    if (task->limits().count("cpus")) {
+      setLimit(executorCpuLimit, task->limits().at("cpus"));
+    } else {
+      Option<Value::Scalar> taskCpus =
+        Resources(task->resources()).get<Value::Scalar>("cpus");
+
+      if (taskCpus.isSome()) {
+        cpuRequest += taskCpus.get();
+      }
+    }
+
+    // Count the task's memory limit into the executor's memory limit.
+    if (task->limits().count("mem")) {
+      setLimit(executorMemLimit, task->limits().at("mem"));
+    } else {
+      Option<Value::Scalar> taskMem =
+        Resources(task->resources()).get<Value::Scalar>("mem");
+
+      if (taskMem.isSome()) {
+        memRequest += taskMem.get();
+      }
+    }
+  }
+
+  if (executorCpuLimit.isSome()) {
+    // Count the executor's CPU request into its CPU limit as well, this is to
+    // ensure the executor's CPU limit is always greater than its CPU request.
+    Option<Value::Scalar> executorCpus =
+      executorResources.get<Value::Scalar>("cpus");
+
+    if (executorCpus.isSome()) {
+      setLimit(executorCpuLimit, executorCpus.get());
+    }
+
+    // For the tasks which do not have CPU limit, count their CPU requests
+    // into the executor's CPU limit as well, this is also to ensure the
+    // executor's CPU limit is always greater than its CPU request. Please
+    // note that if the flag `cgroups_enable_cfs` is not enabled, we should
+    // not set the executor's CPU limit, otherwise the tasks which do not
+    // have CPU limit will be throttled implicitly by the executor's CPU limit.
+    if (cpuRequest.value() > 0) {
+#ifdef __linux__
+      if (flags.cgroups_enable_cfs) {
+        setLimit(executorCpuLimit, cpuRequest);
+      } else {
+        executorCpuLimit = None();
+      }
+#else
+      setLimit(executorCpuLimit, cpuRequest);
+#endif // __linux__
+    }
+  }
+
+  if (executorMemLimit.isSome()) {
+    // Count the executor's memory request into its memory limit as well,
+    // this is to ensure the executor's memory limit is always greater
+    // than its memory request.
+    Option<Value::Scalar> executorMem =
+      executorResources.get<Value::Scalar>("mem");
+
+    if (executorMem.isSome()) {
+      setLimit(executorMemLimit, executorMem.get());
+    }
+
+    // For the tasks which do not have memory limit, count their memory
+    // requests into the executor's memory limit as well, this is also
+    // to ensure the executor's memory limit is always greater than its
+    // memory request.
+    if (memRequest.value() > 0) {
+      setLimit(executorMemLimit, memRequest);
+    }
+  }
+
+  google::protobuf::Map<string, Value::Scalar> executorLimits;
+  if (executorCpuLimit.isSome()) {
+    executorLimits.insert({"cpus", executorCpuLimit.get()});
+  }
+
+  if (executorMemLimit.isSome()) {
+    executorLimits.insert({"mem", executorMemLimit.get()});
+  }
+
+  return executorLimits;
+}
+
+
 void Slave::updateDrainStatus()
 {
   if (drainConfig.isNone()) {
@@ -9934,7 +10306,9 @@ void Framework::checkpointFramework() const
 }
 
 
-Try<Executor*> Framework::addExecutor(const ExecutorInfo& executorInfo)
+Try<Executor*> Framework::addExecutor(
+  const ExecutorInfo& executorInfo,
+  bool isGeneratedForCommandTask)
 {
   // Verify that Resource.AllocationInfo is set, if coming
   // from a MULTI_ROLE master this will be set, otherwise
@@ -9990,7 +10364,8 @@ Try<Executor*> Framework::addExecutor(const ExecutorInfo& executorInfo)
       containerId,
       directory.get(),
       user,
-      info.checkpoint());
+      info.checkpoint(),
+      isGeneratedForCommandTask);
 
   if (executor->checkpoint) {
     executor->checkpointExecutor();
@@ -10185,7 +10560,8 @@ void Framework::recoverExecutor(
       latest,
       directory,
       info.user(),
-      info.checkpoint());
+      info.checkpoint(),
+      state.generatedForCommandTask);
 
   // Recover the libprocess PID if possible for PID based executors.
   if (run->http.isSome()) {
@@ -10529,7 +10905,8 @@ Executor::Executor(
     const ContainerID& _containerId,
     const string& _directory,
     const Option<string>& _user,
-    bool _checkpoint)
+    bool _checkpoint,
+    bool isGeneratedForCommandTask)
   : state(REGISTERING),
     slave(_slave),
     id(_info.executor_id()),
@@ -10540,7 +10917,8 @@ Executor::Executor(
     user(_user),
     checkpoint(_checkpoint),
     http(None()),
-    pid(None())
+    pid(None()),
+    isGeneratedForCommandTask_(isGeneratedForCommandTask)
 {
   CHECK_NOTNULL(slave);
 
@@ -10557,19 +10935,6 @@ Executor::Executor(
 
   completedTasks =
     circular_buffer<shared_ptr<Task>>(MAX_COMPLETED_TASKS_PER_EXECUTOR);
-
-  // TODO(jieyu): The way we determine if an executor is generated for
-  // a command task (either command or docker executor) is really
-  // hacky. We rely on the fact that docker executor launch command is
-  // set in the docker containerizer so that this check is still valid
-  // in the slave.
-  Result<string> executorPath =
-    os::realpath(path::join(slave->flags.launcher_dir, MESOS_EXECUTOR));
-
-  if (executorPath.isSome()) {
-    isGeneratedForCommandTask_ =
-      strings::contains(info.command().value(), executorPath.get());
-  }
 }
 
 
@@ -10716,6 +11081,15 @@ void Executor::checkpointExecutor()
   VLOG(1) << "Checkpointing ExecutorInfo to '" << path << "'";
 
   CHECK_SOME(state::checkpoint(path, info));
+
+  // Sync state of sentinel indicating whether the executor was
+  // generated by the agent.
+  CHECK_SOME(state::checkpoint(
+    paths::getExecutorGeneratedForCommandTaskPath(
+        slave->metaDir, slave->info.id(), frameworkId, id),
+    stringify(static_cast<int>(isGeneratedForCommandTask_)),
+    true));
+
 
   // Create the meta executor directory.
   // NOTE: This creates the 'latest' symlink in the meta directory.
@@ -11092,6 +11466,15 @@ map<string, string> executorEnvironment(
   environment["MESOS_HTTP_COMMAND_EXECUTOR"] =
     flags.http_command_executor ? "1" : "0";
 
+#ifndef __WINDOWS__
+  if (flags.http_executor_domain_sockets) {
+    // If `http_executor_domain_sockets` is true, the location should have
+    // been set either by the user or automatically during agent startup.
+    CHECK(flags.domain_socket_location.isSome());
+    environment["MESOS_DOMAIN_SOCKET"] = *flags.domain_socket_location;
+  }
+#endif // __WINDOWS__
+
   // Set executor's shutdown grace period. If set, the customized value
   // from `ExecutorInfo` overrides the default from agent flags.
   Duration executorShutdownGracePeriod = flags.executor_shutdown_grace_period;
@@ -11241,6 +11624,27 @@ static CommandInfo defaultExecutorCommandInfo(
 
   return commandInfo;
 }
+
+
+static void setLimit(Option<Value::Scalar>& limit, const Value::Scalar& delta)
+{
+  if (limit.isSome() && std::isinf(limit->value())) {
+    // Just return if the limit is already infinite.
+    return;
+  }
+
+  Value::Scalar scalar;
+  if (limit.isNone() || std::isinf(delta.value())) {
+    // Set limit directly if it is the first time or the value to be
+    // added is infinite.
+    scalar.set_value(delta.value());
+  } else {
+    // Add the value into the limit.
+    scalar.set_value(limit->value() + delta.value());
+  }
+
+  limit = scalar;
+};
 
 } // namespace slave {
 } // namespace internal {

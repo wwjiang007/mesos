@@ -33,6 +33,10 @@ option(BUILD_SHARED_LIBS
   "Build shared libraries."
   ${DEFAULT_BUILD_SHARED_LIBS})
 
+option(ENABLE_INSTALL_MODULE_DEPENDENCIES
+  "Install third-party bundled dependencies required for module development"
+  FALSE)
+
 option(ENABLE_PRECOMPILED_HEADERS
   "Enable auto-generated precompiled headers using cotire"
   ${WIN32})
@@ -65,6 +69,21 @@ if (CMAKE_GENERATOR MATCHES "Visual Studio")
       "Please use `cmake -T ${PREFERRED_TOOLSET}`.")
   endif ()
 endif ()
+
+set(
+  MESOS_FINAL_PREFIX
+  ${CMAKE_INSTALL_PREFIX}
+  CACHE STRING
+  "Adjust built-in paths (rpath in shared objects, default paths in Mesos flags
+   and so on) so that cmake install output works after being copied into this prefix.
+   This is typically used by package managers that use different prefixes on a build
+   system and on a target system.")
+
+# TODO(asekretenko): Consider making Mesos tests a separate project
+# that would depend on Mesos installation.
+option(MESOS_INSTALL_TESTS
+  "Add test executables and their dependencies to the install step."
+  FALSE)
 
 
 # 3RDPARTY OPTIONS.
@@ -101,6 +120,20 @@ if (ENABLE_LIBEVENT)
     ""
     CACHE STRING
     "Specify the path to libevent, e.g. \"C:\\libevent-Win64\".")
+endif()
+
+set(
+  BOOST_ROOT_DIR
+  ""
+  CACHE STRING
+  "Specify the path to boost.")
+
+if (NOT WIN32)
+  set(
+    CURL_ROOT_DIR
+    ""
+    CACHE STRING
+    "Specify the path to libcurl.")
 endif()
 
 option(
@@ -146,6 +179,11 @@ option(
   ENABLE_LAST_IN_FIRST_OUT_FIXED_SIZE_SEMAPHORE
   "Build libprocess with LIFO fixed size semaphore."
   FALSE)
+
+option(
+  ENABLE_NVML
+  "Whether to use the NVML headers."
+  TRUE)
 
 option(
   PYTHON
@@ -260,12 +298,6 @@ if (WIN32 AND ENABLE_LIBEVENT)
     "See MESOS-8668 for context.")
 endif ()
 
-if (ENABLE_SSL AND (NOT ENABLE_LIBEVENT))
-  message(
-    FATAL_ERROR
-    "'ENABLE_SSL' currently requires 'ENABLE_LIBEVENT'.")
-endif ()
-
 
 # SYSTEM CHECKS.
 ################
@@ -377,15 +409,46 @@ if (NOT WIN32)
     add_compile_options(-fno-omit-frame-pointer)
   endif ()
 
-  # Directory structure for some build artifacts.
-  # This is defined for use in tests.
-  set(EXEC_INSTALL_PREFIX  ${CMAKE_INSTALL_PREFIX})
-  set(SHARE_INSTALL_PREFIX ${CMAKE_INSTALL_PREFIX}/share)
-  set(DATA_INSTALL_PREFIX  ${SHARE_INSTALL_PREFIX}/mesos)
+  # Install layout definitions used in cmake install targets.
+  # These are relative to ${CMAKE_INSTALL_PREFIX}.
+  #
+  # NOTE: Windows and POSIX configurations have to define the same variables,
+  # but the layout is different!
+  set(MESOS_INSTALL_LAUNCHER  libexec/mesos) # launcher executables
+  set(MESOS_INSTALL_RUNTIME   bin)           # all other executables
+  set(MESOS_INSTALL_LIBRARIES lib)           # static and shared libraries
+  set(MESOS_INSTALL_HEADERS   include)       # headers
+  set(MESOS_INSTALL_DATA      share/mesos)   # data (webui, etc.)
 
-  set(LIBEXEC_INSTALL_DIR     ${EXEC_INSTALL_PREFIX}/libexec)
-  set(PKG_LIBEXEC_INSTALL_DIR ${LIBEXEC_INSTALL_DIR}/mesos)
-  set(LIB_INSTALL_DIR         ${EXEC_INSTALL_PREFIX}/libmesos)
+  # File layout definitions that are used in the sources
+  # (for setting up installed tests and default values of flags).
+  #
+  # NOTE: If ${MESOS_FINAL_PREFIX} is set to a non-default value
+  # (i.e. differs from ${CMAKE_INSTALL_PREFIX}), cmake install output
+  # will only work after copying to ${MESOS_FINAL_PREFIX}.
+
+  # - Path for data (webui, etc.).
+  set(DATA_INSTALL_PREFIX  ${MESOS_FINAL_PREFIX}/${MESOS_INSTALL_DATA})
+
+  # - Path to launcher binaries.
+  set(PKG_LIBEXEC_INSTALL_DIR ${MESOS_FINAL_PREFIX}/${MESOS_INSTALL_LAUNCHER})
+
+  # - Path to libmesos shared object.
+  set(LIB_INSTALL_DIR ${MESOS_FINAL_PREFIX}/${MESOS_INSTALL_LIBRARIES})
+
+  # - Path to modules, including test modules.
+  set(PKG_MODULE_DIR ${MESOS_FINAL_PREFIX}/${MESOS_INSTALL_LIBRARIES})
+
+  # - Path to test-helper and (in the future) test scripts.
+  #   TODO(asekretenko): Either port script tests to cmake or drop them.
+  set(TEST_LIB_EXEC_DIR ${MESOS_FINAL_PREFIX}/${MESOS_INSTALL_RUNTIME})
+
+  # - Path to Mesos binaries, used in tests.
+  set(S_BIN_DIR ${MESOS_FINAL_PREFIX}/${MESOS_INSTALL_RUNTIME})
+
+  # We add an RPATH pointing to the planned shared libraries location.
+  set(CMAKE_INSTALL_RPATH
+    "${CMAKE_INSTALL_RPATH};${MESOS_FINAL_PREFIX}/${MESOS_INSTALL_LIBRARIES}")
 endif ()
 
 option(ENABLE_GC_UNUSED
@@ -552,16 +615,42 @@ if (WIN32)
     -D_CRT_SECURE_NO_WARNINGS
     -D_CRT_NONSTDC_NO_WARNINGS)
 
-  # Directory structure definitions.
-  # TODO(hausdorff): (MESOS-5455) These are placeholder values.
-  # Transition away from them.
-  set(EXEC_INSTALL_PREFIX     "WARNINGDONOTUSEME")
-  set(LIBEXEC_INSTALL_DIR     "WARNINGDONOTUSEME")
-  set(PKG_LIBEXEC_INSTALL_DIR "WARNINGDONOTUSEME")
-  set(LIB_INSTALL_DIR         "WARNINGDONOTUSEME")
-  set(TEST_LIB_EXEC_DIR       "WARNINGDONOTUSEME")
-  set(PKG_MODULE_DIR          "WARNINGDONOTUSEME")
-  set(S_BIN_DIR               "WARNINGDONOTUSEME")
+  # Install layout definitions used in cmake install targets.
+  # These are relative to ${CMAKE_INSTALL_PREFIX}.
+  #
+  # NOTE: Windows and POSIX configurations have to define the same variables,
+  # but the layout is different!
+  set(MESOS_INSTALL_RUNTIME   bin)           # all executables and DLLs
+  set(MESOS_INSTALL_LAUNCHER  ${MESOS_INSTALL_RUNTIME})
+  set(MESOS_INSTALL_LIBRARIES lib)           # static libraries
+  set(MESOS_INSTALL_HEADERS   include)       # headers
+  set(MESOS_INSTALL_DATA      share/mesos)   # data (webui, etc.)
+
+  # File layout definitions that are used in the sources
+  # (for setting up installed tests and default values of flags).
+  #
+  # NOTE: If ${MESOS_FINAL_PREFIX} is set to a non-default value
+  # (i.e. differs from ${CMAKE_INSTALL_PREFIX}), cmake install output
+  # will only work after copying to ${MESOS_FINAL_PREFIX}.
+
+  #  - Path for data (webui, etc.)
+  set(DATA_INSTALL_PREFIX  ${MESOS_FINAL_PREFIX}/${MESOS_INSTALL_DATA})
+
+  # - Path to launcher binaries
+  set(PKG_LIBEXEC_INSTALL_DIR ${MESOS_FINAL_PREFIX}/${MESOS_INSTALL_RUNTIME})
+
+  # - Path to libmesos shared object
+  set(LIB_INSTALL_DIR ${MESOS_FINAL_PREFIX}/${MESOS_INSTALL_RUNTIME})
+
+  # - Path to modules, including test modules
+  set(PKG_MODULE_DIR ${MESOS_FINAL_PREFIX}/${MESOS_INSTALL_RUNTIME})
+
+  # - Path to test-helper and (in the future) test scripts.
+  #   TODO(asekretenko): Either port script tests to Windows or drop them.
+  set(TEST_LIB_EXEC_DIR ${MESOS_FINAL_PREFIX}/${MESOS_INSTALL_RUNTIME})
+
+  # - Path to Mesos binaries, used in tests
+  set(S_BIN_DIR ${MESOS_FINAL_PREFIX}/${MESOS_INSTALL_RUNTIME})
 endif ()
 
 
@@ -583,6 +672,10 @@ add_definitions(
 if (ENABLE_SSL)
   # TODO(andschwa): Make this non-global.
   add_definitions(-DUSE_SSL_SOCKET=1)
+endif ()
+
+if (ENABLE_LIBEVENT)
+  add_definitions(-DUSE_LIBEVENT=1)
 endif ()
 
 # Calculate some build information.

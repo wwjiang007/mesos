@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <memory>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -71,6 +72,7 @@
 
 namespace http = process::http;
 
+using std::shared_ptr;
 
 using google::protobuf::RepeatedPtrField;
 
@@ -82,6 +84,7 @@ using mesos::slave::ContainerTermination;
 using mesos::v1::scheduler::Call;
 using mesos::v1::scheduler::Event;
 using mesos::v1::scheduler::Mesos;
+using mesos::v1::typeutils::diff;
 
 using mesos::internal::devolve;
 using mesos::internal::evolve;
@@ -1493,6 +1496,10 @@ TEST_P(MasterAPITest, ReservationUpdate)
 
   // Helper function to attempt a reservation update from a given `source`
   // to a given reservation using an operator API call.
+  //
+  // Note that RESERVE_RESOURCES call does not wait for the agent to apply
+  // the operation, hence this function might return before the agent changes
+  // its state!
   auto attemptReservation = [&master, &slaveId, &contentType](
       const Resources& source,
       const Resources& resources,
@@ -1564,6 +1571,11 @@ TEST_P(MasterAPITest, ReservationUpdate)
       dynamicallyReservedToFoo,
       accepted);
 
+  // Wait for the agent to apply operation.
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
+
   verifyReservation("role/foo");
 
   // Should fail again, since there are still no resources that are
@@ -1578,6 +1590,11 @@ TEST_P(MasterAPITest, ReservationUpdate)
       dynamicallyReservedToFoo,
       dynamicallyReservedToBar,
       accepted);
+
+  // Wait for the agent to apply operation.
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
 
   verifyReservation("role/bar");
 }
@@ -3247,248 +3264,6 @@ TEST_P(MasterAPITest, EventAuthorizationFiltering)
 }
 
 
-// Operator API events are sent using an asynchronous call chain. When
-// event-related state changes in the master before the authorizer returns, the
-// continuations which actually send the event should still have a consistent
-// view of the master state from the time when the event occurred. This test
-// forces task removal in the master before the authorizer returns in order to
-// verify that events are sent correctly in that case.
-TEST_P(MasterAPITest, EventAuthorizationDelayed)
-{
-  Clock::pause();
-
-  ContentType contentType = GetParam();
-
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
-  auto executor = std::make_shared<v1::MockHTTPExecutor>();
-
-  ExecutorID executorId = DEFAULT_EXECUTOR_ID;
-  TestContainerizer containerizer(executorId, executor);
-
-  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
-    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-
-  slave::Flags slaveFlags = MesosTest::CreateSlaveFlags();
-
-  Try<Owned<cluster::Slave>> slave =
-    StartSlave(detector.get(), &containerizer, slaveFlags);
-  ASSERT_SOME(slave);
-
-  Clock::advance(slaveFlags.registration_backoff_factor);
-
-  AWAIT_READY(slaveRegisteredMessage);
-
-  EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
-
-  Future<v1::scheduler::Event::Subscribed> subscribed;
-  EXPECT_CALL(*scheduler, subscribed(_, _))
-    .WillOnce(FutureArg<1>(&subscribed));
-
-  EXPECT_CALL(*scheduler, heartbeat(_))
-    .WillRepeatedly(Return()); // Ignore heartbeats.
-
-  Future<v1::scheduler::Event::Offers> offers;
-  EXPECT_CALL(*scheduler, offers(_, _))
-    .WillOnce(FutureArg<1>(&offers));
-
-  v1::scheduler::TestMesos mesos(
-      master.get()->pid,
-      contentType,
-      scheduler);
-
-  AWAIT_READY(subscribed);
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->offers().empty());
-
-  // Create an event stream after seeing first offer but before a task is
-  // launched. We should see one framework, one agent, and no tasks/executors.
-  v1::master::Call v1Call;
-  v1Call.set_type(v1::master::Call::SUBSCRIBE);
-
-  http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
-  headers["Accept"] = stringify(contentType);
-
-  Future<http::Response> response = http::streaming::post(
-      master.get()->pid,
-      "api/v1",
-      headers,
-      serialize(contentType, v1Call),
-      stringify(contentType));
-
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
-  AWAIT_EXPECT_RESPONSE_HEADER_EQ("chunked", "Transfer-Encoding", response);
-  ASSERT_EQ(http::Response::PIPE, response->type);
-  ASSERT_SOME(response->reader);
-
-  http::Pipe::Reader reader = response->reader.get();
-
-  auto deserializer =
-    lambda::bind(deserialize<v1::master::Event>, contentType, lambda::_1);
-
-  Reader<v1::master::Event> decoder(deserializer, reader);
-
-  Future<Result<v1::master::Event>> event = decoder.read();
-  AWAIT_READY(event);
-
-  EXPECT_EQ(v1::master::Event::SUBSCRIBED, event->get().type());
-  const v1::master::Response::GetState& getState =
-    event->get().subscribed().get_state();
-
-  EXPECT_EQ(1, getState.get_frameworks().frameworks_size());
-  EXPECT_EQ(1, getState.get_agents().agents_size());
-  EXPECT_TRUE(getState.get_tasks().tasks().empty());
-  EXPECT_TRUE(getState.get_executors().executors().empty());
-
-  event = decoder.read();
-
-  AWAIT_READY(event);
-
-  EXPECT_EQ(v1::master::Event::HEARTBEAT, event->get().type());
-
-  event = decoder.read();
-  EXPECT_TRUE(event.isPending());
-
-  // When the authorizer is called, return pending futures
-  // that we can satisfy later.
-  Promise<Owned<ObjectApprover>> taskAddedApprover;
-  Promise<Owned<ObjectApprover>> updateRunningApprover;
-  Promise<Owned<ObjectApprover>> updateFinishedApprover;
-
-  Sequence approverSequence;
-
-  // Each event results in 4 calls into the authorizer.
-  // NOTE: This may change when the operator event stream code is refactored
-  // to avoid unnecessary authorizer calls. See MESOS-8475.
-  EXPECT_CALL(authorizer, getObjectApprover(_, _))
-    .Times(4)
-    .InSequence(approverSequence)
-    .WillRepeatedly(Return(taskAddedApprover.future()));
-  EXPECT_CALL(authorizer, getObjectApprover(_, _))
-    .Times(4)
-    .InSequence(approverSequence)
-    .WillRepeatedly(Return(updateRunningApprover.future()));
-  EXPECT_CALL(authorizer, getObjectApprover(_, _))
-    .Times(4)
-    .InSequence(approverSequence)
-    .WillRepeatedly(Return(updateFinishedApprover.future()));
-
-  const v1::Offer& offer = offers->offers(0);
-
-  v1::AgentID slaveId(offer.agent_id());
-
-  v1::FrameworkID frameworkId(subscribed->framework_id());
-
-  EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(v1::scheduler::SendAcknowledge(frameworkId, slaveId))
-    .WillOnce(v1::scheduler::SendAcknowledge(frameworkId, slaveId));
-
-  // Capture the acknowledgement messages to the agent so that we can delay the
-  // authorizer until the master has processed the terminal acknowledgement.
-  // NOTE: These calls are in reverse order because they use `EXPECT_CALL` under
-  // the hood, and such expectations are evaluated in reverse order.
-  Future<StatusUpdateAcknowledgementMessage> acknowledgeFinished =
-    FUTURE_PROTOBUF(
-        StatusUpdateAcknowledgementMessage(),
-        master.get()->pid,
-        slave.get()->pid);
-  Future<StatusUpdateAcknowledgementMessage> acknowledgeRunning =
-    FUTURE_PROTOBUF(
-        StatusUpdateAcknowledgementMessage(),
-        master.get()->pid,
-        slave.get()->pid);
-
-  EXPECT_CALL(*executor, connected(_))
-    .WillOnce(v1::executor::SendSubscribe(frameworkId, evolve(executorId)));
-
-  EXPECT_CALL(*executor, subscribed(_, _));
-
-  EXPECT_CALL(*executor, launch(_, _))
-    .WillOnce(v1::executor::SendUpdateFromTask(
-        frameworkId, evolve(executorId), v1::TASK_RUNNING));
-
-  EXPECT_CALL(*executor, acknowledged(_, _))
-    .WillOnce(v1::executor::SendUpdateFromTaskID(
-        frameworkId, evolve(executorId), v1::TASK_FINISHED))
-    .WillOnce(Return());
-
-  TaskInfo task = createTask(devolve(offer), "", executorId);
-
-  mesos.send(v1::createCallAccept(
-      frameworkId,
-      offer,
-      {v1::LAUNCH({evolve(task)})}));
-
-  // Wait until the task has finished and task update acknowledgements
-  // have been processed to allow the authorizer to return.
-  AWAIT_READY(acknowledgeRunning);
-  AWAIT_READY(acknowledgeFinished);
-
-  {
-    taskAddedApprover.set(Owned<ObjectApprover>(new AcceptingObjectApprover()));
-
-    AWAIT_READY(event);
-
-    ASSERT_EQ(v1::master::Event::TASK_ADDED, event->get().type());
-    ASSERT_EQ(evolve(task.task_id()),
-              event->get().task_added().task().task_id());
-  }
-
-  event = decoder.read();
-
-  {
-    updateRunningApprover.set(Owned<ObjectApprover>(
-        new AcceptingObjectApprover()));
-
-    AWAIT_READY(event);
-
-    ASSERT_EQ(v1::master::Event::TASK_UPDATED, event->get().type());
-    ASSERT_EQ(v1::TASK_RUNNING,
-              event->get().task_updated().state());
-    ASSERT_EQ(v1::TASK_RUNNING,
-              event->get().task_updated().status().state());
-    ASSERT_EQ(evolve(task.task_id()),
-              event->get().task_updated().status().task_id());
-  }
-
-  event = decoder.read();
-
-  {
-    updateFinishedApprover.set(Owned<ObjectApprover>(
-        new AcceptingObjectApprover()));
-
-    AWAIT_READY(event);
-
-    ASSERT_EQ(v1::master::Event::TASK_UPDATED, event->get().type());
-    ASSERT_EQ(v1::TASK_FINISHED,
-              event->get().task_updated().state());
-    ASSERT_EQ(v1::TASK_FINISHED,
-              event->get().task_updated().status().state());
-    ASSERT_EQ(evolve(task.task_id()),
-              event->get().task_updated().status().task_id());
-  }
-
-  EXPECT_TRUE(reader.close());
-
-  EXPECT_CALL(authorizer, getObjectApprover(_, _))
-    .WillRepeatedly(Return(Owned<ObjectApprover>(
-        new AcceptingObjectApprover())));
-
-  EXPECT_CALL(*executor, shutdown(_))
-    .Times(AtMost(1));
-
-  EXPECT_CALL(*executor, disconnected(_))
-    .Times(AtMost(1));
-}
-
-
 // This test tries to verify that a client subscribed to the 'api/v1' endpoint
 // can receive `FRAMEWORK_ADDED`, `FRAMEWORK_UPDATED` and 'FRAMEWORK_REMOVED'
 // events.
@@ -3576,6 +3351,12 @@ TEST_P(MasterAPITest, FrameworksEvent)
   // when it reconnects.
   frameworkInfo.set_failover_timeout(Weeks(2).secs());
 
+  // We need to set `checkpoint` explicitly. Otherwise, `jsonify` in the
+  // scheduler driver sets it to the default value, which results in a spurious
+  // diff between the reported `FrameworkInfo` (`checkpoint == false`) and the
+  // one with which the scheduler has subscribed (`checkpoint` not set).
+  frameworkInfo.set_checkpoint(false);
+
   mesos.send(v1::createCallSubscribe(frameworkInfo));
 
   AWAIT_READY(subscribed);
@@ -3585,15 +3366,20 @@ TEST_P(MasterAPITest, FrameworksEvent)
 
   AWAIT_READY(event);
 
+  ::mesos::v1::TimeInfo registeredTime;
   {
     EXPECT_EQ(v1::master::Event::FRAMEWORK_ADDED, event.get()->type());
 
     const v1::master::Response::GetFrameworks::Framework& framework =
       event.get()->framework_added().framework();
 
-    EXPECT_EQ(frameworkInfo, framework.framework_info());
+    EXPECT_NONE(
+        mesos::v1::typeutils::diff(frameworkInfo, framework.framework_info()));
+
     EXPECT_TRUE(framework.active());
     EXPECT_TRUE(framework.connected());
+
+    registeredTime = framework.registered_time();
   }
 
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -3627,7 +3413,14 @@ TEST_P(MasterAPITest, FrameworksEvent)
     const v1::master::Response::GetFrameworks::Framework& framework =
       event.get()->framework_updated().framework();
 
-    EXPECT_EQ(frameworkInfo, framework.framework_info());
+    EXPECT_NONE(
+        mesos::v1::typeutils::diff(frameworkInfo, framework.framework_info()));
+
+    EXPECT_EQ(registeredTime, framework.registered_time());
+
+    EXPECT_LT(
+        registeredTime.nanoseconds(),
+        framework.reregistered_time().nanoseconds());
   }
 
   EXPECT_CALL(*scheduler, disconnected(_))

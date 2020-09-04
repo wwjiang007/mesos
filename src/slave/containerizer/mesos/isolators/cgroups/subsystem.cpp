@@ -116,13 +116,15 @@ Future<Nothing> Subsystem::recover(
 
 Future<Nothing> Subsystem::prepare(
     const ContainerID& containerId,
-    const string& cgroup)
+    const string& cgroup,
+    const mesos::slave::ContainerConfig& containerConfig)
 {
   return process::dispatch(
       process.get(),
       &SubsystemProcess::prepare,
       containerId,
-      cgroup);
+      cgroup,
+      containerConfig);
 }
 
 
@@ -155,14 +157,16 @@ Future<mesos::slave::ContainerLimitation> Subsystem::watch(
 Future<Nothing> Subsystem::update(
     const ContainerID& containerId,
     const string& cgroup,
-    const Resources& resources)
+    const Resources& resourceRequests,
+    const google::protobuf::Map<string, Value::Scalar>& resourceLimits)
 {
   return process::dispatch(
       process.get(),
       &SubsystemProcess::update,
       containerId,
       cgroup,
-      resources);
+      resourceRequests,
+      resourceLimits);
 }
 
 
@@ -219,7 +223,8 @@ Future<Nothing> SubsystemProcess::recover(
 
 Future<Nothing> SubsystemProcess::prepare(
     const ContainerID& containerId,
-    const string& cgroup)
+    const string& cgroup,
+    const mesos::slave::ContainerConfig& containerConfig)
 {
   return Nothing();
 }
@@ -245,7 +250,8 @@ Future<ContainerLimitation> SubsystemProcess::watch(
 Future<Nothing> SubsystemProcess::update(
     const ContainerID& containerId,
     const string& cgroup,
-    const Resources& resources)
+    const Resources& resourceRequests,
+    const google::protobuf::Map<string, Value::Scalar>& resourceLimits)
 {
   return Nothing();
 }

@@ -24,7 +24,7 @@
 
 #include <mesos/mesos.hpp>
 
-#include <mesos/csi/types.hpp>
+#include <mesos/secret/resolver.hpp>
 
 #include <process/future.hpp>
 #include <process/grpc.hpp>
@@ -39,6 +39,7 @@
 
 #include "csi/metrics.hpp"
 #include "csi/service_manager.hpp"
+#include "csi/state.hpp"
 #include "csi/volume_manager.hpp"
 
 namespace mesos {
@@ -58,7 +59,8 @@ public:
       const hashset<Service>& services,
       const process::grpc::client::Runtime& runtime,
       ServiceManager* serviceManager,
-      Metrics* metrics);
+      Metrics* metrics,
+      SecretResolver* secretResolver);
 
   // Since this class contains `Owned` members which should not but can be
   // copied, explicitly make this class non-copyable.
@@ -74,20 +76,20 @@ public:
   process::Future<std::vector<VolumeInfo>> listVolumes() override;
 
   process::Future<Bytes> getCapacity(
-      const types::VolumeCapability& capability,
+      const Volume::Source::CSIVolume::VolumeCapability& capability,
       const google::protobuf::Map<std::string, std::string>& parameters)
     override;
 
   process::Future<VolumeInfo> createVolume(
       const std::string& name,
       const Bytes& capacity,
-      const types::VolumeCapability& capability,
+      const Volume::Source::CSIVolume::VolumeCapability& capability,
       const google::protobuf::Map<std::string, std::string>& parameters)
     override;
 
   process::Future<Option<Error>> validateVolume(
       const VolumeInfo& volumeInfo,
-      const types::VolumeCapability& capability,
+      const Volume::Source::CSIVolume::VolumeCapability& capability,
       const google::protobuf::Map<std::string, std::string>& parameters)
     override;
 
@@ -97,7 +99,9 @@ public:
 
   process::Future<Nothing> detachVolume(const std::string& volumeId) override;
 
-  process::Future<Nothing> publishVolume(const std::string& volumeId) override;
+  process::Future<Nothing> publishVolume(
+      const std::string& volumeId,
+      const Option<state::VolumeState>& volumeState = None()) override;
 
   process::Future<Nothing> unpublishVolume(
       const std::string& volumeId) override;

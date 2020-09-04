@@ -49,11 +49,13 @@ We categorize the changes as follows:
   <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Mesos Core-->
     <ul style="padding-left:10px;">
       <li>D <a href="#1-10-x-ssl-env-var-rename">Renamed LIBPROCESS_SSL_VERIFY_CERT and LIBPROCESS_SSL_REQUIRE_CERT environment variables.</a></li>
+      <li>D <a href="#1-10-x-limits-cfs-quota">CPU limits affect the function of the agent's `cgroups_enable_cfs` flag.</a></li>
     </ul>
  </td>
 
   <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Flags-->
     <ul style="padding-left:10px;">
+      <li>C <a href="#1-10-x-agent-features">agent_features</a></li>
     </ul>
   </td>
 
@@ -64,11 +66,14 @@ We categorize the changes as follows:
 
   <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Module API-->
     <ul style="padding-left:10px;">
+      <li>C <a href="#1-10-x-synchronous-authorization">Authorizers must support synchronous authorization.</a></li>
+      <li>AC <a href="#1-10-x-allocator-module-changes">Resource consumption is exposed to allocators.</a></li>
     </ul>
   </td>
 
   <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Endpoints-->
     <ul style="padding-left:10px;">
+      <li>D <a href="#1-10-x-tasks-pending-authoirization-deprecated">v1 GetTasks pending_tasks</a></li>
     </ul>
   </td>
 </tr>
@@ -557,6 +562,40 @@ We categorize the changes as follows:
 * The canonical name for the environment variable `LIBPROCESS_SSL_VERIFY_CERT` was changed to `LIBPROCESS_SSL_VERIFY_SERVER_CERT`.
   The canonical name for the environment variable `LIBPROCESS_SSL_REQUIRE_CERT` was changed to `LIBPROCESS_SSL_REQUIRE_CLIENT_CERT`.
   The old names will continue to work as before, but operators are encouraged to update their configuration to reduce confusion.
+
+<a name="1-10-x-limits-cfs-quota"></a>
+
+* The Mesos agent's `cgroups_enable_cfs` flag previously controlled whether or not CFS quota would be used for all tasks on the agent. Resource limits have been added to tasks, and when a CPU limit is specified on a task, the agent will now apply a CFS quota regardless of the value of `cgroups_enable_cfs`.
+
+<a name="1-10-x-agent-features"></a>
+
+* The Mesos agent now requires the new `TASK_RESOURCE_LIMITS` feature. This capability is set by default, but if the `--agent_features` flag is specified explicitly, `TASK_RESOURCE_LIMITS` must be included.
+
+<a name="1-10-x-synchronous-authorization"></a>
+
+* Authorizers now must implement a method `getApprover(...)` (see the
+  [authorization documentation](authorization.md#implementing-an-authorizer)
+  and [MESOS-10056](https://issues.apache.org/jira/browse/MESOS-10056))
+  that returns `ObjectApprover`s that are valid throughout their whole lifetime.
+  Keeping the state of an `ObjectApprover` up-to-date becomes a responsibility
+  of the authorizer. This is a **breaking change** for authorizer modules.
+
+<a name="1-10-x-tasks-pending-authoirization-deprecated"></a>
+
+* The field `pending_tasks` in `GetTasks` master API call has been deprecated.
+  From now on, this field will be empty. Moreover, the notion of
+  *tasks pending authorization* no longer exists
+  (see [MESOS-10056](https://issues.apache.org/jira/browse/MESOS-10056)).
+
+
+<a name="1-10-x-allocator-module-changes"></a>
+
+* Allocator interface has been changed to supply allocator with information on
+  resources actually consumed by frameworks. A method
+  `transitionOfferedToAllocated(...)` has been added and the signature of
+  `recoverResources(...)` has been extended. Note that allocators must implement
+  these new/extended method signatures, but are free to ignore resource
+  consumption data provided by master.
 
 ## Upgrading from 1.8.x to 1.9.x ##
 

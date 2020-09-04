@@ -231,6 +231,12 @@
   jira_user: drcrallen
   reviewboard_user: drcrallen
 
+- name: Charles-Francois Natali
+  emails:
+    - cf.natali@gmail.com
+  jira_user: cf.natali
+  reviewboard_user: cf.natali
+
 - name: Chen Runcong
   affiliations:
     - {organization: Asiainfo}
@@ -940,3 +946,12 @@
     - xingzhou@cn.ibm.com
   jira_user: dongdong
   reviewboard_user: dongdong
+
+- name: Dong Zhu
+  affiliations:
+    - {organization: D2IQ}
+  emails:
+    - dzhu@d2iq.com
+    - bluezhudong@gmail.com
+  jira_user: dzhu
+  reviewboard_user: dzhu

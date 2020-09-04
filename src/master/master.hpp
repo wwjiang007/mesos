@@ -24,6 +24,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <mesos/mesos.hpp>
@@ -51,7 +52,6 @@
 #include <process/owned.hpp>
 #include <process/process.hpp>
 #include <process/protobuf.hpp>
-#include <process/sequence.hpp>
 #include <process/timer.hpp>
 
 #include <process/metrics/counter.hpp>
@@ -79,6 +79,7 @@
 #include "internal/devolve.hpp"
 #include "internal/evolve.hpp"
 
+#include "master/authorization.hpp"
 #include "master/constants.hpp"
 #include "master/flags.hpp"
 #include "master/machine.hpp"
@@ -234,12 +235,6 @@ Slave(Master* const _master,
   // and `removeExecutor()` are used, and provide a const view into
   // the executors.
   hashmap<FrameworkID, hashmap<ExecutorID, ExecutorInfo>> executors;
-
-  // Tasks that have not yet been launched because they are currently
-  // being authorized. This is similar to Framework's pendingTasks but we
-  // track pendingTasks per agent separately to determine if any offer
-  // operation for this agent would change resources requested by these tasks.
-  hashmap<FrameworkID, hashmap<TaskID, TaskInfo>> pendingTasks;
 
   // Tasks present on this slave.
   //
@@ -618,37 +613,41 @@ protected:
   // Add a framework.
   void addFramework(
       Framework* framework,
-      const std::set<std::string>& suppressedRoles);
+      ::mesos::allocator::FrameworkOptions&& allocatorOptions);
 
   // Recover a framework from its `FrameworkInfo`. This happens after
   // master failover, when an agent running one of the framework's
   // tasks reregisters or when the framework itself reregisters,
   // whichever happens first. The result of this function is a
-  // registered, inactive framework with state `RECOVERED`.
-  void recoverFramework(
-      const FrameworkInfo& info,
-      const std::set<std::string>& suppressedRoles);
+  // registered, inactive framework with state `RECOVERED` and empty
+  // FrameworkOptions in the allocator.
+  void recoverFramework(const FrameworkInfo& info);
 
   // Transition a framework from `RECOVERED` to `CONNECTED` state and
   // activate it. This happens at most once after master failover, the
   // first time that the framework reregisters with the new master.
   // Exactly one of `newPid` or `http` must be provided.
-  void activateRecoveredFramework(
+  void connectAndActivateRecoveredFramework(
       Framework* framework,
       const FrameworkInfo& frameworkInfo,
       const Option<process::UPID>& pid,
       const Option<StreamingHttpConnection<v1::scheduler::Event>>& http,
-      const std::set<std::string>& suppressedRoles);
+      const process::Owned<ObjectApprovers>& objectApprovers,
+      ::mesos::allocator::FrameworkOptions&& allocatorOptions);
 
   // Replace the scheduler for a framework with a new process ID, in
   // the event of a scheduler failover.
-  void failoverFramework(Framework* framework, const process::UPID& newPid);
+  void failoverFramework(
+      Framework* framework,
+      const process::UPID& newPid,
+      const process::Owned<ObjectApprovers>& objectApprovers);
 
   // Replace the scheduler for a framework with a new HTTP connection,
   // in the event of a scheduler failover.
   void failoverFramework(
       Framework* framework,
-      const StreamingHttpConnection<v1::scheduler::Event>& http);
+      const StreamingHttpConnection<v1::scheduler::Event>& http,
+      const process::Owned<ObjectApprovers>& objectApprovers);
 
   void _failoverFramework(Framework* framework);
 
@@ -673,7 +672,7 @@ protected:
   void updateFramework(
       Framework* framework,
       const FrameworkInfo& frameworkInfo,
-      const std::set<std::string>& suppressedRoles);
+      ::mesos::allocator::FrameworkOptions&& allocatorOptions);
 
   void sendFrameworkUpdates(const Framework& framework);
 
@@ -685,10 +684,6 @@ protected:
   // Removes the agent from the resource offer cycle (and rescinds active
   // offers). Other aspects of the agent will continue to function normally.
   void deactivate(Slave* slave);
-
-  // Adds the agent back to the resource offer cycle.
-  // Must *NOT* be called if the agent is `deactivated`.
-  void reactivate(Slave* slave);
 
   // Add a slave.
   void addSlave(
@@ -742,171 +737,18 @@ protected:
       const FrameworkInfo& frameworkInfo,
       const process::UPID& from);
 
-  // Returns whether the framework is authorized.
+  // Returns whether the principal is authorized for the specified
+  // action-object pair.
   // Returns failure for transient authorization failures.
-  process::Future<bool> authorizeFramework(
-      const FrameworkInfo& frameworkInfo);
+  process::Future<bool> authorize(
+      const Option<process::http::authentication::Principal>& principal,
+      authorization::ActionObject&& actionObject);
 
-  // Returns whether the principal is authorized to (re-)register an agent
-  // and whether the `SlaveInfo` is authorized.
-  process::Future<bool> authorizeSlave(
-      const SlaveInfo& slaveInfo,
-      const Option<process::http::authentication::Principal>& principal);
-
-  // Returns whether the task is authorized.
-  // Returns failure for transient authorization failures.
-  process::Future<bool> authorizeTask(
-      const TaskInfo& task,
-      Framework* framework);
-
-  /**
-   * Authorizes a `RESERVE` operation.
-   *
-   * Returns whether the Reserve operation is authorized with the
-   * provided principal. This function is used for authorization of
-   * operations originating from both frameworks and operators. Note
-   * that operations may be validated AFTER authorization, so it's
-   * possible that `reserve` could be malformed.
-   *
-   * @param reserve The `RESERVE` operation to be performed.
-   * @param principal An `Option` containing the principal attempting
-   *     this operation.
-   *
-   * @return A `Future` containing a boolean value representing the
-   *     success or failure of this authorization. A failed `Future`
-   *     implies that validation of the operation did not succeed.
-   */
-  process::Future<bool> authorizeReserveResources(
-      const Offer::Operation::Reserve& reserve,
-      const Option<process::http::authentication::Principal>& principal);
-
-  /**
-   * Authorizes an `UNRESERVE` operation.
-   *
-   * Returns whether the Unreserve operation is authorized with the
-   * provided principal. This function is used for authorization of
-   * operations originating both from frameworks and operators. Note
-   * that operations may be validated AFTER authorization, so it's
-   * possible that `unreserve` could be malformed.
-   *
-   * @param unreserve The `UNRESERVE` operation to be performed.
-   * @param principal An `Option` containing the principal attempting
-   *     this operation.
-   *
-   * @return A `Future` containing a boolean value representing the
-   *     success or failure of this authorization. A failed `Future`
-   *     implies that validation of the operation did not succeed.
-   */
-  process::Future<bool> authorizeUnreserveResources(
-      const Offer::Operation::Unreserve& unreserve,
-      const Option<process::http::authentication::Principal>& principal);
-
-  /**
-   * Authorizes a `CREATE` operation.
-   *
-   * Returns whether the Create operation is authorized with the provided
-   * principal. This function is used for authorization of operations
-   * originating both from frameworks and operators. Note that operations may be
-   * validated AFTER authorization, so it's possible that `create` could be
-   * malformed.
-   *
-   * @param create The `CREATE` operation to be performed.
-   * @param principal An `Option` containing the principal attempting this
-   *     operation.
-   *
-   * @return A `Future` containing a boolean value representing the success or
-   *     failure of this authorization. A failed `Future` implies that
-   *     validation of the operation did not succeed.
-   */
-  process::Future<bool> authorizeCreateVolume(
-      const Offer::Operation::Create& create,
-      const Option<process::http::authentication::Principal>& principal);
-
-  /**
-   * Authorizes a `DESTROY` operation.
-   *
-   * Returns whether the Destroy operation is authorized with the provided
-   * principal. This function is used for authorization of operations
-   * originating both from frameworks and operators. Note that operations may be
-   * validated AFTER authorization, so it's possible that `destroy` could be
-   * malformed.
-   *
-   * @param destroy The `DESTROY` operation to be performed.
-   * @param principal An `Option` containing the principal attempting this
-   *     operation.
-   *
-   * @return A `Future` containing a boolean value representing the success or
-   *     failure of this authorization. A failed `Future` implies that
-   *     validation of the operation did not succeed.
-   */
-  process::Future<bool> authorizeDestroyVolume(
-      const Offer::Operation::Destroy& destroy,
-      const Option<process::http::authentication::Principal>& principal);
-
-  /**
-   * Authorizes resize of a volume triggered by either `GROW_VOLUME` or
-   * `SHRINK_VOLUME` operations.
-   *
-   * Returns whether the triggering operation is authorized with the provided
-   * principal. This function is used for authorization of operations
-   * originating both from frameworks and operators. Note that operations may be
-   * validated AFTER authorization, so it's possible that the operation could be
-   * malformed.
-   *
-   * @param volume The volume being resized.
-   * @param principal An `Option` containing the principal attempting this
-   *     operation.
-   *
-   * @return A `Future` containing a boolean value representing the success or
-   *     failure of this authorization. A failed `Future` implies that
-   *     validation of the operation did not succeed.
-   */
-  process::Future<bool> authorizeResizeVolume(
-      const Resource& volume,
-      const Option<process::http::authentication::Principal>& principal);
-
-
-  /**
-   * Authorizes a `CREATE_DISK` operation.
-   *
-   * Returns whether the `CREATE_DISK` operation is authorized with the
-   * provided principal. This function is used for authorization of operations
-   * originating from frameworks. Note that operations may be validated AFTER
-   * authorization, so it's possible that the operation could be malformed.
-   *
-   * @param createDisk The `CREATE_DISK` operation to be performed.
-   * @param principal An `Option` containing the principal attempting this
-   *     operation.
-   *
-   * @return A `Future` containing a boolean value representing the success or
-   *     failure of this authorization. A failed `Future` implies that
-   *     validation of the operation did not succeed.
-   */
-  process::Future<bool> authorizeCreateDisk(
-      const Offer::Operation::CreateDisk& createDisk,
-      const Option<process::http::authentication::Principal>& principal);
-
-
-  /**
-   * Authorizes a `DESTROY_DISK` operation.
-   *
-   * Returns whether the `DESTROY_DISK` operation is authorized with the
-   * provided principal. This function is used for authorization of operations
-   * originating from frameworks. Note that operations may be validated AFTER
-   * authorization, so it's possible that the operation could be malformed.
-   *
-   * @param destroyDisk The `DESTROY_DISK` operation to be performed.
-   * @param principal An `Option` containing the principal attempting this
-   *     operation.
-   *
-   * @return A `Future` containing a boolean value representing the success or
-   *     failure of this authorization. A failed `Future` implies that
-   *     validation of the operation did not succeed.
-   */
-  process::Future<bool> authorizeDestroyDisk(
-      const Offer::Operation::DestroyDisk& destroyDisk,
-      const Option<process::http::authentication::Principal>& principal);
-
+  // Overload of authorize() for cases which require multiple action-object
+  // pairs to be authorized simultaneously.
+  process::Future<bool> authorize(
+      const Option<process::http::authentication::Principal>& principal,
+      std::vector<authorization::ActionObject>&& actionObjects);
 
   // Determine if a new executor needs to be launched.
   bool isLaunchExecutor (
@@ -1064,8 +906,8 @@ private:
       StreamingHttpConnection<v1::scheduler::Event> http,
       FrameworkInfo&& frameworkInfo,
       bool force,
-      google::protobuf::RepeatedPtrField<std::string>&& suppressedRoles,
-      const process::Future<bool>& authorized);
+      ::mesos::allocator::FrameworkOptions&& allocatorOptions,
+      const process::Future<process::Owned<ObjectApprovers>>& objectApprovers);
 
   void subscribe(
       const process::UPID& from,
@@ -1075,8 +917,8 @@ private:
       const process::UPID& from,
       FrameworkInfo&& frameworkInfo,
       bool force,
-      google::protobuf::RepeatedPtrField<std::string>&& suppressedRoles,
-      const process::Future<bool>& authorized);
+      ::mesos::allocator::FrameworkOptions&& allocatorOptions,
+      const process::Future<process::Owned<ObjectApprovers>>& objectApprovers);
 
   // Update framework via SchedulerDriver (i.e. no response
   // code feedback, FrameworkErrorMessage on error).
@@ -1088,14 +930,10 @@ private:
   process::Future<process::http::Response> updateFramework(
       mesos::scheduler::Call::UpdateFramework&& call);
 
-  process::Future<process::http::Response> _updateFramework(
-      mesos::scheduler::Call::UpdateFramework&& call,
-      const process::Future<bool>& authorized);
-
   // Subscribes a client to the 'api/vX' endpoint.
   void subscribe(
       const StreamingHttpConnection<v1::master::Event>& http,
-      const Option<process::http::authentication::Principal>& principal);
+      const process::Owned<ObjectApprovers>& approvers);
 
   void teardown(Framework* framework);
 
@@ -1106,9 +944,7 @@ private:
   void _accept(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
-      mesos::scheduler::Call::Accept&& accept,
-      const process::Future<
-          std::vector<process::Future<bool>>>& authorizations);
+      mesos::scheduler::Call::Accept&& accept);
 
   void acceptInverseOffers(
       Framework* framework,
@@ -1437,12 +1273,21 @@ private:
   };
 
 public:
-  // Inner class used to namespace HTTP handlers that do not change the
-  // underlying master object.
+  // Inner class used to namespace read-only HTTP handlers; these handlers
+  // may be executed in parallel.
   //
-  // Endpoints served by this handler are only permitted to depend on
-  // the request query parameters and the authorization filters to
-  // make caching of responses possible.
+  // A synchronously executed post-processing step is provided for any
+  // cases where the handler is not purely read-only and requires a
+  // synchronous write (i.e. it's not feasible to perform the write
+  // asynchronously (e.g. SUBSCRIBE cannot have a gap between serving
+  // the initial state and registering the subscriber, or else events
+  // will be missed in the interim)).
+  //
+  // The handlers are only permitted to depend on the output content
+  // type (derived from the request headers), the request query
+  // parameters and the authorization filters to de-duplicate identical
+  // responses (this does not de-duplicate all identical responses, e.g.
+  // different authz principal but same permissions).
   //
   // NOTE: Most member functions of this class are not routed directly but
   // dispatched from their corresponding handlers in the outer `Http` class.
@@ -1452,39 +1297,140 @@ public:
   class ReadOnlyHandler
   {
   public:
+    struct PostProcessing
+    {
+      struct Subscribe
+      {
+        process::Owned<ObjectApprovers> approvers;
+        StreamingHttpConnection<v1::master::Event> connection;
+      };
+
+      // Any additional post-processing cases will add additional
+      // cases into this variant.
+      Variant<Subscribe> state;
+    };
+
     explicit ReadOnlyHandler(const Master* _master) : master(_master) {}
 
     // /frameworks
-    process::http::Response frameworks(
+    std::pair<process::http::Response, Option<PostProcessing>> frameworks(
+        ContentType outputContentType,
         const hashmap<std::string, std::string>& queryParameters,
         const process::Owned<ObjectApprovers>& approvers) const;
 
     // /roles
-    process::http::Response roles(
+    std::pair<process::http::Response, Option<PostProcessing>> roles(
+        ContentType outputContentType,
         const hashmap<std::string, std::string>& queryParameters,
         const process::Owned<ObjectApprovers>& approvers) const;
 
     // /slaves
-    process::http::Response slaves(
+    std::pair<process::http::Response, Option<PostProcessing>> slaves(
+        ContentType outputContentType,
         const hashmap<std::string, std::string>& queryParameters,
         const process::Owned<ObjectApprovers>& approvers) const;
 
     // /state
-    process::http::Response state(
+    std::pair<process::http::Response, Option<PostProcessing>> state(
+        ContentType outputContentType,
         const hashmap<std::string, std::string>& queryParameters,
         const process::Owned<ObjectApprovers>& approvers) const;
 
     // /state-summary
-    process::http::Response stateSummary(
+    std::pair<process::http::Response, Option<PostProcessing>> stateSummary(
+        ContentType outputContentType,
         const hashmap<std::string, std::string>& queryParameters,
         const process::Owned<ObjectApprovers>& approvers) const;
 
     // /tasks
-    process::http::Response tasks(
+    std::pair<process::http::Response, Option<PostProcessing>> tasks(
+        ContentType outputContentType,
+        const hashmap<std::string, std::string>& queryParameters,
+        const process::Owned<ObjectApprovers>& approvers) const;
+
+    // master::Call::GET_STATE
+    std::pair<process::http::Response, Option<PostProcessing>> getState(
+        ContentType outputContentType,
+        const hashmap<std::string, std::string>& queryParameters,
+        const process::Owned<ObjectApprovers>& approvers) const;
+
+    // master::Call::GET_AGENTS
+    std::pair<process::http::Response, Option<PostProcessing>> getAgents(
+        ContentType outputContentType,
+        const hashmap<std::string, std::string>& queryParameters,
+        const process::Owned<ObjectApprovers>& approvers) const;
+
+    // master::Call::GET_FRAMEWORKS
+    std::pair<process::http::Response, Option<PostProcessing>> getFrameworks(
+        ContentType outputContentType,
+        const hashmap<std::string, std::string>& queryParameters,
+        const process::Owned<ObjectApprovers>& approvers) const;
+
+    // master::Call::GET_EXECUTORS
+    std::pair<process::http::Response, Option<PostProcessing>> getExecutors(
+        ContentType outputContentType,
+        const hashmap<std::string, std::string>& queryParameters,
+        const process::Owned<ObjectApprovers>& approvers) const;
+
+    // master::Call::GET_OPERATIONS
+    std::pair<process::http::Response, Option<PostProcessing>> getOperations(
+        ContentType outputContentType,
+        const hashmap<std::string, std::string>& queryParameters,
+        const process::Owned<ObjectApprovers>& approvers) const;
+
+    // master::Call::GET_TASKS
+    std::pair<process::http::Response, Option<PostProcessing>> getTasks(
+        ContentType outputContentType,
+        const hashmap<std::string, std::string>& queryParameters,
+        const process::Owned<ObjectApprovers>& approvers) const;
+
+    // master::Call::GET_ROLES
+    std::pair<process::http::Response, Option<PostProcessing>> getRoles(
+        ContentType outputContentType,
+        const hashmap<std::string, std::string>& queryParameters,
+        const process::Owned<ObjectApprovers>& approvers) const;
+
+    // master::Call::SUBSCRIBE
+    std::pair<process::http::Response, Option<PostProcessing>> subscribe(
+        ContentType outputContentType,
         const hashmap<std::string, std::string>& queryParameters,
         const process::Owned<ObjectApprovers>& approvers) const;
 
   private:
+    std::string serializeGetState(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::string serializeGetAgents(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::string serializeGetFrameworks(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::string serializeGetExecutors(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::string serializeGetOperations(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::string serializeGetTasks(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::string serializeGetRoles(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::string serializeSubscribe(
+        const process::Owned<ObjectApprovers>& approvers) const;
+
+    std::function<void(JSON::ObjectWriter*)> jsonifyGetState(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::function<void(JSON::ObjectWriter*)> jsonifyGetAgents(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::function<void(JSON::ObjectWriter*)> jsonifyGetFrameworks(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::function<void(JSON::ObjectWriter*)> jsonifyGetExecutors(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::function<void(JSON::ObjectWriter*)> jsonifyGetOperations(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::function<void(JSON::ObjectWriter*)> jsonifyGetTasks(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::function<void(JSON::ObjectWriter*)> jsonifyGetRoles(
+        const process::Owned<ObjectApprovers>& approvers) const;
+    std::function<void(JSON::ObjectWriter*)> jsonifySubscribe(
+        const process::Owned<ObjectApprovers>& approvers) const;
+
     const Master* master;
   };
 
@@ -1779,14 +1725,6 @@ private:
         const Option<process::http::authentication::Principal>& principal,
         ContentType contentType) const;
 
-    static std::function<void(JSON::ObjectWriter*)> jsonifyGetAgents(
-        const Master* master,
-        const process::Owned<ObjectApprovers>& approvers);
-    std::string serializeGetAgents(
-        const process::Owned<ObjectApprovers>& approvers) const;
-    mesos::master::Response::GetAgents _getAgents(
-        const process::Owned<ObjectApprovers>& approvers) const;
-
     process::Future<process::http::Response> getFlags(
         const mesos::master::Call& call,
         const Option<process::http::authentication::Principal>& principal,
@@ -1882,14 +1820,6 @@ private:
         const Option<process::http::authentication::Principal>& principal,
         ContentType contentType) const;
 
-    static std::function<void(JSON::ObjectWriter*)> jsonifyGetTasks(
-        const Master* master,
-        const process::Owned<ObjectApprovers>& approvers);
-    std::string serializeGetTasks(
-        const process::Owned<ObjectApprovers>& approvers) const;
-    mesos::master::Response::GetTasks _getTasks(
-        const process::Owned<ObjectApprovers>& approvers) const;
-
     process::Future<process::http::Response> createVolumes(
         const mesos::master::Call& call,
         const Option<process::http::authentication::Principal>& principal,
@@ -1925,39 +1855,15 @@ private:
         const Option<process::http::authentication::Principal>& principal,
         ContentType contentType) const;
 
-    static std::function<void(JSON::ObjectWriter*)> jsonifyGetFrameworks(
-        const Master* master,
-        const process::Owned<ObjectApprovers>& approvers);
-    std::string serializeGetFrameworks(
-        const process::Owned<ObjectApprovers>& approvers) const;
-    mesos::master::Response::GetFrameworks _getFrameworks(
-        const process::Owned<ObjectApprovers>& approvers) const;
-
     process::Future<process::http::Response> getExecutors(
         const mesos::master::Call& call,
         const Option<process::http::authentication::Principal>& principal,
         ContentType contentType) const;
 
-    static std::function<void(JSON::ObjectWriter*)> jsonifyGetExecutors(
-        const Master* master,
-        const process::Owned<ObjectApprovers>& approvers);
-    std::string serializeGetExecutors(
-        const process::Owned<ObjectApprovers>& approvers) const;
-    mesos::master::Response::GetExecutors _getExecutors(
-        const process::Owned<ObjectApprovers>& approvers) const;
-
     process::Future<process::http::Response> getState(
         const mesos::master::Call& call,
         const Option<process::http::authentication::Principal>& principal,
         ContentType contentType) const;
-
-    static std::function<void(JSON::ObjectWriter*)> jsonifyGetState(
-        const Master* master,
-        const process::Owned<ObjectApprovers>& approvers);
-    std::string serializeGetState(
-        const process::Owned<ObjectApprovers>& approvers) const;
-    mesos::master::Response::GetState _getState(
-        const process::Owned<ObjectApprovers>& approvers) const;
 
     static std::function<void(JSON::ObjectWriter*)> jsonifySubscribe(
         const Master* master,
@@ -2008,15 +1914,22 @@ private:
     // installation, we take some extra care to keep the backlog small.
     // In particular, all read-only requests are batched and executed in
     // parallel, instead of going through the master queue separately.
+    // The post-processing step, that depends on the handler, will be
+    // executed synchronously and serially after the parallel executions
+    // complete.
 
-    typedef process::http::Response
+    typedef std::pair<
+        process::http::Response,
+        Option<ReadOnlyHandler::PostProcessing>>
       (Master::ReadOnlyHandler::*ReadOnlyRequestHandler)(
+          ContentType,
           const hashmap<std::string, std::string>&,
           const process::Owned<ObjectApprovers>&) const;
 
     process::Future<process::http::Response> deferBatchedRequest(
         ReadOnlyRequestHandler handler,
         const Option<process::http::authentication::Principal>& principal,
+        ContentType outputContentType,
         const hashmap<std::string, std::string>& queryParameters,
         const process::Owned<ObjectApprovers>& approvers) const;
 
@@ -2025,13 +1938,10 @@ private:
     struct BatchedRequest
     {
       ReadOnlyRequestHandler handler;
+      ContentType outputContentType;
       hashmap<std::string, std::string> queryParameters;
       Option<process::http::authentication::Principal> principal;
       process::Owned<ObjectApprovers> approvers;
-
-      // NOTE: The returned response should be either of type
-      // `BODY` or `PATH`, since `PIPE`-type responses would
-      // break the deduplication mechanism.
       process::Promise<process::http::Response> promise;
     };
 
@@ -2299,7 +2209,7 @@ private:
     {
       Subscriber(
           const StreamingHttpConnection<v1::master::Event>& _http,
-          const Option<process::http::authentication::Principal> _principal)
+          const process::Owned<ObjectApprovers>& _approvers)
         : http(_http),
           heartbeater(
               "subscriber " + stringify(http.streamId),
@@ -2311,25 +2221,19 @@ private:
               http,
               DEFAULT_HEARTBEAT_INTERVAL,
               DEFAULT_HEARTBEAT_INTERVAL),
-          principal(_principal) {}
+          approvers(_approvers) {}
+
 
       // Not copyable, not assignable.
       Subscriber(const Subscriber&) = delete;
       Subscriber& operator=(const Subscriber&) = delete;
 
-      // Creates object approvers. The futures returned by this method will be
-      // completed in the calling order.
-      process::Future<process::Owned<ObjectApprovers>> getApprovers(
-          const Option<Authorizer*>& authorizer,
-          std::initializer_list<authorization::Action> actions);
-
       // TODO(greggomann): Refactor this function into multiple event-specific
       // overloads. See MESOS-8475.
       void send(
-          const process::Shared<mesos::master::Event>& event,
-          const process::Owned<ObjectApprovers>& approvers,
-          const process::Shared<FrameworkInfo>& frameworkInfo,
-          const process::Shared<Task>& task);
+          const mesos::master::Event& event,
+          const Option<FrameworkInfo>& frameworkInfo,
+          const Option<Task>& task);
 
       ~Subscriber()
       {
@@ -2342,16 +2246,12 @@ private:
 
       StreamingHttpConnection<v1::master::Event> http;
       ResponseHeartbeater<mesos::master::Event, v1::master::Event> heartbeater;
-      const Option<process::http::authentication::Principal> principal;
-
-      // We maintain a sequence to coordinate the creation of object approvers
-      // in order to sequentialize all events to the subscriber.
-      process::Sequence approversSequence;
+      const process::Owned<ObjectApprovers> approvers;
     };
 
     // Sends the event to all subscribers connected to the 'api/vX' endpoint.
     void send(
-        mesos::master::Event&& event,
+        const mesos::master::Event& event,
         const Option<FrameworkInfo>& frameworkInfo = None(),
         const Option<Task>& task = None());
 
@@ -2479,6 +2379,9 @@ private:
   process::Time startTime; // Start time used to calculate uptime.
 
   Option<process::Time> electedTime; // Time when this master is elected.
+
+  ::mesos::allocator::OfferConstraintsFilter::Options
+    offerConstraintsFilterOptions;
 };
 
 
@@ -2499,28 +2402,28 @@ struct Framework
     // agents that are running tasks for the framework.
     RECOVERED,
 
-    // Framework was previously connected to this master. A framework
-    // becomes disconnected when there is a socket error.
-    DISCONNECTED,
+    // The framework is connected. The framework may or may not be eligible to
+    // receive offers; this property is tracked separately.
+    CONNECTED,
 
-    // The framework is connected but not active.
-    INACTIVE,
-
-    // Framework is connected and eligible to receive offers. No
-    // offers will be made to frameworks that are not active.
-    ACTIVE
+    // Framework was previously connected to this master,
+    // but is not connected now.
+    DISCONNECTED
   };
 
-  Framework(Master* const master,
-            const Flags& masterFlags,
-            const FrameworkInfo& info,
-            const process::UPID& _pid,
-            const process::Time& time = process::Clock::now());
+  Framework(
+      Master* const master,
+      const Flags& masterFlags,
+      const FrameworkInfo& info,
+      const process::UPID& _pid,
+      const process::Owned<ObjectApprovers>& objectApprovers,
+      const process::Time& time = process::Clock::now());
 
   Framework(Master* const master,
             const Flags& masterFlags,
             const FrameworkInfo& info,
             const StreamingHttpConnection<v1::scheduler::Event>& _http,
+            const process::Owned<ObjectApprovers>& objectApprovers,
             const process::Time& time = process::Clock::now());
 
   Framework(Master* const master,
@@ -2587,28 +2490,54 @@ struct Framework
   // 'webui_url', 'capabilities', and 'labels'.
   void update(const FrameworkInfo& newInfo);
 
-  void updateConnection(const process::UPID& newPid);
+  // Reactivate framework with new connection: update connection-related state
+  // and mark the framework as CONNECTED, regardless of the previous state.
+  void updateConnection(
+      const process::UPID& newPid,
+      const process::Owned<ObjectApprovers>& objectApprovers);
 
   void updateConnection(
-      const StreamingHttpConnection<v1::scheduler::Event>& newHttp);
+      const StreamingHttpConnection<v1::scheduler::Event>& newHttp,
+      const process::Owned<ObjectApprovers>& objectApprovers);
 
-  // Closes the HTTP connection and stops the heartbeat.
-  //
-  // TODO(vinod): Currently `state` variable is set separately
-  // from this method. We need to make sure these are in sync.
-  void closeHttpConnection();
+  // If the framework is CONNECTED, clear all state associated with
+  // the scheduler being connected (close http connection, stop heartbeater,
+  // clear object approvers, etc.), mark the framework DISCONNECTED and return
+  // `true`. Otherwise, return `false`.
+  bool disconnect();
+
+  // Mark the framework as active (eligible to receive offers if connected)
+  // or inactive. Returns true if this property changed, false otherwise.
+  bool activate();
+  bool deactivate();
 
   void heartbeat();
 
-  bool active() const;
-  bool connected() const;
-  bool recovered() const;
+  bool active() const { return active_; }
+
+  bool connected() const {return state == State::CONNECTED;}
+  bool recovered() const {return state == State::RECOVERED;}
 
   bool isTrackedUnderRole(const std::string& role) const;
   void trackUnderRole(const std::string& role);
   void untrackUnderRole(const std::string& role);
 
-  void setFrameworkState(const State& _state);
+  const Option<StreamingHttpConnection<v1::scheduler::Event>>& http() const
+  {
+    return http_;
+  }
+
+  const Option<process::UPID>& pid() const { return pid_; }
+
+  // Returns ObjectApprovers for all actions
+  // needed to authorize scheduler API calls.
+  static process::Future<process::Owned<ObjectApprovers>> createObjectApprovers(
+      const Option<Authorizer*>& _authorizer,
+      const FrameworkInfo& frameworkInfo);
+
+  // Returns whether the framework principal is authorized to perform
+  // action on object.
+  Try<bool> approved(const authorization::ActionObject& actionObject) const;
 
   Master* const master;
 
@@ -2618,22 +2547,9 @@ struct Framework
 
   protobuf::framework::Capabilities capabilities;
 
-  // Frameworks can either be connected via HTTP or by message passing
-  // (scheduler driver). At most one of `http` and `pid` will be set
-  // according to the last connection made by the framework; neither
-  // field will be set if the framework is in state `RECOVERED`.
-  Option<StreamingHttpConnection<v1::scheduler::Event>> http;
-  Option<process::UPID> pid;
-
-  State state;
-
   process::Time registeredTime;
   process::Time reregisteredTime;
   process::Time unregisteredTime;
-
-  // Tasks that have not yet been launched because they are currently
-  // being authorized.
-  hashmap<TaskID, TaskInfo> pendingTasks;
 
   // TODO(bmahler): Make this private to enforce that `addTask()` and
   // `removeTask()` are used, and provide a const view into the tasks.
@@ -2702,10 +2618,6 @@ struct Framework
   Resources totalOfferedResources;
   hashmap<SlaveID, Resources> offeredResources;
 
-  // This is only set for HTTP frameworks.
-  process::Owned<ResponseHeartbeater<scheduler::Event, v1::scheduler::Event>>
-    heartbeater;
-
   // This is used for per-framework metrics.
   FrameworkMetrics metrics;
 
@@ -2714,10 +2626,38 @@ private:
             const Flags& masterFlags,
             const FrameworkInfo& _info,
             State state,
+            bool active,
+            const process::Owned<ObjectApprovers>& objectApprovers,
             const process::Time& time);
 
   Framework(const Framework&);              // No copying.
   Framework& operator=(const Framework&); // No assigning.
+
+  // Indicates whether this framework should be receiving offers
+  // when it is connected.
+  bool active_;
+
+  // NOTE: `state` should never modified by means other than `setState()`.
+  //
+  // TODO(asekretenko): Encapsulate `state` to ensure that `metrics.subscribed`
+  // is updated together with any `state` change.
+  State state;
+
+  void setState(State state_);
+
+  // Frameworks can either be connected via HTTP or by message passing
+  // (scheduler driver). At most one of `http` and `pid` will be set
+  // according to the last connection made by the framework; neither
+  // field will be set if the framework is in state `RECOVERED`.
+  Option<StreamingHttpConnection<v1::scheduler::Event>> http_;
+  Option<process::UPID> pid_;
+
+  // This is only set for HTTP frameworks.
+  process::Owned<ResponseHeartbeater<scheduler::Event, v1::scheduler::Event>>
+    heartbeater;
+
+  // ObjectApprovers for the framework's principal.
+  process::Owned<ObjectApprovers> objectApprovers;
 };
 
 
@@ -2744,13 +2684,13 @@ void Framework::send(const Message& message)
     // that one of `http` or `pid` is set if the framework is connected.
   }
 
-  if (http.isSome()) {
-    if (!http->send(message)) {
+  if (http_.isSome()) {
+    if (!http_->send(message)) {
       LOG(WARNING) << "Unable to send message to framework " << *this << ":"
                    << " connection closed";
     }
-  } else if (pid.isSome()) {
-    master->send(pid.get(), message);
+  } else if (pid().isSome()) {
+    master->send(pid().get(), message);
   } else {
     LOG(WARNING) << "Unable to send message to framework " << *this << ":"
                  << " framework is recovered but has not reregistered";
@@ -2766,23 +2706,6 @@ inline const FrameworkID Framework::id() const
 }
 
 
-inline bool Framework::active() const
-{
-  return state == ACTIVE;
-}
-
-
-inline bool Framework::connected() const
-{
-  return state == ACTIVE || state == INACTIVE;
-}
-
-
-inline bool Framework::recovered() const
-{
-  return state == RECOVERED;
-}
-
 
 inline std::ostream& operator<<(
     std::ostream& stream,
@@ -2792,8 +2715,8 @@ inline std::ostream& operator<<(
   // updated on framework failover (MESOS-1784).
   stream << framework.id() << " (" << framework.info.name() << ")";
 
-  if (framework.pid.isSome()) {
-    stream << " at " << framework.pid.get();
+  if (framework.pid().isSome()) {
+    stream << " at " << framework.pid().get();
   }
 
   return stream;
@@ -2831,6 +2754,11 @@ struct Role
 
   hashmap<FrameworkID, Framework*> frameworks;
 };
+
+
+mesos::master::Response::GetFrameworks::Framework model(
+    const Framework& framework);
+
 
 } // namespace master {
 } // namespace internal {

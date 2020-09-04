@@ -93,7 +93,8 @@ Example:
   <td>
 JSON representation of agent features to whitelist. We always require
 'MULTI_ROLE', 'HIERARCHICAL_ROLE', 'RESERVATION_REFINEMENT',
-'AGENT_OPERATION_FEEDBACK', and 'AGENT_DRAINING'.
+'AGENT_OPERATION_FEEDBACK', 'RESOURCE_PROVIDER', 'AGENT_DRAINING', and
+'TASK_RESOURCE_LIMITS'.
 <p/>
 Example:
 <pre><code>
@@ -103,7 +104,9 @@ Example:
         {"type": "HIERARCHICAL_ROLE"},
         {"type": "RESERVATION_REFINEMENT"},
         {"type": "AGENT_OPERATION_FEEDBACK"},
-        {"type": "AGENT_DRAINING"}
+        {"type": "RESOURCE_PROVIDER"},
+        {"type": "AGENT_DRAINING"},
+        {"type": "TASK_RESOURCE_LIMITS"}
     ]
 }
 </pre></code>
@@ -808,6 +811,25 @@ users. By default, this flag is off. (default: false)
   </td>
 </tr>
 
+<tr id="domain_socket_location">
+  <td>
+    --domain_socket_location=VALUE
+  </td>
+  <td>
+Location on the host filesystem of the domain socket used for
+communication with executors. Alternatively, this can be set to
+<code>'systemd:&lt;identifier&gt;'</code> to use the domain socket
+with the given identifier, which is expected to be passed by systemd.
+
+This flag will be ignored unless the <code>--http_executor_domain_sockets</code>
+flag is also set to true.
+
+Total path length must be less than 108 characters.
+
+Will be set to <code>&lt;runtime_dir&gt;/agent.sock</code> by default.
+  </td>
+</tr>
+
 <tr id="enforce_container_disk_quota">
   <td>
     --[no-]enforce_container_disk_quota
@@ -1073,6 +1095,18 @@ executor library to interact with the Mesos agent. If set to <code>false</code>,
 the driver based implementation would be used.
 <b>NOTE</b>: This flag is *experimental* and should not be used in
 production yet. (default: false)
+  </td>
+</tr>
+
+
+<tr id="http_executor_domain_sockets">
+  <td>
+      --http_executor_domain_sockets
+  </td>
+  <td>
+If true, the agent will provide a unix domain sockets that the
+executor can use to connect to the agent, instead of relying on
+a TCP connection.
   </td>
 </tr>
 
@@ -1473,6 +1507,54 @@ Example config file in this directory:
 <pre><code>{
   "type": "org.mesos.apache.rp.local.storage",
   "name": "lvm"
+}</code></pre>
+  </td>
+</tr>
+
+<tr id="csi_plugin_config_dir">
+  <td>
+    --csi_plugin_config_dir=VALUE
+  </td>
+  <td>
+Path to a directory that contains CSI plugin configs.
+Each file in the config dir should contain a JSON object representing
+a <code>CSIPluginInfo</code> object which can be either a managed CSI
+plugin (i.e. the plugin launched by Mesos as a standalone container)
+or an unmanaged CSI plugin (i.e. the plugin launched out of Mesos).
+<p/>
+Example config files in this directory:
+<pre><code>{
+  "type": "org.apache.mesos.csi.managed-plugin",
+  "containers": [
+    {
+      "services": [
+        "CONTROLLER_SERVICE",
+        "NODE_SERVICE"
+      ],
+      "command": {
+        "shell": false,
+        "value": "managed-plugin",
+        "arguments": [
+          "managed-plugin",
+          "--endpoint=$(CSI_ENDPOINT)"
+        ]
+      },
+      "resources": [
+        {"name": "cpus", "type": "SCALAR", "scalar": {"value": 0.1}},
+        {"name": "mem", "type": "SCALAR", "scalar": {"value": 1024}}
+      ]
+    }
+  ]
+}</code></pre>
+<pre><code>{
+  "type": "org.apache.mesos.csi.unmanaged-plugin",
+  "endpoints": [
+    {
+      "csi_service": "NODE_SERVICE",
+      "endpoint": "/var/lib/unmanaged-plugin/csi.sock"
+    }
+  ],
+  "target_path_root": "/mnt/unmanaged-plugin"
 }</code></pre>
   </td>
 </tr>

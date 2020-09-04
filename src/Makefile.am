@@ -44,6 +44,7 @@ PICOJSON = 3rdparty/picojson-$(PICOJSON_VERSION)
 PIP = 3rdparty/pip-$(PIP_VERSION)
 PROTOBUF = 3rdparty/protobuf-$(PROTOBUF_VERSION)
 RAPIDJSON = 3rdparty/rapidjson-$(RAPIDJSON_VERSION)
+RE2 = 3rdparty/re2-$(RE2_VERSION)
 SETUPTOOLS = 3rdparty/setuptools-$(SETUPTOOLS_VERSION)
 STOUT = 3rdparty/stout
 WHEEL = 3rdparty/wheel-$(WHEEL_VERSION)
@@ -239,8 +240,10 @@ LIB_LIBSECCOMP = -lseccomp
 endif
 endif
 
+if ENABLE_NVML
 if WITH_BUNDLED_NVML
 MESOS_CPPFLAGS += -I../$(NVML)
+endif
 endif
 
 if WITH_BUNDLED_PICOJSON
@@ -262,6 +265,15 @@ endif
 if WITH_BUNDLED_RAPIDJSON
 MESOS_CPPFLAGS += -I../$(RAPIDJSON)/include
 endif
+
+if WITH_BUNDLED_RE2
+MESOS_CPPFLAGS += -I../$(RE2)
+LIB_RE2 = ../$(RE2)/obj/libre2.a
+else
+LIB_RE2 = -lre2
+LDADD += -lre2
+endif
+
 
 if WITH_BUNDLED_STOUT
 MESOS_CPPFLAGS += -I$(top_srcdir)/$(STOUT)/include
@@ -291,7 +303,6 @@ APPC_SPEC_PROTO = $(top_srcdir)/include/mesos/appc/spec.proto
 AUTHENTICATION_PROTO = $(top_srcdir)/include/mesos/authentication/authentication.proto
 AUTHORIZATION_PROTO = $(top_srcdir)/include/mesos/authorizer/authorizer.proto
 CONTAINERIZER_PROTO = $(top_srcdir)/include/mesos/slave/containerizer.proto
-CSI_TYPES_PROTO = $(top_srcdir)/include/mesos/csi/types.proto
 DOCKER_SPEC_PROTO = $(top_srcdir)/include/mesos/docker/spec.proto
 DOCKER_V1_PROTO = $(top_srcdir)/include/mesos/docker/v1.proto
 DOCKER_V2_PROTO = $(top_srcdir)/include/mesos/docker/v2.proto
@@ -413,6 +424,8 @@ CXX_PROTOS +=								\
   slave/containerizer/mesos/isolators/docker/volume/state.pb.h		\
   slave/containerizer/mesos/isolators/network/cni/spec.pb.cc		\
   slave/containerizer/mesos/isolators/network/cni/spec.pb.h		\
+  slave/containerizer/mesos/isolators/volume/csi/state.pb.cc		\
+  slave/containerizer/mesos/isolators/volume/csi/state.pb.h		\
   slave/volume_gid_manager/state.pb.cc					\
   slave/volume_gid_manager/state.pb.h
 
@@ -429,8 +442,6 @@ CXX_CSI_PROTOS =							\
   ../include/csi/v1/csi.grpc.pb.h					\
   ../include/csi/v1/csi.pb.cc						\
   ../include/csi/v1/csi.pb.h						\
-  ../include/mesos/csi/types.pb.cc					\
-  ../include/mesos/csi/types.pb.h					\
   csi/state.pb.cc							\
   csi/state.pb.h
 
@@ -709,13 +720,8 @@ nodist_authorizer_HEADERS =						\
 csidir = $(pkgincludedir)/csi
 
 csi_HEADERS =								\
-  $(top_srcdir)/include/mesos/csi/types.hpp				\
-  $(top_srcdir)/include/mesos/csi/types.proto				\
   $(top_srcdir)/include/mesos/csi/v0.hpp				\
   $(top_srcdir)/include/mesos/csi/v1.hpp
-
-nodist_csi_HEADERS =							\
-  ../include/mesos/csi/types.pb.h
 
 # Install the generated CSI headers into $PREFIX/include.
 csi_v0dir = $(includedir)/csi/v0
@@ -1033,6 +1039,7 @@ libmesos_no_3rdparty_la_SOURCES =					\
   slave/containerizer/mesos/provisioner/docker/message.proto		\
   slave/containerizer/mesos/isolators/docker/volume/state.proto		\
   slave/containerizer/mesos/isolators/network/cni/spec.proto		\
+  slave/containerizer/mesos/isolators/volume/csi/state.proto		\
   slave/volume_gid_manager/state.proto
 
 # TODO(tillt): Remove authentication/cram_md5/* which will enable us to
@@ -1067,6 +1074,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   common/build.hpp							\
   common/command_utils.cpp						\
   common/command_utils.hpp						\
+  common/domain_sockets.hpp						\
   common/future_tracker.hpp						\
   common/heartbeater.hpp						\
   common/http.cpp							\
@@ -1083,6 +1091,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   common/resources_utils.hpp						\
   common/roles.cpp							\
   common/status_utils.hpp						\
+  common/type_utils_differencers.hpp					\
   common/type_utils.cpp							\
   common/validation.cpp							\
   common/validation.hpp							\
@@ -1125,6 +1134,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   master/allocator/mesos/hierarchical.hpp				\
   master/allocator/mesos/metrics.cpp					\
   master/allocator/mesos/metrics.hpp					\
+  master/allocator/mesos/offer_constraints_filter.cpp			\
   master/allocator/mesos/sorter/drf/metrics.cpp				\
   master/allocator/mesos/sorter/drf/metrics.hpp				\
   master/allocator/mesos/sorter/drf/sorter.cpp				\
@@ -1133,6 +1143,8 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   master/allocator/mesos/sorter/random/sorter.hpp				\
   master/allocator/mesos/sorter/random/utils.hpp				\
   master/allocator/mesos/sorter/sorter.hpp					\
+  master/authorization.cpp						\
+  master/authorization.hpp						\
   master/constants.cpp							\
   master/constants.hpp							\
   master/contender/contender.cpp					\
@@ -1211,6 +1223,8 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   slave/container_daemon.hpp						\
   slave/container_daemon_process.hpp					\
   slave/container_logger.cpp						\
+  slave/csi_server.cpp							\
+  slave/csi_server.hpp							\
   slave/container_loggers/sandbox.cpp					\
   slave/container_loggers/sandbox.hpp					\
   slave/containerizer/composing.cpp					\
@@ -1252,6 +1266,9 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   slave/containerizer/mesos/isolators/posix/rlimits.hpp			\
   slave/containerizer/mesos/isolators/volume/sandbox_path.cpp		\
   slave/containerizer/mesos/isolators/volume/sandbox_path.hpp		\
+  slave/containerizer/mesos/isolators/volume/csi/paths.cpp		\
+  slave/containerizer/mesos/isolators/volume/csi/paths.hpp		\
+  slave/containerizer/mesos/isolators/volume/csi/state.hpp		\
   slave/containerizer/mesos/isolators/windows/cpu.hpp			\
   slave/containerizer/mesos/isolators/windows/mem.hpp			\
   slave/containerizer/mesos/launch.cpp					\
@@ -1455,6 +1472,8 @@ MESOS_LINUX_FILES =									\
   slave/containerizer/mesos/isolators/volume/secret.hpp					\
   slave/containerizer/mesos/isolators/volume/utils.cpp					\
   slave/containerizer/mesos/isolators/volume/utils.hpp					\
+  slave/containerizer/mesos/isolators/volume/csi/isolator.cpp				\
+  slave/containerizer/mesos/isolators/volume/csi/isolator.hpp				\
   slave/containerizer/mesos/provisioner/backends/aufs.cpp				\
   slave/containerizer/mesos/provisioner/backends/aufs.hpp				\
   slave/containerizer/mesos/provisioner/backends/bind.cpp				\
@@ -1598,7 +1617,6 @@ libcsi_la_SOURCES =							\
   csi/service_manager.hpp						\
   csi/state.hpp								\
   csi/state.proto							\
-  csi/types.cpp								\
   csi/v0.cpp								\
   csi/v0_client.cpp							\
   csi/v0_client.hpp							\
@@ -1693,7 +1711,6 @@ libmesos_la_SOURCES =							\
   $(AUTHENTICATION_PROTO)						\
   $(AUTHORIZATION_PROTO)						\
   $(CONTAINERIZER_PROTO)						\
-  $(CSI_TYPES_PROTO)							\
   $(EXECUTOR_PROTO)							\
   $(DOCKER_SPEC_PROTO)							\
   $(DOCKER_V1_PROTO)							\
@@ -1739,6 +1756,7 @@ libmesos_la_LIBADD =							\
   $(LIB_PROCESS)							\
   $(LIB_PROTOBUF)							\
   $(LIB_LIBSECCOMP)							\
+  $(LIB_RE2)								\
   $(LIB_ZOOKEEPER)							\
   -lsvn_subr-1								\
   -lsvn_delta-1								\
@@ -1971,6 +1989,9 @@ nobase_dist_pkgdata_DATA +=						\
   webui/app/agents/agents.html						\
   webui/app/frameworks/framework.html					\
   webui/app/frameworks/frameworks.html					\
+  webui/app/frameworks/roles.html					\
+  webui/app/frameworks/roles-tree.html					\
+  webui/app/frameworks/roles-tree-root.html				\
   webui/app/maintenance/maintenance.html				\
   webui/app/offers/offers.html						\
   webui/app/roles/roles.html						\
@@ -2158,7 +2179,16 @@ BUILT_SOURCES += $(nodist_libjava_la_SOURCES)
 # * For 'javac -h' recipe, we substitute '_' with '/' to compute the source path
 #   of the java file. Unlike 'javah', 'javac -h' requires java sources to
 #   generate headers.
+#
+# NOTE: javah has a race between concurrent runs trying to create
+# the same output directory:
+# http://hg.openjdk.java.net/jdk8/jdk8/langtools/file/1ff9d5118aae/src/share/classes/com/sun/tools/javah/JavahTask.java#l475
+# Thus, we have to create the output directory here.
+#
+# TODO(asekretenko): Replace `javah` (deprecated as of JDK 9+)
+# with `javac` when switching to a newer JDK.
 java/jni/%.h: $(MESOS_JAR)
+	mkdir -p java/jni
 if HAS_JAVAH
 	$(JAVA_HOME)/bin/javah -d java/jni                              \
 	  -classpath $(MESOS_JAR):@PROTOBUF_JAR@                        \
@@ -2675,6 +2705,7 @@ mesos_tests_SOURCES =						\
   tests/master_tests.cpp					\
   tests/master/mock_master_api_subscriber.cpp			\
   tests/master/mock_master_api_subscriber.hpp			\
+  tests/master/offer_constraints_filter_tests.cpp		\
   tests/master/update_framework_tests.cpp			\
   tests/master_validation_tests.cpp				\
   tests/mesos.cpp						\
@@ -2842,6 +2873,7 @@ mesos_tests_SOURCES +=						\
   tests/containerizer/runtime_isolator_tests.cpp		\
   tests/containerizer/sched_tests.cpp				\
   tests/containerizer/setns_test_helper.cpp			\
+  tests/containerizer/volume_csi_isolator_tests.cpp		\
   tests/containerizer/volume_host_path_isolator_tests.cpp	\
   tests/containerizer/volume_image_isolator_tests.cpp		\
   tests/containerizer/volume_secret_isolator_tests.cpp

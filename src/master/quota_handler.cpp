@@ -247,7 +247,7 @@ void Master::QuotaHandler::rescindOffers(const QuotaInfo& request) const
   if (master->roles.contains(role)) {
     Role* roleState = master->roles.at(role);
     foreachvalue (const Framework* framework, roleState->frameworks) {
-      if (framework->active()) {
+      if (framework->connected() && framework->active()) {
         ++frameworksInRole;
       }
     }
@@ -351,7 +351,8 @@ Future<http::Response> Master::QuotaHandler::status(
 
   return _status(principal)
     .then([request](const QuotaStatus& status) -> Future<http::Response> {
-      return OK(JSON::protobuf(status), request.url.query.get("jsonp"));
+      return OK(jsonify(JSON::Protobuf(status)),
+                request.url.query.get("jsonp"));
     });
 }
 

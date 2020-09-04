@@ -47,6 +47,7 @@
 #include "messages/messages.hpp"
 
 #include "tests/cluster.hpp"
+#include "tests/containerizer.hpp"
 #include "tests/mesos.hpp"
 #include "tests/resources_utils.hpp"
 
@@ -55,16 +56,23 @@ namespace http = process::http;
 
 using mesos::master::detector::MasterDetector;
 
+using mesos::slave::ContainerTermination;
+
 using process::Clock;
 using process::Failure;
 using process::Future;
 using process::Owned;
+using process::Promise;
+
+using std::vector;
 
 using testing::_;
 using testing::AllOf;
 using testing::DoAll;
+using testing::Not;
 using testing::Return;
 using testing::Sequence;
+using testing::Truly;
 using testing::WithParamInterface;
 
 namespace mesos {
@@ -126,7 +134,7 @@ public:
 
   // Helper function to post a request to "/api/v1" master endpoint and return
   // the response.
-  Future<http::Response> post(
+  static Future<http::Response> post(
       const process::PID<master::Master>& pid,
       const v1::master::Call& call,
       const ContentType& contentType,
@@ -221,6 +229,147 @@ TEST_P(MasterAlreadyDrainedTest, DrainAgent)
     EXPECT_EQ(agent.drain_info(), drainInfo);
     EXPECT_LT(0, agent.estimated_drain_start_time().nanoseconds());
   }
+}
+
+
+// This is a regression test for MESOS-10116.
+// It verifies that reactivating an agent while it is not connected
+// does not trigger generating offers for this agent, but instead makes
+// the agent offered when it re-registers.
+//
+// Also, the test ensures that accepting the first offer for a reconnected agent
+// does not crash the master and that this offer can be successfully used
+// to launch a task. The latter serves as a regression test for MESOS-10118.
+TEST_P(MasterAlreadyDrainedTest, ReactivateDisconnectedAgent)
+{
+  const ContentType contentType = GetParam();
+
+  const auto IsMarkAgentDrained =
+    [](const process::Owned<master::RegistryOperation>& operation) {
+      return dynamic_cast<master::MarkAgentDrained*>(operation.get()) !=
+             nullptr;
+    };
+
+  Future<Nothing> registrarApplyDrained;
+  EXPECT_CALL(*master->registrar, apply(Truly(IsMarkAgentDrained)))
+    .WillOnce(DoAll(
+        FutureSatisfy(&registrarApplyDrained),
+        Invoke(master->registrar.get(), &MockRegistrar::unmocked_apply)));
+
+  EXPECT_CALL(*master->registrar, apply(Not(Truly(IsMarkAgentDrained))))
+    .WillRepeatedly(
+        Invoke(master->registrar.get(), &MockRegistrar::unmocked_apply));
+
+
+  {
+    v1::master::Call::DrainAgent drainAgent;
+    drainAgent.mutable_agent_id()->CopyFrom(agentId);
+    drainAgent.mutable_max_grace_period()->set_seconds(10);
+
+    v1::master::Call call;
+    call.set_type(v1::master::Call::DRAIN_AGENT);
+    call.mutable_drain_agent()->CopyFrom(drainAgent);
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(
+        http::OK().status,
+        post(master->pid, call, contentType));
+  }
+
+  AWAIT_READY(registrarApplyDrained);
+
+  // The agent should apply draining as well.
+  Clock::settle();
+
+  // Simulate agent crash.
+  slave->terminate();
+  slave.reset();
+
+  Clock::settle();
+
+  // Set up the scheduler.
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.add_capabilities()->set_type(
+      v1::FrameworkInfo::Capability::PARTITION_AWARE);
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  // Expect no offers after agent reactivation.
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .Times(testing::AtMost(0));
+
+  // Subscribe the scheduler.
+  v1::scheduler::TestMesos mesos(master.get()->pid, contentType, scheduler);
+
+  AWAIT_READY(subscribed);
+  const v1::FrameworkID frameworkId = subscribed->framework_id();
+
+  // Later, after agent reconnection, the scheduler will launch a task.
+  // It should expect and acknowledge all task status updates.
+  // Note that we will be specifically waiting for TASK_RUNNING update.
+  const auto sendAcknowledge =
+    v1::scheduler::SendAcknowledge(frameworkId, agentId);
+
+  EXPECT_CALL(
+      *scheduler, update(_, Not(TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .WillRepeatedly(sendAcknowledge);
+
+  Future<v1::scheduler::Event::Update> taskRunning;
+  EXPECT_CALL(*scheduler, update(_, TaskStatusUpdateStateEq(v1::TASK_RUNNING)))
+    .WillOnce(DoAll(FutureArg<1>(&taskRunning), sendAcknowledge));
+
+  // Reactivate the agent.
+  {
+    v1::master::Call::ReactivateAgent reactivateAgent;
+    reactivateAgent.mutable_agent_id()->CopyFrom(agentId);
+
+    v1::master::Call call;
+    call.set_type(v1::master::Call::REACTIVATE_AGENT);
+    call.mutable_reactivate_agent()->CopyFrom(reactivateAgent);
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(
+        http::OK().status,
+        post(master->pid, call, contentType));
+  }
+
+  // Trigger allocation to make sure that the agent is not offered.
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  // Expect to get an offer after the agent is brought back.
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  Try<Owned<cluster::Slave>> recoveredSlave =
+    StartSlave(detector.get(), agentFlags);
+  ASSERT_SOME(recoveredSlave);
+
+  Clock::advance(agentFlags.registration_backoff_factor);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+  EXPECT_EQ(agentId, offer.agent_id());
+
+  // Launch a task to verify that the offer is usable.
+  const v1::TaskInfo taskInfo =
+    v1::createTask(agentId, offer.resources(), SLEEP_COMMAND(1000));
+
+  mesos.send(
+      v1::createCallAccept(frameworkId, offer, {v1::LAUNCH({taskInfo})}));
+
+  AWAIT_READY(taskRunning);
 }
 
 
@@ -1011,6 +1160,133 @@ TEST_P(MasterDrainingTest, DrainAgentUnreachable)
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->offers().empty());
   EXPECT_EQ(agentId, offers->offers(0).agent_id());
+}
+
+
+class MasterDrainingTest2
+  : public MesosTest,
+    public WithParamInterface<ContentType> {};
+
+// These tests are parameterized by the content type of the HTTP request.
+INSTANTIATE_TEST_CASE_P(
+    ContentType,
+    MasterDrainingTest2,
+    ::testing::Values(ContentType::PROTOBUF, ContentType::JSON));
+
+
+// This test ensures that the user cannot reactivate an agent
+// that is still in the DRAINING state (which was previously
+// possible and problematic, see MESOS-10096).
+//
+// We use a mock executor that ignores the kill task request
+// to ensure the agent doesn't transition out of draining.
+TEST_P(MasterDrainingTest2, DisallowReactivationWhileDraining)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  auto slaveOptions = SlaveOptions(detector.get())
+                        .withFlags(CreateSlaveFlags())
+                        .withId(process::ID::generate())
+                        .withContainerizer(&containerizer);
+  Try<Owned<cluster::Slave>> slave = StartSlave(slaveOptions);
+  ASSERT_SOME(slave);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_checkpoint(true);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  // Start the scheduler and launch a task.
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+  Offer offer = offers.get()[0];
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  *task.mutable_slave_id() = offer.slave_id();
+  *task.mutable_resources() = offer.resources();
+  *task.mutable_executor() = DEFAULT_EXECUTOR_INFO;
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillRepeatedly(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  EXPECT_CALL(containerizer, update(_, _, _))
+    .WillRepeatedly(Return(Nothing()));
+
+  Promise<Option<ContainerTermination>> hang;
+
+  EXPECT_CALL(containerizer, wait(_))
+    .WillRepeatedly(Return(hang.future()));
+
+  Future<TaskStatus> statusRunning1;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning1));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusRunning1);
+  ASSERT_EQ(TASK_RUNNING, statusRunning1->state());
+
+  ContentType contentType = GetParam();
+
+  // Start draining the agent.
+  // Don't do anything upon the kill task request.
+  EXPECT_CALL(exec, killTask(_, _));
+
+  {
+    v1::master::Call::DrainAgent drainAgent;
+    *drainAgent.mutable_agent_id() = evolve(offer.slave_id());
+
+    v1::master::Call call;
+    call.set_type(v1::master::Call::DRAIN_AGENT);
+    *call.mutable_drain_agent() = drainAgent;
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(
+        http::OK().status,
+        MasterAlreadyDrainedTest::post(
+            (*master)->pid, call, contentType));
+  }
+
+  // The agent should now be in the draining state.
+
+  // Attempt to reactivate the agent while it is in
+  // draining, this should be rejected.
+  {
+    v1::master::Call::ReactivateAgent reactivateAgent;
+    *reactivateAgent.mutable_agent_id() = evolve(offer.slave_id());
+
+    v1::master::Call call;
+    call.set_type(v1::master::Call::REACTIVATE_AGENT);
+    call.mutable_reactivate_agent()->CopyFrom(reactivateAgent);
+
+    Future<http::Response> response =
+      MasterAlreadyDrainedTest::post((*master)->pid, call, contentType);
+
+    AWAIT_READY(response);
+    EXPECT_EQ(http::BadRequest().status, response->status);
+    EXPECT_EQ("Agent is still in the DRAINING state",
+              response->body);
+  }
 }
 
 } // namespace tests {

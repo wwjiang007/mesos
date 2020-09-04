@@ -236,6 +236,228 @@ message Response {
 }
 
 
+// An attribute constraint consists of a Predicate: a boolean function of
+// an attribute or an attribute-like property of an agent (a pseudoattribute),
+// and a Selector: a rule for obtaining this (pseudo)attribute value from
+// AgentInfo.
+//
+// The attribute constraint evaluates to `true` for a given agent if and only
+// if the predicate yields `true` for the specified (pseudo)attribute.
+message AttributeConstraint {
+  message Selector {
+    enum PseudoattributeType {
+      UNKNOWN = 0;
+      HOSTNAME = 1;
+      REGION = 2;
+      ZONE = 3;
+    }
+
+    oneof selector {
+      // The predicate will be applied to the specified pseudoattribute.
+      PseudoattributeType pseudoattribute_type = 1;
+
+      // The predicate will be applied to the first attribute with the specified
+      // name. Note that an agent can have multiple attributes with the same
+      // name, and that the order of attributes is preserved by Mesos.
+      //
+      // TODO(asekretenko): If a need to handle the multiple-attribute
+      // case differently arises, in simple cases it can be addressed by adding
+      // a Selector-wide flag or one more oneof member here.
+      string attribute_name = 2;
+    }
+  }
+
+  message Predicate {
+    // Yields `true` if the (pseudo)attribute exists.
+    message Exists {}
+
+    // Yields `true` if the (pseudo)attribute does not exist.
+    message NotExists {}
+
+    // Predicates for (pseudo)attribute value equality.
+    //
+    // Given that existing schedulers tend to test SCALAR and RANGES attributes
+    // of offered agents for equality in ways that are not entirely trivial,
+    // we currently only support TEXT (string for pseudoattributes)
+    // equality.
+    //
+    // Both equality predicates will match (yield `true`) for attributes of
+    // SCALAR and RANGES types. This way, schedulers will still receive offers
+    // for SCALAR and RANGES attributes if a string equality constraint was
+    // specified to Mesos, and the scheduler's own logic will determine how to
+    // filter attributes of these types.
+    //
+    // For example: if a scheduler sets a constraint
+    //
+    //   { "selector": {"attribute_name": "foo"},
+    //     "predicate": {"text_equals": {"value":"2.0"}} }
+    //
+    // then agents with a SCALAR attribute
+    // {"name": "foo", "scalar": {"value": 1.0}}
+    // will match (since it's SCALAR, not TEXT!) and the scheduler side
+    // filtering will need to filter it according to its desired semantics.
+    //
+    // That said, it is strongly recommended to only use TEXT attributes
+    // on agents. For users with existing attributes, this can be done
+    // by adding a variant of the existing attribute that uses TEXT instead:
+    //
+    //   --attributes=foo2:v1.0
+    //   which gets parsed into
+    //   {"name": "foo2", "text": {"value": "v1.0"}}, etc.
+
+    // Yields `true` if the (pseudo)attribute exists and is a string/TEXT
+    // equal to the specified `value`.
+    //
+    // Always yields `true` for existing non-TEXT attributes (and non-string
+    // pseudoattributes) for the reason explained above.
+    message TextEquals {
+      required string value = 1;
+    }
+
+    // Yields `true` if the (pseudo)attribute does not exist or is a string/TEXT
+    // NOT equal to the specified `value`.
+    //
+    // Always yields `true` for existing non-TEXT attributes (and non-string
+    // pseudoattributes) for the reason explained above.
+    message TextNotEquals {
+      required string value = 1;
+    }
+
+    // Predicates for regular expression constraints.
+    //
+    // The regular expressions are interpreted according to
+    // RE2 regular expression syntax and semantics:
+    // https://github.com/google/re2/blob/master/doc/syntax.txt
+    //
+    // The call using the constraints is invalid if the specified string is not
+    // a valid RE2 regex, or the regex is deemed too expensive to
+    // construct/store/execute, namely:
+    //
+    //  - the RE2 object cannot be constructed from the regex without breaching
+    //    the limit on the estimated memory footprint of an individual RE2
+    //    (controlled by the --offer_constraints_re2_max_mem master flag), or
+    //
+    //  - the regex program size reported by `RE2::ProgramSize()`
+    //    exceeds the value of --offer_constraints_re2_max_program_size flag.
+    //
+    // Frameworks using the C++ implementation of RE2 (directly or via the JNI
+    // wrapper) for regexp validation on their side, are advised to set
+    // the `max_mem` RE2 option and limit `ProgramSize()` to values no larger
+    // than the defaults for the corresonding Mesos master flags.
+    //
+    // TODO(asekretenko): Provide an API for the frameworks and/or operators
+    // to validate regexp constraints against the Mesos master setup.
+    //
+    // Similarly to the string equality predicates, both regexp predicates match
+    // (evaluate to `true`) when the (pseudo)attribute is not a TEXT/string.
+    // This way, schedulers will have to apply purely on their own
+    // whatever filtration they do for non-TEXT attributes which happen
+    // to be selected by the constraint's `Selector`
+
+    // Yields `true` if the (pseudo)attribute exists and is a TEXT/string
+    // matching the specified regex.
+    //
+    // Always yields `true` for existing non-TEXT attributes (and non-string
+    // pseudoattributes) for the reasons explained above.
+    message TextMatches {
+      required string regex = 1;
+    }
+
+    // Yields `true` if the (pseudo)attribute either does not exists or is
+    // not a TEXT/string matching the specified regex.
+    //
+    // Always yields `true` for existing non-TEXT attributes (and non-string
+    // pseudoattributes) for the reasons explained above.
+    message TextNotMatches {
+      required string regex = 1;
+    }
+
+    oneof predicate {
+      Exists exists = 1;
+      NotExists not_exists = 2;
+
+      TextEquals text_equals = 3;
+      TextNotEquals text_not_equals = 4;
+
+      TextMatches text_matches = 5;
+      TextNotMatches text_not_matches = 6;
+    }
+  }
+
+  required Selector selector = 1;
+  required Predicate predicate = 2;
+}
+
+// Frameworks can express offer constraints for their roles.
+//
+// Constraints restrict which offers will be sent to the framework:
+// if an offer does not match the provided constraints, it will not
+// be sent to the framework.
+//
+// Constraints are expressed on a per role basis. If you consider a
+// scheduler that has multiple apps to launch within a single role,
+// the structure of the constraints for that role looks as follows:
+//
+//    app 1              app 2                         app N
+// constraints   OR   constraints   OR   ...   OR   constraints
+//                        /\
+//                       /  \
+//    constraint 1 AND constraint 2 AND ... AND constraint M
+//
+// That is, at least one of the constraint groups must match for an offer to
+// be generated, and within a group all the constraints must match.
+//
+// As a concrete example, consider a scheduler with two applications
+// with multiple tasks it wants to launch within a role:
+//
+// application 1: all tasks on an agent with a hostname == "foo"
+// application 2: each task on an agent with an unique "rack" attribute
+//
+// Assuming there are already some instances of application 2 launched,
+// the constraints might look like the following:
+//
+//      app 1              app 2
+//  constraints    OR    constraints
+//       /\                 /\
+//      /  \               /  \
+// hostname == "foo"    rack != "X" AND
+//                      rack != "Y" AND
+//                      rack != "Z"
+//
+//                   ==
+//
+//         (hostname == "foo")
+//                   OR
+// (rack != "X" AND rack != "Y" AND rack != "Z")
+//
+// The benefits of expressing constraints are:
+//
+// (1) reduced fraction of unusable offers received, and hence:
+// (2) reduced traffic and processing overhead due to unusable
+// offer / DECLINE back and forth churn
+// (3) most importantly, reduced latency to receive the desired
+// offer for a particular task
+//
+// NOTE: Even if a particular resource matches offer constraints of a
+// framework's role, there is still no guarantee that it will ever be offered
+// to this role of the framework.
+message OfferConstraints {
+  message RoleConstraints {
+    message Group {
+      repeated AttributeConstraint attribute_constraints = 1;
+
+      // TODO(asekretenko): Implement resource-based constraints to extend
+      // functionality of OfferFilters and to allow for precise filtering
+      // of reservations.
+    }
+
+    repeated Group groups = 1;
+  }
+
+  map<string, RoleConstraints> role_constraints = 1;
+}
+
+
 /**
  * Scheduler call API.
  *
@@ -288,6 +510,8 @@ message Call {
     // offered resources. The framework can decide to suppress all or a subset
     // of roles the framework (re)registers as.
     repeated string suppressed_roles = 2;
+
+    optional OfferConstraints offer_constraints = 3;
   }
 
   // Accepts an offer, performing the specified operations
@@ -507,6 +731,8 @@ message Call {
     // offered resources. The framework can decide to suppress all or a subset
     // of roles provided in the new `framework_info`.
     repeated string suppressed_roles = 2;
+
+    optional OfferConstraints offer_constraints = 3;
   }
 
   // Identifies who generated this call. Master assigns a framework id

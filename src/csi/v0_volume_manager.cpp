@@ -21,6 +21,8 @@
 #include <functional>
 #include <list>
 
+#include <mesos/secret/resolver.hpp>
+
 #include <process/after.hpp>
 #include <process/collect.hpp>
 #include <process/defer.hpp>
@@ -81,14 +83,19 @@ VolumeManagerProcess::VolumeManagerProcess(
     const hashset<Service> _services,
     const Runtime& _runtime,
     ServiceManager* _serviceManager,
-    Metrics* _metrics)
+    Metrics* _metrics,
+    SecretResolver* _secretResolver)
   : ProcessBase(process::ID::generate("csi-v0-volume-manager")),
     rootDir(_rootDir),
     info(_info),
     services(_services),
     runtime(_runtime),
     serviceManager(_serviceManager),
-    metrics(_metrics)
+    metrics(_metrics),
+    secretResolver(_secretResolver),
+    mountRootDir(info.has_target_path_root()
+      ? info.target_path_root()
+      : paths::getMountRootDir(rootDir, info.type(), info.name()))
 {
   // This should have been validated in `VolumeManager::create`.
   CHECK(!services.empty())
@@ -206,9 +213,6 @@ Future<Nothing> VolumeManagerProcess::recover()
       }
 
       // Garbage collect leftover mount paths that were failed to remove before.
-      const string mountRootDir =
-        paths::getMountRootDir(rootDir, info.type(), info.name());
-
       Try<list<string>> mountPaths = paths::getMountPaths(mountRootDir);
       if (mountPaths.isError()) {
         // TODO(chhsiao): This could indicate that something is seriously wrong.
@@ -259,7 +263,7 @@ Future<vector<VolumeInfo>> VolumeManagerProcess::listVolumes()
 
 
 Future<Bytes> VolumeManagerProcess::getCapacity(
-    const types::VolumeCapability& capability,
+    const CSIVolume::VolumeCapability& capability,
     const Map<string, string>& parameters)
 {
   if (!controllerCapabilities->getCapacity) {
@@ -280,7 +284,7 @@ Future<Bytes> VolumeManagerProcess::getCapacity(
 Future<VolumeInfo> VolumeManagerProcess::createVolume(
     const string& name,
     const Bytes& capacity,
-    const types::VolumeCapability& capability,
+    const CSIVolume::VolumeCapability& capability,
     const Map<string, string>& parameters)
 {
   if (!controllerCapabilities->createDeleteVolume) {
@@ -329,7 +333,7 @@ Future<VolumeInfo> VolumeManagerProcess::createVolume(
 
 Future<Option<Error>> VolumeManagerProcess::validateVolume(
     const VolumeInfo& volumeInfo,
-    const types::VolumeCapability& capability,
+    const CSIVolume::VolumeCapability& capability,
     const Map<string, string>& parameters)
 {
   // If the volume has been checkpointed, the validation succeeds only if the
@@ -452,8 +456,29 @@ Future<Nothing> VolumeManagerProcess::detachVolume(const string& volumeId)
 }
 
 
-Future<Nothing> VolumeManagerProcess::publishVolume(const string& volumeId)
+Future<Nothing> VolumeManagerProcess::publishVolume(
+    const string& volumeId,
+    const Option<VolumeState>& volumeState)
 {
+  if (volumeState.isSome()) {
+    if (!volumeState->pre_provisioned()) {
+      return Failure(
+          "Cannot specify volume state when publishing a volume unless that"
+          " volume is pre-provisioned");
+    }
+
+    if (volumeState->state() != VolumeState::VOL_READY &&
+        volumeState->state() != VolumeState::NODE_READY) {
+      return Failure(
+          "Cannot specify volume state when publishing a volume unless that"
+          " volume is in either the VOL_READY or NODE_READY state");
+    }
+
+    // This must be an untracked volume. Track it now before we continue.
+    volumes.put(volumeId, VolumeState(volumeState.get()));
+    checkpointVolumeState(volumeId);
+  }
+
   if (!volumes.contains(volumeId)) {
     return Failure("Cannot publish unknown volume '" + volumeId + "'");
   }
@@ -473,7 +498,10 @@ Future<Nothing> VolumeManagerProcess::publishVolume(const string& volumeId)
 Future<Nothing> VolumeManagerProcess::unpublishVolume(const string& volumeId)
 {
   if (!volumes.contains(volumeId)) {
-    return Failure("Cannot unpublish unknown volume '" + volumeId + "'");
+    LOG(WARNING) << "Ignoring unpublish request for unknown volume '"
+                 << volumeId << "'";
+
+    return Nothing();
   }
 
   VolumeData& volume = volumes.at(volumeId);
@@ -623,7 +651,7 @@ Future<Nothing> VolumeManagerProcess::prepareServices()
       vector<Future<GetPluginInfoResponse>> futures;
       foreach (const Service& service, services) {
         futures.push_back(call(
-            CONTROLLER_SERVICE, &Client::getPluginInfo, GetPluginInfoRequest())
+            service, &Client::getPluginInfo, GetPluginInfoRequest())
           .onReady([service](const GetPluginInfoResponse& response) {
             LOG(INFO) << service << " loaded: " << stringify(response);
           }));
@@ -698,8 +726,7 @@ Future<bool> VolumeManagerProcess::_deleteVolume(const std::string& volumeId)
   if (volumeState.node_publish_required()) {
     CHECK_EQ(VolumeState::PUBLISHED, volumeState.state());
 
-    const string targetPath = paths::getMountTargetPath(
-        paths::getMountRootDir(rootDir, info.type(), info.name()), volumeId);
+    const string targetPath = paths::getMountTargetPath(mountRootDir, volumeId);
 
     // NOTE: Normally the volume should have been cleaned up. However this may
     // not be true for preprovisioned volumes (e.g., leftover from a previous
@@ -728,16 +755,7 @@ Future<bool> VolumeManagerProcess::_deleteVolume(const std::string& volumeId)
   // the future returned by the sequence ready as well.
   return __deleteVolume(volumeId)
     .then(process::defer(self(), [this, volumeId](bool deleted) {
-      volumes.erase(volumeId);
-
-      const string volumePath =
-        paths::getVolumePath(rootDir, info.type(), info.name(), volumeId);
-
-      Try<Nothing> rmdir = os::rmdir(volumePath);
-      CHECK_SOME(rmdir) << "Failed to remove checkpointed volume state at '"
-                        << volumePath << "': " << rmdir.error();
-
-      garbageCollectMountPath(volumeId);
+      removeVolume(volumeId);
 
       return deleted;
     }));
@@ -810,7 +828,7 @@ Future<Nothing> VolumeManagerProcess::_attachVolume(const string& volumeId)
   request.set_node_id(CHECK_NOTNONE(nodeId));
   *request.mutable_volume_capability() =
     evolve(volumeState.volume_capability());
-  request.set_readonly(false);
+  request.set_readonly(volumeState.readonly());
   *request.mutable_volume_attributes() = volumeState.volume_context();
 
   return call(
@@ -913,8 +931,7 @@ Future<Nothing> VolumeManagerProcess::_publishVolume(const string& volumeId)
       .then(process::defer(self(), &Self::_publishVolume, volumeId));
   }
 
-  const string targetPath = paths::getMountTargetPath(
-      paths::getMountRootDir(rootDir, info.type(), info.name()), volumeId);
+  const string targetPath = paths::getMountTargetPath(mountRootDir, volumeId);
 
   // NOTE: The target path will be cleaned up during volume removal.
   Try<Nothing> mkdir = os::mkdir(targetPath);
@@ -938,19 +955,44 @@ Future<Nothing> VolumeManagerProcess::_publishVolume(const string& volumeId)
   request.set_target_path(targetPath);
   *request.mutable_volume_capability() =
     evolve(volumeState.volume_capability());
-  request.set_readonly(false);
+  request.set_readonly(volumeState.readonly());
   *request.mutable_volume_attributes() = volumeState.volume_context();
 
   if (nodeCapabilities->stageUnstageVolume) {
     const string stagingPath = paths::getMountStagingPath(
-        paths::getMountRootDir(rootDir, info.type(), info.name()), volumeId);
+        mountRootDir, volumeId);
 
     CHECK(os::exists(stagingPath));
     request.set_staging_target_path(stagingPath);
   }
 
-  return call(NODE_SERVICE, &Client::nodePublishVolume, std::move(request))
-    .then(defer(self(), [this, volumeId, targetPath] {
+  Future<NodePublishVolumeResponse> rpcResult;
+
+  if (!volumeState.node_publish_secrets().empty()) {
+    rpcResult = resolveSecrets(volumeState.node_publish_secrets())
+      .then(process::defer(
+          self(),
+          [this, request](const Map<string, string>& secrets) {
+            NodePublishVolumeRequest request_(request);
+            *request_.mutable_node_publish_secrets() = secrets;
+
+            return call(
+                NODE_SERVICE,
+                &Client::nodePublishVolume,
+                std::move(request_));
+          }));
+  } else {
+    rpcResult =
+      call(NODE_SERVICE, &Client::nodePublishVolume, std::move(request));
+  }
+
+  return rpcResult
+    .then(process::defer(self(), [this, volumeId, targetPath]()
+        -> Future<Nothing> {
+      if (!os::exists(targetPath)) {
+        return Failure("Target path '" + targetPath + "' not created");
+      }
+
       CHECK(volumes.contains(volumeId));
       VolumeState& volumeState = volumes.at(volumeId).state;
 
@@ -1003,8 +1045,7 @@ Future<Nothing> VolumeManagerProcess::__publishVolume(const string& volumeId)
       .then(process::defer(self(), &Self::__publishVolume, volumeId));
   }
 
-  const string stagingPath = paths::getMountStagingPath(
-      paths::getMountRootDir(rootDir, info.type(), info.name()), volumeId);
+  const string stagingPath = paths::getMountStagingPath(mountRootDir, volumeId);
 
   // NOTE: The staging path will be cleaned up in during volume removal.
   Try<Nothing> mkdir = os::mkdir(stagingPath);
@@ -1030,7 +1071,25 @@ Future<Nothing> VolumeManagerProcess::__publishVolume(const string& volumeId)
     evolve(volumeState.volume_capability());
   *request.mutable_volume_attributes() = volumeState.volume_context();
 
-  return call(NODE_SERVICE, &Client::nodeStageVolume, std::move(request))
+  Future<NodeStageVolumeResponse> rpcResult;
+
+  if (!volumeState.node_stage_secrets().empty()) {
+    rpcResult = resolveSecrets(volumeState.node_stage_secrets())
+      .then([=](const Map<string, string>& secrets) {
+        NodeStageVolumeRequest request_(request);
+        *request_.mutable_node_stage_secrets() = secrets;
+
+        return call(
+            NODE_SERVICE,
+            &Client::nodeStageVolume,
+            std::move(request_));
+      });
+  } else {
+    rpcResult =
+      call(NODE_SERVICE, &Client::nodeStageVolume, std::move(request));
+  }
+
+  return rpcResult
     .then(process::defer(self(), [this, volumeId] {
       CHECK(volumes.contains(volumeId));
       VolumeState& volumeState = volumes.at(volumeId).state;
@@ -1051,6 +1110,13 @@ Future<Nothing> VolumeManagerProcess::_unpublishVolume(const string& volumeId)
 
   if (volumeState.state() == VolumeState::NODE_READY) {
     CHECK(volumeState.boot_id().empty());
+
+    if (volumeState.pre_provisioned()) {
+      // Since this volume was pre-provisioned, it has reached the end of its
+      // lifecycle. Remove it now.
+      removeVolume(volumeId);
+    }
+
     return Nothing();
   }
 
@@ -1063,9 +1129,16 @@ Future<Nothing> VolumeManagerProcess::_unpublishVolume(const string& volumeId)
   }
 
   if (!nodeCapabilities->stageUnstageVolume) {
-    // Since this is a no-op, no need to checkpoint here.
-    volumeState.set_state(VolumeState::NODE_READY);
-    volumeState.clear_boot_id();
+    if (volumeState.pre_provisioned()) {
+      // Since this volume was pre-provisioned, it has reached the end of its
+      // lifecycle. Remove it now.
+      removeVolume(volumeId);
+    } else {
+      // Since this is a no-op, no need to checkpoint here.
+      volumeState.set_state(VolumeState::NODE_READY);
+      volumeState.clear_boot_id();
+    }
+
     return Nothing();
   }
 
@@ -1078,8 +1151,7 @@ Future<Nothing> VolumeManagerProcess::_unpublishVolume(const string& volumeId)
     checkpointVolumeState(volumeId);
   }
 
-  const string stagingPath = paths::getMountStagingPath(
-      paths::getMountRootDir(rootDir, info.type(), info.name()), volumeId);
+  const string stagingPath = paths::getMountStagingPath(mountRootDir, volumeId);
 
   CHECK(os::exists(stagingPath));
 
@@ -1091,13 +1163,20 @@ Future<Nothing> VolumeManagerProcess::_unpublishVolume(const string& volumeId)
   request.set_staging_target_path(stagingPath);
 
   return call(NODE_SERVICE, &Client::nodeUnstageVolume, std::move(request))
-    .then(process::defer(self(), [this, volumeId] {
+    .then(process::defer(self(), [this, volumeId, volumeState] {
       CHECK(volumes.contains(volumeId));
-      VolumeState& volumeState = volumes.at(volumeId).state;
-      volumeState.set_state(VolumeState::NODE_READY);
-      volumeState.clear_boot_id();
 
-      checkpointVolumeState(volumeId);
+      if (volumeState.pre_provisioned()) {
+        // Since this volume was pre-provisioned, it has reached the end of its
+        // lifecycle. Remove it now.
+        removeVolume(volumeId);
+      } else {
+        VolumeState& volumeState = volumes.at(volumeId).state;
+        volumeState.set_state(VolumeState::NODE_READY);
+        volumeState.clear_boot_id();
+
+        checkpointVolumeState(volumeId);
+      }
 
       return Nothing();
     }));
@@ -1130,8 +1209,7 @@ Future<Nothing> VolumeManagerProcess::__unpublishVolume(const string& volumeId)
     checkpointVolumeState(volumeId);
   }
 
-  const string targetPath = paths::getMountTargetPath(
-      paths::getMountRootDir(rootDir, info.type(), info.name()), volumeId);
+  const string targetPath = paths::getMountTargetPath(mountRootDir, volumeId);
 
   CHECK(os::exists(targetPath));
 
@@ -1175,9 +1253,7 @@ void VolumeManagerProcess::garbageCollectMountPath(const string& volumeId)
 {
   CHECK(!volumes.contains(volumeId));
 
-  const string path = paths::getMountPath(
-      paths::getMountRootDir(rootDir, info.type(), info.name()), volumeId);
-
+  const string path = paths::getMountPath(mountRootDir, volumeId);
   if (os::exists(path)) {
     Try<Nothing> rmdir = os::rmdir(path);
     if (rmdir.isError()) {
@@ -1188,20 +1264,77 @@ void VolumeManagerProcess::garbageCollectMountPath(const string& volumeId)
 }
 
 
+void VolumeManagerProcess::removeVolume(const string& volumeId)
+{
+  volumes.erase(volumeId);
+
+  const string volumePath =
+    paths::getVolumePath(rootDir, info.type(), info.name(), volumeId);
+
+  Try<Nothing> rmdir = os::rmdir(volumePath);
+  CHECK_SOME(rmdir) << "Failed to remove checkpointed volume state at '"
+                    << volumePath << "': " << rmdir.error();
+
+  garbageCollectMountPath(volumeId);
+}
+
+
+Future<Map<string, string>> VolumeManagerProcess::resolveSecrets(
+    const Map<string, Secret>& secrets)
+{
+  if (!secretResolver) {
+    return Failure(
+        "CSI volume included secrets but the agent was not initialized with "
+        "a secret resolver");
+  }
+
+  // This `futures` is used below with `process::collect()` to synchronize the
+  // continuation. Within the continuation itself, we need to have the
+  // key:value mapping of the secrets, so we use `resolvedSecrets` instead.
+  vector<Future<Secret::Value>> futures;
+  hashmap<string, Future<Secret::Value>> resolvedSecrets;
+
+  for (auto it = secrets.begin(); it != secrets.end(); ++it) {
+    Future<Secret::Value> pendingSecret = secretResolver->resolve(it->second);
+
+    futures.push_back(pendingSecret);
+    resolvedSecrets.insert({it->first, pendingSecret});
+  }
+
+  return process::collect(futures)
+    .then([=]() {
+      Map<string, string> result;
+
+      foreachpair (
+          const string& key,
+          const Future<Secret::Value>& secret,
+          resolvedSecrets) {
+        CHECK(secret.isReady());
+
+        result.insert({key, secret->data()});
+      }
+
+      return result;
+    });
+}
+
+
 VolumeManager::VolumeManager(
     const string& rootDir,
     const CSIPluginInfo& info,
     const hashset<Service>& services,
     const Runtime& runtime,
     ServiceManager* serviceManager,
-    Metrics* metrics)
+    Metrics* metrics,
+    SecretResolver* secretResolver)
   : process(new VolumeManagerProcess(
         rootDir,
         info,
         services,
         runtime,
         serviceManager,
-        metrics))
+        metrics,
+        secretResolver))
 {
   process::spawn(CHECK_NOTNULL(process.get()));
   recovered = process::dispatch(process.get(), &VolumeManagerProcess::recover);
@@ -1229,7 +1362,7 @@ Future<vector<VolumeInfo>> VolumeManager::listVolumes()
 
 
 Future<Bytes> VolumeManager::getCapacity(
-    const types::VolumeCapability& capability,
+    const CSIVolume::VolumeCapability& capability,
     const Map<string, string>& parameters)
 {
   return recovered
@@ -1244,7 +1377,7 @@ Future<Bytes> VolumeManager::getCapacity(
 Future<VolumeInfo> VolumeManager::createVolume(
     const string& name,
     const Bytes& capacity,
-    const types::VolumeCapability& capability,
+    const CSIVolume::VolumeCapability& capability,
     const Map<string, string>& parameters)
 {
   return recovered
@@ -1260,7 +1393,7 @@ Future<VolumeInfo> VolumeManager::createVolume(
 
 Future<Option<Error>> VolumeManager::validateVolume(
     const VolumeInfo& volumeInfo,
-    const types::VolumeCapability& capability,
+    const CSIVolume::VolumeCapability& capability,
     const Map<string, string>& parameters)
 {
   return recovered
@@ -1297,11 +1430,16 @@ Future<Nothing> VolumeManager::detachVolume(const string& volumeId)
 }
 
 
-Future<Nothing> VolumeManager::publishVolume(const string& volumeId)
+Future<Nothing> VolumeManager::publishVolume(
+    const string& volumeId,
+    const Option<VolumeState>& volumeState)
 {
   return recovered
     .then(process::defer(
-        process.get(), &VolumeManagerProcess::publishVolume, volumeId));
+        process.get(),
+        &VolumeManagerProcess::publishVolume,
+        volumeId,
+        volumeState));
 }
 
 

@@ -43,9 +43,11 @@
 #include <stout/try.hpp>
 #include <stout/unreachable.hpp>
 
+#include <stout/os/exec.hpp>
 #include <stout/os/int_fd.hpp>
 #include <stout/os/open.hpp>
 #include <stout/os/realpath.hpp>
+#include <stout/os/shell.hpp>
 #include <stout/os/which.hpp>
 #include <stout/os/write.hpp>
 
@@ -1175,7 +1177,7 @@ int MesosContainerizerLaunch::execute()
   // Search executable in the current working directory as well.
   // execvpe and execvp will only search executable from the current
   // working directory if environment variable PATH is not set.
-  if (!path::absolute(executable) &&
+  if (!path::is_absolute(executable) &&
       launchInfo.has_working_directory()) {
     Option<string> which = os::which(
         executable,

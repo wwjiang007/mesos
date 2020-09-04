@@ -106,11 +106,14 @@ set(MESOS_TESTS_SRC
   hook_tests.cpp
   http_authentication_tests.cpp
   http_fault_tolerance_tests.cpp
+  logging_tests.cpp
   master_draining_tests.cpp
   master_load_tests.cpp
   master_maintenance_tests.cpp
   master_slave_reconciliation_tests.cpp
+  master/offer_constraints_filter_tests.cpp
   master/update_framework_tests.cpp
+  metrics_tests.cpp
   operation_reconciliation_tests.cpp
   operation_status_update_manager_tests.cpp
   partition_tests.cpp
@@ -178,7 +181,6 @@ if (NOT WIN32)
     examples_tests.cpp
     fetcher_cache_tests.cpp
     log_tests.cpp
-    logging_tests.cpp
     master_allocator_tests.cpp
     master_authorization_tests.cpp
     master_benchmarks.cpp
@@ -186,7 +188,6 @@ if (NOT WIN32)
     master_quota_tests.cpp
     master_tests.cpp
     master_validation_tests.cpp
-    metrics_tests.cpp
     module_tests.cpp
     oversubscription_tests.cpp
     persistent_volume_endpoints_tests.cpp
@@ -246,6 +247,7 @@ if (LINUX)
     containerizer/rootfs.cpp
     containerizer/runtime_isolator_tests.cpp
     containerizer/sched_tests.cpp
+    containerizer/volume_csi_isolator_tests.cpp
     containerizer/volume_host_path_isolator_tests.cpp
     containerizer/volume_image_isolator_tests.cpp
     containerizer/volume_secret_isolator_tests.cpp)
@@ -307,9 +309,15 @@ target_compile_definitions(
   PKGLIBEXECDIR="${PKG_LIBEXEC_INSTALL_DIR}"
   TESTLIBEXECDIR="${TEST_LIB_EXEC_DIR}"
   PKGMODULEDIR="${PKG_MODULE_DIR}"
-  SBINDIR="${S_BIN_DIR}")
+  SBINDIR="${S_BIN_DIR}"
+  MESOS_INSTALL_TESTS=${MESOS_INSTALL_TESTS})
 
-add_executable(mesos-tests EXCLUDE_FROM_ALL ${MESOS_TESTS_SRC})
+if(MESOS_INSTALL_TESTS)
+  add_executable(mesos-tests ${MESOS_TESTS_SRC})
+else()
+  add_executable(mesos-tests EXCLUDE_FROM_ALL ${MESOS_TESTS_SRC})
+endif()
+
 target_link_libraries(mesos-tests PRIVATE mesos-tests-interface)
 
 target_compile_definitions(
@@ -317,7 +325,13 @@ target_compile_definitions(
   $<$<BOOL:${HAS_JAVA}>:MESOS_HAS_JAVA>)
 
 # Helper to run tests that require a subprocess.
-add_executable(test-helper EXCLUDE_FROM_ALL ${TEST_HELPER_SRC})
+if (MESOS_INSTALL_TESTS)
+  add_executable(test-helper ${TEST_HELPER_SRC})
+  install(TARGETS test-helper RUNTIME DESTINATION ${MESOS_INSTALL_RUNTIME})
+else()
+  add_executable(test-helper EXCLUDE_FROM_ALL ${TEST_HELPER_SRC})
+endif()
+
 target_link_libraries(test-helper PRIVATE mesos-tests-interface)
 
 # The tests require these binaries.
@@ -332,7 +346,8 @@ if (NOT WIN32)
     mesos-local
     mesos-log
     mesos-logrotate-logger
-    mesos-master)
+    mesos-master
+    mesos-resolve)
 
   # The tests require all the test modules. These are not directly linked but
   # instead loaded at runtime, hence the manual dependency here.
@@ -362,6 +377,7 @@ if (NOT WIN32)
     disk-full-framework
     docker-no-executor-framework
     dynamic-reservation-framework
+    inverse-offer-framework
     load-generator-framework
     long-lived-executor
     long-lived-framework
@@ -380,8 +396,19 @@ if (NOT WIN32)
       mesos-tests
       test-csi-plugin)
   endif ()
+
+  if (NOT ENABLE_NEW_CLI)
+    add_dependencies(mesos-tests
+      mesos-cli)
+  else ()
+    add_dependencies(mesos-tests
+      cli)
+  endif ()
 endif ()
 
+if (MESOS_INSTALL_TESTS)
+  install(TARGETS mesos-tests RUNTIME DESTINATION ${MESOS_INSTALL_RUNTIME})
+endif()
 
 # ADD TEST TARGET (runs when you do, e.g., `make check`).
 #########################################################

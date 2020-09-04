@@ -243,11 +243,8 @@ def verify_review(review_request):
                  '%s 2>&1 > %s' % (command, build_output)])
         else:
             # Launch docker build script.
-
-            # TODO(jojy): Launch 'docker_build.sh' in subprocess so that
-            # verifications can be run in parallel for various configurations.
             configuration = ("export "
-                             "OS='ubuntu:14.04' "
+                             "OS='ubuntu:16.04' "
                              "BUILDTOOL='autotools' "
                              "COMPILER='gcc' "
                              "CONFIGURATION='--verbose "
@@ -255,7 +252,7 @@ def verify_review(review_request):
                              "--disable-parallel-test-execution' "
                              "ENVIRONMENT='GLOG_v=1 MESOS_VERBOSE=1'")
 
-            command = "%s; ./support/docker-build.sh" % configuration
+            command = "%s; ./support/jenkins/buildbot.sh" % configuration
 
             # `tee` the output so that the console can log the whole build
             # output. `pipefail` ensures that the exit status of the build

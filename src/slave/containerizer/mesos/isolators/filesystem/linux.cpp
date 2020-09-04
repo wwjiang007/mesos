@@ -750,7 +750,7 @@ Future<Option<ContainerLaunchInfo>> LinuxFilesystemIsolatorProcess::prepare(
 
     foreach (const ContainerMountInfo& mnt, ROOTFS_CONTAINER_MOUNTS) {
       // The target for special mounts must always be an absolute path.
-      CHECK(path::absolute(mnt.target()));
+      CHECK(path::is_absolute(mnt.target()));
 
       ContainerMountInfo* info = launchInfo.add_mounts();
 
@@ -758,7 +758,7 @@ Future<Option<ContainerLaunchInfo>> LinuxFilesystemIsolatorProcess::prepare(
       info->set_target(path::join(containerConfig.rootfs(), mnt.target()));
 
       // Absolute path mounts are always relative to the container root.
-      if (mnt.has_source() && path::absolute(mnt.source())) {
+      if (mnt.has_source() && path::is_absolute(mnt.source())) {
         info->set_source(path::join(containerConfig.rootfs(), info->source()));
       }
     }
@@ -850,7 +850,8 @@ Future<Option<ContainerLaunchInfo>> LinuxFilesystemIsolatorProcess::prepare(
 
 Future<Nothing> LinuxFilesystemIsolatorProcess::update(
     const ContainerID& containerId,
-    const Resources& resources)
+    const Resources& resourceRequests,
+    const google::protobuf::Map<string, Value::Scalar>& resourceLimits)
 {
   if (containerId.has_parent()) {
     return Failure("Not supported for nested containers");
@@ -882,7 +883,7 @@ Future<Nothing> LinuxFilesystemIsolatorProcess::update(
       continue;
     }
 
-    if (resources.contains(resource)) {
+    if (resourceRequests.contains(resource)) {
       continue;
     }
 
@@ -923,7 +924,7 @@ Future<Nothing> LinuxFilesystemIsolatorProcess::update(
   vector<Future<gid_t>> futures;
 
   // We then mount new persistent volumes.
-  foreach (const Resource& resource, resources.persistentVolumes()) {
+  foreach (const Resource& resource, resourceRequests.persistentVolumes()) {
     // This is enforced by the master.
     CHECK(resource.disk().has_volume());
 
@@ -1075,7 +1076,7 @@ Future<Nothing> LinuxFilesystemIsolatorProcess::update(
   }
 
   // Store the new resources;
-  info->resources = resources;
+  info->resources = resourceRequests;
 
   return collect(futures)
     .then(defer(self(), [this, containerId](const vector<gid_t>& gids)

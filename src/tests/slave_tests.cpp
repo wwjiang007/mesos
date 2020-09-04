@@ -1556,7 +1556,8 @@ TEST_F(SlaveTest, StateEndpoint)
         "RESOURCE_PROVIDER",
         "RESIZE_VOLUME",
         "AGENT_OPERATION_FEEDBACK",
-        "AGENT_DRAINING"
+        "AGENT_DRAINING",
+        "TASK_RESOURCE_LIMITS"
       ]
     )~");
 
@@ -2416,11 +2417,13 @@ TEST_F(SlaveTest, StatisticsEndpointRunningExecutor)
   Try<JSON::Value> expected = JSON::parse(strings::format(
       "[{"
           "\"statistics\":{"
-              "\"cpus_limit\":%g,"
-              "\"mem_limit_bytes\":%lu"
+              "\"cpus_soft_limit\":%g,"
+              "\"mem_limit_bytes\":%lu,"
+              "\"mem_soft_limit_bytes\":%lu"
           "}"
       "}]",
       1 + slave::DEFAULT_EXECUTOR_CPUS,
+      (Megabytes(32) + slave::DEFAULT_EXECUTOR_MEM).bytes(),
       (Megabytes(32) + slave::DEFAULT_EXECUTOR_MEM).bytes()).get());
 
   ASSERT_SOME(expected);
@@ -2821,7 +2824,7 @@ TEST_F(SlaveTest, ROOT_ContainerizerDebugEndpoint)
     .WillOnce(DoAll(FutureSatisfy(&prepare),
                     Return(promise.future())));
 
-  EXPECT_CALL(*mockIsolator, update(_, _))
+  EXPECT_CALL(*mockIsolator, update(_, _, _))
     .WillOnce(Return(Nothing()));
 
   // Wrap `mockIsolator` in `PendingFutureTracker`.
@@ -3128,7 +3131,7 @@ TEST_F(SlaveTest, TerminalTaskContainerizerUpdateFailsWithLost)
   EXPECT_EQ(TASK_RUNNING, status2->state());
 
   // Set up the containerizer so the next update() will fail.
-  EXPECT_CALL(containerizer, update(_, _))
+  EXPECT_CALL(containerizer, update(_, _, _))
     .WillOnce(Return(Failure("update() failed")))
     .WillRepeatedly(Return(Nothing()));
 
@@ -3241,7 +3244,7 @@ TEST_F(SlaveTest, TerminalTaskContainerizerUpdateFailsWithGone)
   EXPECT_EQ(TASK_RUNNING, status2->state());
 
   // Set up the containerizer so the next update() will fail.
-  EXPECT_CALL(containerizer, update(_, _))
+  EXPECT_CALL(containerizer, update(_, _, _))
     .WillOnce(Return(Failure("update() failed")))
     .WillRepeatedly(Return(Nothing()));
 
@@ -3310,7 +3313,7 @@ TEST_F(SlaveTest, ContainerUpdatedBeforeTaskReachesExecutor)
   // sent to the executor.
   testing::Sequence sequence;
 
-  EXPECT_CALL(containerizer, update(_, _))
+  EXPECT_CALL(containerizer, update(_, _, _))
     .InSequence(sequence)
     .WillOnce(Return(Nothing()));
 
@@ -3368,7 +3371,7 @@ TEST_F(SlaveTest, TaskLaunchContainerizerUpdateFails)
     .Times(AtMost(1));
 
   // Set up the containerizer so update() will fail.
-  EXPECT_CALL(containerizer, update(_, _))
+  EXPECT_CALL(containerizer, update(_, _, _))
     .WillOnce(Return(Failure("update() failed")))
     .WillRepeatedly(Return(Nothing()));
 
@@ -7078,7 +7081,7 @@ TEST_F(SlaveTest, TaskLabels)
 
   Future<Nothing> update;
   EXPECT_CALL(containerizer,
-              update(_, Resources(offers.get()[0].resources())))
+              update(_, Resources(offers.get()[0].resources()), _))
     .WillOnce(DoAll(FutureSatisfy(&update),
                     Return(Nothing())));
 
@@ -12086,97 +12089,8 @@ TEST_F(
 }
 
 
-// When the agent receives a `DrainSlaveMessage` from the master, the agent's
-// drain info should be visible in the agent's API output.
-TEST_F(SlaveTest, DrainInfoInAPIOutputs)
-{
-  Clock::pause();
-
-  const int GRACE_PERIOD_NANOS = 1000000;
-
-  Try<Owned<cluster::Master>> master = StartMaster();
-  ASSERT_SOME(master);
-
-  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
-    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
-
-  StandaloneMasterDetector detector(master.get()->pid);
-
-  slave::Flags slaveFlags = CreateSlaveFlags();
-
-  Try<Owned<cluster::Slave>> slave = StartSlave(&detector, slaveFlags);
-  ASSERT_SOME(slave);
-
-  Clock::advance(slaveFlags.registration_backoff_factor);
-
-  AWAIT_READY(slaveRegisteredMessage);
-
-  // Simulate the master sending a `DrainSlaveMessage` to the agent.
-  DurationInfo maxGracePeriod;
-  maxGracePeriod.set_nanoseconds(GRACE_PERIOD_NANOS);
-
-  DrainConfig drainConfig;
-  drainConfig.set_mark_gone(true);
-  drainConfig.mutable_max_grace_period()->CopyFrom(maxGracePeriod);
-
-  DrainSlaveMessage drainSlaveMessage;
-  drainSlaveMessage.mutable_config()->CopyFrom(drainConfig);
-
-  process::post(master.get()->pid, slave.get()->pid, drainSlaveMessage);
-
-  Clock::settle();
-
-  {
-    v1::agent::Call call;
-    call.set_type(v1::agent::Call::GET_AGENT);
-
-    const ContentType contentType = ContentType::PROTOBUF;
-
-    process::http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
-    headers["Accept"] = stringify(contentType);
-
-    Future<process::http::Response> httpResponse =
-      process::http::post(
-          slave.get()->pid,
-          "api/v1",
-          headers,
-          serialize(contentType, call),
-          stringify(contentType));
-
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, httpResponse);
-
-    Future<v1::agent::Response> responseMessage =
-      deserialize<v1::agent::Response>(contentType, httpResponse->body);
-
-    AWAIT_READY(responseMessage);
-    ASSERT_TRUE(responseMessage->IsInitialized());
-    ASSERT_EQ(v1::agent::Response::GET_AGENT, responseMessage->type());
-    ASSERT_TRUE(responseMessage->get_agent().has_drain_config());
-    EXPECT_EQ(
-        drainConfig,
-        devolve(responseMessage->get_agent().drain_config()));
-  }
-
-  {
-    Future<Response> response = process::http::get(
-        slave.get()->pid,
-        "state",
-        None(),
-        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
-
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
-    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
-
-    Try<JSON::Object> state = JSON::parse<JSON::Object>(response->body);
-
-    ASSERT_SOME(state);
-
-    EXPECT_EQ(JSON::protobuf(drainConfig), state->values["drain_config"]);
-  }
-}
-
-
 // When an agent receives a `DrainSlaveMessage`, it should kill running tasks.
+// Agent API outputs related to draining are also verified.
 TEST_F(SlaveTest, DrainAgentKillsRunningTask)
 {
   Clock::pause();
@@ -12191,23 +12105,19 @@ TEST_F(SlaveTest, DrainAgentKillsRunningTask)
 
   slave::Flags slaveFlags = CreateSlaveFlags();
 
-  Try<Owned<cluster::Slave>> slave = StartSlave(&detector, slaveFlags);
+  Try<Owned<cluster::Slave>> slave = StartSlave(&detector, slaveFlags, true);
   ASSERT_SOME(slave);
+
+  slave.get()->start();
 
   Clock::advance(slaveFlags.registration_backoff_factor);
 
   AWAIT_READY(updateSlaveMessage);
 
-  // Set the partition-aware capability to ensure that the terminal update state
-  // is TASK_GONE_BY_OPERATOR, since we will set `mark_gone = true`.
-  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
-  frameworkInfo.add_capabilities()->set_type(
-      v1::FrameworkInfo::Capability::PARTITION_AWARE);
-
   auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
 
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
 
   Future<v1::scheduler::Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -12277,7 +12187,6 @@ TEST_F(SlaveTest, DrainAgentKillsRunningTask)
   maxGracePeriod.set_nanoseconds(0);
 
   DrainConfig drainConfig;
-  drainConfig.set_mark_gone(true);
   drainConfig.mutable_max_grace_period()->CopyFrom(maxGracePeriod);
 
   DrainSlaveMessage drainSlaveMessage;
@@ -12287,9 +12196,118 @@ TEST_F(SlaveTest, DrainAgentKillsRunningTask)
 
   AWAIT_READY(killedUpdate);
 
-  EXPECT_EQ(v1::TASK_GONE_BY_OPERATOR, killedUpdate->status().state());
+  EXPECT_EQ(v1::TASK_KILLED, killedUpdate->status().state());
   EXPECT_EQ(
       v1::TaskStatus::REASON_AGENT_DRAINING, killedUpdate->status().reason());
+
+  // Since the scheduler has not acknowledged the terminal task status update,
+  // the agent should still be in the draining state. Confirm that its drain
+  // info appears in API outputs.
+  {
+    v1::agent::Call call;
+    call.set_type(v1::agent::Call::GET_AGENT);
+
+    const ContentType contentType = ContentType::PROTOBUF;
+
+    process::http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
+    headers["Accept"] = stringify(contentType);
+
+    Future<process::http::Response> httpResponse =
+      process::http::post(
+          slave.get()->pid,
+          "api/v1",
+          headers,
+          serialize(contentType, call),
+          stringify(contentType));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, httpResponse);
+
+    Future<v1::agent::Response> responseMessage =
+      deserialize<v1::agent::Response>(contentType, httpResponse->body);
+
+    AWAIT_READY(responseMessage);
+    ASSERT_TRUE(responseMessage->get_agent().has_drain_config());
+    EXPECT_EQ(
+        drainConfig,
+        devolve(responseMessage->get_agent().drain_config()));
+  }
+
+  {
+    Future<Response> response = process::http::get(
+        slave.get()->pid,
+        "state",
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    Try<JSON::Object> state = JSON::parse<JSON::Object>(response->body);
+
+    ASSERT_SOME(state);
+
+    EXPECT_EQ(JSON::protobuf(drainConfig), state->values["drain_config"]);
+  }
+
+  // Now acknowledge the terminal update and confirm that the agent's drain info
+  // is gone.
+
+  Future<StatusUpdateAcknowledgementMessage> terminalAcknowledgement =
+    FUTURE_PROTOBUF(StatusUpdateAcknowledgementMessage(), _, _);
+
+  // The agent won't complete draining until the framework has been removed.
+  // Set up an expectation to await on this event.
+  Future<Nothing> removeFramework;
+  EXPECT_CALL(*slave.get()->mock(), removeFramework(_))
+    .WillOnce(DoAll(Invoke(slave.get()->mock(),
+                           &MockSlave::unmocked_removeFramework),
+                    FutureSatisfy(&removeFramework)));
+
+  {
+    Call call;
+    call.mutable_framework_id()->CopyFrom(frameworkId);
+    call.set_type(Call::ACKNOWLEDGE);
+
+    Call::Acknowledge* acknowledge = call.mutable_acknowledge();
+    acknowledge->mutable_task_id()->CopyFrom(killedUpdate->status().task_id());
+    acknowledge->mutable_agent_id()->CopyFrom(offer.agent_id());
+    acknowledge->set_uuid(killedUpdate->status().uuid());
+
+    mesos.send(call);
+  }
+
+  // Resume the clock so that the timer used by `delay()` in `os::reap()` can
+  // elapse and allow the executor process to be reaped.
+  Clock::resume();
+
+  AWAIT_READY(terminalAcknowledgement);
+  AWAIT_READY(removeFramework);
+
+  {
+    v1::agent::Call call;
+    call.set_type(v1::agent::Call::GET_AGENT);
+
+    const ContentType contentType = ContentType::PROTOBUF;
+
+    process::http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
+    headers["Accept"] = stringify(contentType);
+
+    Future<process::http::Response> httpResponse =
+      process::http::post(
+          slave.get()->pid,
+          "api/v1",
+          headers,
+          serialize(contentType, call),
+          stringify(contentType));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, httpResponse);
+
+    Future<v1::agent::Response> responseMessage =
+      deserialize<v1::agent::Response>(contentType, httpResponse->body);
+
+    AWAIT_READY(responseMessage);
+    ASSERT_FALSE(responseMessage->get_agent().has_drain_config());
+  }
 }
 
 
@@ -12379,7 +12397,7 @@ TEST_F(SlaveTest, DrainAgentKillsQueuedTask)
         FutureSatisfy(&launched),
         Return(launchResult.future())));
 
-  EXPECT_CALL(mockContainerizer, update(_, _))
+  EXPECT_CALL(mockContainerizer, update(_, _, _))
     .WillOnce(Return(Nothing()));
 
   mesos.send(

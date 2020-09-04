@@ -53,6 +53,7 @@ using std::string;
 using std::vector;
 using std::weak_ptr;
 
+using mesos::allocator::FrameworkOptions;
 using mesos::allocator::InverseOfferStatus;
 using mesos::allocator::Options;
 
@@ -202,6 +203,46 @@ static hashmap<string, vector<ResourceQuantities>> unpackFrameworkOfferFilters(
 }
 
 
+void ScalarResourceTotals::add(
+    const SlaveID& slaveID,
+    const Resources& resources)
+{
+  if (resources.scalars().empty()) {
+    // In this case, we avoid adding an entry to `scalars` to maintain the
+    // invariant that `scalars` doesn't track agents with empty resources.
+    return;
+  }
+
+  scalarsTotal -= ResourceQuantities::fromScalarResources(scalars[slaveID]);
+  scalars.at(slaveID) += resources.scalars();
+  scalarsTotal += ResourceQuantities::fromScalarResources(scalars.at(slaveID));
+}
+
+
+void ScalarResourceTotals::subtract(
+    const SlaveID& slaveID,
+    const Resources& resources)
+{
+  if (resources.scalars().empty()) {
+    // `scalars` does not track agents with empty resources, thus subtracting
+    // empty resources from an agent is valid regardless of whether its
+    // resources are tracked in `scalars`.
+    return;
+  }
+
+  CHECK_CONTAINS(scalars, slaveID);
+  CHECK_CONTAINS(scalars.at(slaveID), resources.scalars());
+
+  scalarsTotal -= ResourceQuantities::fromScalarResources(scalars.at(slaveID));
+  scalars.at(slaveID) -= resources.scalars();
+  scalarsTotal += ResourceQuantities::fromScalarResources(scalars.at(slaveID));
+
+  if (scalars.at(slaveID).empty()) {
+    scalars.erase(slaveID);
+  }
+}
+
+
 Role::Role(const string& _role, Role* _parent)
   : role(_role),
     basename(strings::split(role, "/").back()),
@@ -315,10 +356,10 @@ bool RoleTree::tryRemove(const std::string& role)
       break;
     }
 
-    CHECK(current->allocatedScalars_.empty())
+    CHECK(current->allocatedUnreservedNonRevocable.empty())
       << "An empty role " << current->role
       << " has non-empty allocated scalar resources: "
-      << current->allocatedScalars_;
+      << current->allocatedUnreservedNonRevocable.quantities();
 
     Role* parent = CHECK_NOTNULL(current->parent);
 
@@ -328,9 +369,17 @@ bool RoleTree::tryRemove(const std::string& role)
       (*metrics)->removeRole(current->role);
     }
 
-    CHECK(current->offeredOrAllocatedScalars_.empty())
-      << " role: " << role
-      << " offeredOrAllocated: " << current->offeredOrAllocatedScalars_;
+    CHECK(current->offeredOrAllocatedUnreservedNonRevocable.empty())
+      << "An empty role " << current->role
+      << " has non-empty offered or allocated"
+      << " unreserved non-revocable scalar resources: "
+      << current->offeredOrAllocatedUnreservedNonRevocable.quantities();
+
+    CHECK(current->offeredOrAllocatedReserved.empty())
+      << "An empty role " << current->role
+      << " has non-empty offered or allocated reserved scalar resources: "
+      << current->offeredOrAllocatedReserved.quantities();
+
     roles_.erase(current->role);
 
     current = parent;
@@ -385,28 +434,32 @@ void RoleTree::untrackReservations(const Resources& resources)
 }
 
 
-void RoleTree::trackAllocated(const Resources& resources_)
+void RoleTree::trackAllocated(
+    const SlaveID& slaveId,
+    const Resources& resources_)
 {
   foreachpair (
       const string& role,
       const Resources& resources,
-      resources_.scalars().allocations()) {
+      resources_.scalars().unreserved().nonRevocable().allocations()) {
     applyToRoleAndAncestors(CHECK_NOTNONE(get_(role)), [&](Role* current) {
-      current->allocatedScalars_ += resources;
+      current->allocatedUnreservedNonRevocable.add(slaveId, resources);
       updateQuotaConsumedMetric(current);
     });
   }
 }
 
 
-void RoleTree::untrackAllocated(const Resources& resources_)
+void RoleTree::untrackAllocated(
+    const SlaveID& slaveId,
+    const Resources& resources_)
 {
   foreachpair (
       const string& role,
       const Resources& resources,
-      resources_.scalars().allocations()) {
+      resources_.scalars().unreserved().nonRevocable().allocations()) {
     applyToRoleAndAncestors(CHECK_NOTNONE(get_(role)), [&](Role* current) {
-      current->allocatedScalars_ -= resources;
+      current->allocatedUnreservedNonRevocable.subtract(slaveId, resources);
       updateQuotaConsumedMetric(current);
     });
   }
@@ -453,7 +506,9 @@ void RoleTree::updateWeight(const string& role, double weight)
 }
 
 
-void RoleTree::trackOfferedOrAllocated(const Resources& resources_)
+void RoleTree::trackOfferedOrAllocated(
+    const SlaveID& slaveId,
+    const Resources& resources_)
 {
   // TODO(mzhu): avoid building a map by traversing `resources`
   // and look for the allocation role of individual resource.
@@ -464,14 +519,20 @@ void RoleTree::trackOfferedOrAllocated(const Resources& resources_)
       const Resources& resources,
       resources_.scalars().allocations()) {
     applyToRoleAndAncestors(
-        CHECK_NOTNONE(get_(role)), [&resources](Role* current) {
-      current->offeredOrAllocatedScalars_ += resources;
-    });
+        CHECK_NOTNONE(get_(role)), [&resources, &slaveId](Role* current) {
+          current->offeredOrAllocatedReserved.add(
+              slaveId, resources.reserved());
+
+          current->offeredOrAllocatedUnreservedNonRevocable.add(
+              slaveId, resources.unreserved().nonRevocable());
+        });
   }
 }
 
 
-void RoleTree::untrackOfferedOrAllocated(const Resources& resources_)
+void RoleTree::untrackOfferedOrAllocated(
+    const SlaveID& slaveId,
+    const Resources& resources_)
 {
   // TODO(mzhu): avoid building a map by traversing `resources`
   // and look for the allocation role of individual resource.
@@ -482,12 +543,13 @@ void RoleTree::untrackOfferedOrAllocated(const Resources& resources_)
       const Resources& resources,
       resources_.scalars().allocations()) {
     applyToRoleAndAncestors(
-        CHECK_NOTNONE(get_(role)), [&resources](Role* current) {
-      CHECK_CONTAINS(current->offeredOrAllocatedScalars_, resources)
-        << " Role: " << current->role
-        << " offeredOrAllocated: " << current->offeredOrAllocatedScalars_;
-      current->offeredOrAllocatedScalars_ -= resources;
-    });
+        CHECK_NOTNONE(get_(role)), [&resources, &slaveId](Role* current) {
+          current->offeredOrAllocatedReserved.subtract(
+              slaveId, resources.reserved());
+
+          current->offeredOrAllocatedUnreservedNonRevocable.subtract(
+              slaveId, resources.unreserved().nonRevocable());
+        });
   }
 }
 
@@ -503,8 +565,14 @@ std::string RoleTree::toJSON() const
       writer->field("limits", role->quota_.limits);
       writer->field(
           "reservation_quantities", role->reservationScalarQuantities_);
+
       writer->field(
-          "offered_or_allocated_scalars", role->offeredOrAllocatedScalars_);
+          "offered_or_allocated_reserved_quantities",
+          role->offeredOrAllocatedReserved.quantities());
+
+      writer->field(
+          "offered_or_allocated_unreserved_nonrevocable_quantities",
+          role->offeredOrAllocatedUnreservedNonRevocable.quantities());
 
       writer->field("frameworks", [&](JSON::ArrayWriter* writer) {
         foreach (const FrameworkID& id, role->frameworks_) {
@@ -528,17 +596,19 @@ std::string RoleTree::toJSON() const
 
 Framework::Framework(
     const FrameworkInfo& frameworkInfo,
-    const set<string>& _suppressedRoles,
+    FrameworkOptions&& options,
     bool _active,
     bool publishPerFrameworkMetrics)
   : frameworkId(frameworkInfo.id()),
     roles(protobuf::framework::getRoles(frameworkInfo)),
-    suppressedRoles(_suppressedRoles),
+    suppressedRoles(std::move(options.suppressedRoles)),
     capabilities(frameworkInfo.capabilities()),
     active(_active),
     metrics(new FrameworkMetrics(frameworkInfo, publishPerFrameworkMetrics)),
     minAllocatableResources(
-        unpackFrameworkOfferFilters(frameworkInfo.offer_filters())) {}
+        unpackFrameworkOfferFilters(frameworkInfo.offer_filters())),
+    offerConstraintsFilter(std::move(options.offerConstraintsFilter))
+{}
 
 
 void HierarchicalAllocatorProcess::initialize(
@@ -650,7 +720,7 @@ void HierarchicalAllocatorProcess::addFramework(
     const FrameworkInfo& frameworkInfo,
     const hashmap<SlaveID, Resources>& used,
     bool active,
-    const set<string>& suppressedRoles)
+    FrameworkOptions&& frameworkOptions)
 {
   CHECK(initialized);
   CHECK_NOT_CONTAINS(frameworks, frameworkId);
@@ -658,12 +728,16 @@ void HierarchicalAllocatorProcess::addFramework(
   // TODO(mzhu): remove the `frameworkId` parameter.
   CHECK_EQ(frameworkId, frameworkInfo.id());
 
-  frameworks.insert({frameworkId,
+  // NOTE: We don't use insert({frameworkId, Framework()}) here because with
+  // older versions of libstdc++ the argument type of
+  // std::unordered_map::insert(P&&)is deduced to be a non-copyable non-movable
+  // std::pair<const FrameworkId, Framework>.
+  frameworks.emplace(frameworkId,
                      Framework(
                          frameworkInfo,
-                         suppressedRoles,
+                         std::move(frameworkOptions),
                          active,
-                         options.publishPerFrameworkMetrics)});
+                         options.publishPerFrameworkMetrics));
 
   const Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
 
@@ -672,7 +746,7 @@ void HierarchicalAllocatorProcess::addFramework(
 
     Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
 
-    if (suppressedRoles.count(role)) {
+    if (framework.suppressedRoles.count(role)) {
       frameworkSorter->deactivate(frameworkId.value());
       framework.metrics->suppressRole(role);
     } else {
@@ -694,7 +768,7 @@ void HierarchicalAllocatorProcess::addFramework(
     // resources, so we only need to track them in the sorters.
     trackAllocatedResources(slaveId, frameworkId, resources);
 
-    roleTree.trackAllocated(resources);
+    roleTree.trackAllocated(slaveId, resources);
   }
 
   LOG(INFO) << "Added framework " << frameworkId;
@@ -817,7 +891,7 @@ void HierarchicalAllocatorProcess::deactivateFramework(
 void HierarchicalAllocatorProcess::updateFramework(
     const FrameworkID& frameworkId,
     const FrameworkInfo& frameworkInfo,
-    const set<string>& suppressedRoles)
+    FrameworkOptions&& frameworkOptions)
 {
   CHECK(initialized);
 
@@ -861,13 +935,21 @@ void HierarchicalAllocatorProcess::updateFramework(
   framework.minAllocatableResources =
     unpackFrameworkOfferFilters(frameworkInfo.offer_filters());
 
-  suppressRoles(framework, suppressedRoles - oldSuppressedRoles);
-  reviveRoles(framework, (oldSuppressedRoles - suppressedRoles) & newRoles);
+  framework.offerConstraintsFilter =
+    std::move(frameworkOptions.offerConstraintsFilter);
 
-  CHECK(framework.suppressedRoles == suppressedRoles)
+  suppressRoles(
+      framework,
+      frameworkOptions.suppressedRoles - oldSuppressedRoles);
+
+  reviveRoles(
+      framework,
+      (oldSuppressedRoles - frameworkOptions.suppressedRoles) & newRoles);
+
+  CHECK(framework.suppressedRoles == frameworkOptions.suppressedRoles)
     << "After updating framework " << frameworkId
     << " its set of suppressed roles " << stringify(framework.suppressedRoles)
-    << " differs from required " << stringify(suppressedRoles);
+    << " differs from required " << stringify(frameworkOptions.suppressedRoles);
 }
 
 
@@ -935,7 +1017,7 @@ void HierarchicalAllocatorProcess::addSlave(
 
     trackAllocatedResources(slaveId, frameworkId, allocation);
 
-    roleTree.trackAllocated(allocation);
+    roleTree.trackAllocated(slaveId, allocation);
   }
 
   // If we have just a number of recovered agents, we cannot distinguish
@@ -975,7 +1057,7 @@ void HierarchicalAllocatorProcess::removeSlave(
 
     // untrackAllocatedResources() potentially removes allocation roles, thus
     // we need to untrack actually allocated resources in the roles tree first.
-    roleTree.untrackAllocated(slave.totalAllocated);
+    roleTree.untrackAllocated(slaveId, slave.totalAllocated);
 
     // Untrack resources in roleTree and sorter.
     foreachpair (
@@ -1233,8 +1315,8 @@ void HierarchicalAllocatorProcess::updateAllocation(
   slave.increaseAvailable(frameworkId, offeredResources);
   slave.decreaseAvailable(frameworkId, updatedOfferedResources);
 
-  roleTree.untrackOfferedOrAllocated(offeredResources);
-  roleTree.trackOfferedOrAllocated(updatedOfferedResources);
+  roleTree.untrackOfferedOrAllocated(slaveId, offeredResources);
+  roleTree.trackOfferedOrAllocated(slaveId, updatedOfferedResources);
 
   // Update the allocation in the framework sorter.
   frameworkSorter->update(
@@ -1512,7 +1594,7 @@ void HierarchicalAllocatorProcess::transitionOfferedToAllocated(
     const Resources& resources)
 {
   CHECK_NOTNONE(getSlave(slaveId))->totalAllocated += resources;
-  roleTree.trackAllocated(resources);
+  roleTree.trackAllocated(slaveId, resources);
 }
 
 
@@ -1534,7 +1616,7 @@ void HierarchicalAllocatorProcess::recoverResources(
   if (isAllocated && slave.isSome()) {
     CHECK_CONTAINS((*slave)->totalAllocated, resources);
     (*slave)->totalAllocated -= resources;
-    roleTree.untrackAllocated(resources);
+    roleTree.untrackAllocated(slaveId, resources);
   }
 
   Option<Framework*> framework = getFramework(frameworkId);
@@ -1939,10 +2021,7 @@ void HierarchicalAllocatorProcess::__generateOffers()
     // these as metrics.
     if (r->quota() != DEFAULT_QUOTA) {
       logHeadroomInfo = true;
-      rolesConsumedQuota[r->role] +=
-        r->reservationScalarQuantities() +
-        ResourceQuantities::fromScalarResources(
-            r->offeredOrAllocatedScalars().unreserved().nonRevocable());
+      rolesConsumedQuota[r->role] += r->quotaOfferedOrConsumed();
     }
   }
 
@@ -1988,8 +2067,7 @@ void HierarchicalAllocatorProcess::__generateOffers()
   // unallocated reservations = total reservations - allocated reservations
   availableHeadroom -=
     roleTree.root()->reservationScalarQuantities() -
-    ResourceQuantities::fromScalarResources(
-        roleTree.root()->offeredOrAllocatedScalars().reserved());
+    roleTree.root()->offeredOrAllocatedReservedScalarQuantities();
 
   // Subtract revocable resources.
   foreachvalue (const Slave& slave, slaves) {
@@ -2076,6 +2154,18 @@ void HierarchicalAllocatorProcess::__generateOffers()
         if (unsatisfiedQuotaGuarantees.empty()) {
           break;
         }
+        FrameworkID frameworkId;
+        frameworkId.set_value(frameworkId_);
+
+        const Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
+        CHECK(framework.active) << frameworkId;
+
+        if (framework.offerConstraintsFilter.isSome() &&
+            framework.offerConstraintsFilter->isAgentExcluded(
+                role, slave.info)) {
+          // Framework filters the agent regardless of remaining resources.
+          continue;
+        }
 
         // Offer a shared resource only if it has not been offered in this
         // offer cycle to a framework.
@@ -2087,11 +2177,6 @@ void HierarchicalAllocatorProcess::__generateOffers()
           break; // Nothing left for the role.
         }
 
-        FrameworkID frameworkId;
-        frameworkId.set_value(frameworkId_);
-
-        const Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
-        CHECK(framework.active) << frameworkId;
 
         // An early `continue` optimization.
         if (!allocatable(available, role, framework)) {
@@ -2306,6 +2391,18 @@ void HierarchicalAllocatorProcess::__generateOffers()
       Sorter* frameworkSorter = CHECK_NOTNONE(getFrameworkSorter(role));
 
       foreach (const string& frameworkId_, frameworkSorter->sort()) {
+        FrameworkID frameworkId;
+        frameworkId.set_value(frameworkId_);
+
+        const Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
+
+        if (framework.offerConstraintsFilter.isSome() &&
+            framework.offerConstraintsFilter->isAgentExcluded(
+                role, slave.info)) {
+          // Framework filters the agent regardless of remaining resources.
+          continue;
+        }
+
         // Offer a shared resource only if it has not been offered in this
         // offer cycle to a framework.
         Resources available =
@@ -2316,10 +2413,6 @@ void HierarchicalAllocatorProcess::__generateOffers()
           break; // Nothing left for the role.
         }
 
-        FrameworkID frameworkId;
-        frameworkId.set_value(frameworkId_);
-
-        const Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
 
         // An early `continue` optimization.
         if (!allocatable(available, role, framework)) {
@@ -2458,7 +2551,17 @@ void HierarchicalAllocatorProcess::generateInverseOffers()
 
       foreachkey (
           const FrameworkID& frameworkId, slave.getOfferedOrAllocated()) {
-        const Framework& framework = *CHECK_NOTNONE(getFramework(frameworkId));
+        const Option<Framework*> framework_ = getFramework(frameworkId);
+        // NOTE: This method might be called in-between adding per-framework
+        // used resources on an agent via `addSlave()` and adding a framework
+        // via `addFramework()`.
+        if (framework_.isNone()) {
+          // Framework is using resources on an agent but has not yet been
+          // re-added to allocator via addFramework().
+          continue;
+        }
+
+        const Framework& framework = **framework_;
 
         // No need to deallocate for an inactive framework as the master
         // will not send it inverse offers.
@@ -3056,7 +3159,7 @@ void HierarchicalAllocatorProcess::trackAllocatedResources(
     CHECK_CONTAINS(*frameworkSorter, frameworkId.value())
       << " for role " << role;
 
-    roleTree.trackOfferedOrAllocated(allocation);
+    roleTree.trackOfferedOrAllocated(slaveId, allocation);
 
     roleSorter->allocated(role, slaveId, allocation);
     frameworkSorter->allocated(
@@ -3090,7 +3193,7 @@ void HierarchicalAllocatorProcess::untrackAllocatedResources(
     CHECK_CONTAINS(*frameworkSorter, frameworkId.value())
       << "for role " << role;
 
-    roleTree.untrackOfferedOrAllocated(allocation);
+    roleTree.untrackOfferedOrAllocated(slaveId, allocation);
 
     frameworkSorter->unallocated(frameworkId.value(), slaveId, allocation);
 

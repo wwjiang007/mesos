@@ -57,7 +57,13 @@ public:
 
   process::Future<Nothing> prepare(
       const ContainerID& containerId,
-      const std::string& cgroup) override;
+      const std::string& cgroup,
+      const mesos::slave::ContainerConfig& containerConfig) override;
+
+  process::Future<Nothing> isolate(
+      const ContainerID& containerId,
+      const std::string& cgroup,
+      pid_t pid) override;
 
   process::Future<Nothing> recover(
       const ContainerID& containerId,
@@ -70,7 +76,9 @@ public:
   process::Future<Nothing> update(
       const ContainerID& containerId,
       const std::string& cgroup,
-      const Resources& resources) override;
+      const Resources& resourceRequests,
+      const google::protobuf::Map<
+          std::string, Value::Scalar>& resourceLimits = {}) override;
 
   process::Future<ResourceStatistics> usage(
       const ContainerID& containerId,
@@ -91,6 +99,16 @@ private:
         process::Owned<cgroups::memory::pressure::Counter>> pressureCounters;
 
     process::Promise<mesos::slave::ContainerLimitation> limitation;
+
+    // Indicate whether the memory hard limit of this container has
+    // already been updated.
+    bool hardLimitUpdated;
+
+    // Indicates whether this is a command task container. Please note
+    // that we only need to use this field in isolating phase, so we do
+    // not recover it after agent restarts, that means its value may not
+    // be correct after agent recovery.
+    bool isCommandTask;
   };
 
   MemorySubsystemProcess(const Flags& flags, const std::string& hierarchy);

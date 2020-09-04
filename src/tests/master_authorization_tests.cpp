@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include <atomic>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -68,6 +69,9 @@
 
 namespace http = process::http;
 
+using std::shared_ptr;
+using std::weak_ptr;
+
 using google::protobuf::RepeatedPtrField;
 
 using mesos::internal::master::Master;
@@ -102,7 +106,9 @@ using testing::An;
 using testing::AtMost;
 using testing::DoAll;
 using testing::Eq;
+using testing::Ne;
 using testing::Invoke;
+using testing::InvokeWithoutArgs;
 using testing::Return;
 using testing::Truly;
 
@@ -386,628 +392,6 @@ TEST_F(MasterAuthorizationTest, UnauthorizedTaskGroup)
   driver.join();
 }
 
-
-// This test verifies that a 'killTask()' that comes before
-// '_accept()' is called results in TASK_KILLED.
-TEST_F(MasterAuthorizationTest, KillTask)
-{
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  MockExecutor exec(DEFAULT_EXECUTOR_ID);
-  TestContainerizer containerizer(&exec);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
-  ASSERT_SOME(slave);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  EXPECT_CALL(sched, registered(&driver, _, _));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->empty());
-
-  TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
-
-  // Return a pending future from authorizer.
-  Future<Nothing> authorize;
-  Promise<bool> promise;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())));
-
-  driver.launchTasks(offers.get()[0].id(), {task});
-
-  // Wait until authorization is in progress.
-  AWAIT_READY(authorize);
-
-  Future<TaskStatus> status;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status));
-
-  Future<Nothing> recoverResources =
-    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
-
-  // Now kill the task.
-  driver.killTask(task.task_id());
-
-  // Framework should get a TASK_KILLED right away.
-  AWAIT_READY(status);
-  EXPECT_EQ(TASK_KILLED, status->state());
-  EXPECT_EQ(TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH, status->reason());
-
-  // Now complete authorization.
-  promise.set(true);
-
-  // No task launch should happen resulting in all resources being
-  // returned to the allocator.
-  AWAIT_READY(recoverResources);
-
-  // Make sure the task is not known to master anymore.
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .Times(0);
-
-  driver.reconcileTasks({});
-
-  // We settle the clock here to ensure any updates sent by the master
-  // are received. There shouldn't be any updates in this case.
-  Clock::pause();
-  Clock::settle();
-
-  driver.stop();
-  driver.join();
-}
-
-
-// This test verifies that if a pending task in a task group
-// is killed, then the entire group will be killed.
-TEST_F(MasterAuthorizationTest, KillPendingTaskInTaskGroup)
-{
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
-  ASSERT_SOME(slave);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  Future<FrameworkID> frameworkId;
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .WillOnce(FutureArg<1>(&frameworkId));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(frameworkId);
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->empty());
-
-  Resources resources =
-    Resources::parse("cpus:0.1;mem:32;disk:32").get();
-
-  ExecutorInfo executor;
-  executor.set_type(ExecutorInfo::DEFAULT);
-  executor.mutable_executor_id()->set_value("E");
-  executor.mutable_framework_id()->CopyFrom(frameworkId.get());
-  executor.mutable_resources()->CopyFrom(resources);
-
-  TaskInfo task1;
-  task1.set_name("1");
-  task1.mutable_task_id()->set_value("1");
-  task1.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
-  task1.mutable_resources()->MergeFrom(resources);
-
-  TaskInfo task2;
-  task2.set_name("2");
-  task2.mutable_task_id()->set_value("2");
-  task2.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
-  task2.mutable_resources()->MergeFrom(resources);
-
-  TaskGroupInfo taskGroup;
-  taskGroup.add_tasks()->CopyFrom(task1);
-  taskGroup.add_tasks()->CopyFrom(task2);
-
-  // Return a pending future from authorizer.
-  Future<Nothing> authorize1;
-  Future<Nothing> authorize2;
-  Promise<bool> promise1;
-  Promise<bool> promise2;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize1),
-                    Return(promise1.future())))
-    .WillOnce(DoAll(FutureSatisfy(&authorize2),
-                    Return(promise2.future())));
-
-  Future<TaskStatus> task1Status;
-  Future<TaskStatus> task2Status;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&task1Status))
-    .WillOnce(FutureArg<1>(&task2Status));
-
-  Offer::Operation operation;
-  operation.set_type(Offer::Operation::LAUNCH_GROUP);
-
-  Offer::Operation::LaunchGroup* launchGroup =
-    operation.mutable_launch_group();
-
-  launchGroup->mutable_executor()->CopyFrom(executor);
-  launchGroup->mutable_task_group()->CopyFrom(taskGroup);
-
-  driver.acceptOffers({offers.get()[0].id()}, {operation});
-
-  // Wait until all authorizations are in progress.
-  AWAIT_READY(authorize1);
-  AWAIT_READY(authorize2);
-
-  Future<Nothing> recoverResources =
-    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
-
-  // Now kill task1.
-  driver.killTask(task1.task_id());
-
-  AWAIT_READY(task1Status);
-  EXPECT_EQ(TASK_KILLED, task1Status->state());
-  EXPECT_TRUE(strings::contains(
-      task1Status->message(), "Killed before delivery to the agent"));
-  EXPECT_EQ(TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
-            task1Status->reason());
-
-  // Now complete authorizations for task1 and task2.
-  promise1.set(true);
-  promise2.set(true);
-
-  AWAIT_READY(task2Status);
-  EXPECT_EQ(TASK_KILLED, task2Status->state());
-  EXPECT_TRUE(strings::contains(
-      task2Status->message(),
-      "A task within the task group was killed before delivery to the agent"));
-  EXPECT_EQ(TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
-            task2Status->reason());
-
-  // No task launch should happen resulting in all resources being
-  // returned to the allocator.
-  AWAIT_READY(recoverResources);
-
-  // Make sure the task group is not known to master anymore.
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .Times(0);
-
-  driver.reconcileTasks({});
-
-  // We settle the clock here to ensure any updates sent by the master
-  // are received. There shouldn't be any updates in this case.
-  Clock::pause();
-  Clock::settle();
-
-  driver.stop();
-  driver.join();
-}
-
-
-// This test verifies that a slave removal that comes before
-// '_accept()' is called results in TASK_LOST for a framework that is
-// not partition-aware.
-TEST_F(MasterAuthorizationTest, SlaveRemovedLost)
-{
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  MockExecutor exec(DEFAULT_EXECUTOR_ID);
-  TestContainerizer containerizer(&exec);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
-  ASSERT_SOME(slave);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  EXPECT_CALL(sched, registered(&driver, _, _));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->empty());
-
-  TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
-
-  // Return a pending future from authorizer.
-  Future<Nothing> authorize;
-  Promise<bool> promise;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())));
-
-  driver.launchTasks(offers.get()[0].id(), {task});
-
-  // Wait until authorization is in progress.
-  AWAIT_READY(authorize);
-
-  Future<Nothing> slaveLost;
-  EXPECT_CALL(sched, slaveLost(&driver, _))
-    .WillOnce(FutureSatisfy(&slaveLost));
-
-  Future<Nothing> recoverResources =
-    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
-
-  // Stop the slave with explicit shutdown as otherwise with
-  // checkpointing the master will wait for the slave to reconnect.
-  slave.get()->shutdown();
-  slave->reset();
-
-  AWAIT_READY(slaveLost);
-
-  Future<TaskStatus> status;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status));
-
-  // Now complete authorization.
-  promise.set(true);
-
-  // Framework should get a TASK_LOST.
-  AWAIT_READY(status);
-
-  EXPECT_EQ(TASK_LOST, status->state());
-  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status->source());
-  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, status->reason());
-
-  // No task launch should happen resulting in all resources being
-  // returned to the allocator.
-  AWAIT_READY(recoverResources);
-
-  // Check metrics.
-  JSON::Object stats = Metrics();
-  EXPECT_EQ(0u, stats.values["master/tasks_dropped"]);
-  EXPECT_EQ(1u, stats.values["master/tasks_lost"]);
-  EXPECT_EQ(
-      1u, stats.values["master/task_lost/source_master/reason_slave_removed"]);
-
-  // Make sure the task is not known to master anymore.
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .Times(0);
-
-  driver.reconcileTasks({});
-
-  // We settle the clock here to ensure any updates sent by the master
-  // are received. There shouldn't be any updates in this case.
-  Clock::pause();
-  Clock::settle();
-
-  driver.stop();
-  driver.join();
-}
-
-
-// This test verifies that a slave removal that comes before
-// '_accept()' is called results in TASK_DROPPED for a framework that
-// is partition-aware.
-TEST_F(MasterAuthorizationTest, SlaveRemovedDropped)
-{
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  MockExecutor exec(DEFAULT_EXECUTOR_ID);
-  TestContainerizer containerizer(&exec);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
-  ASSERT_SOME(slave);
-
-  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
-  frameworkInfo.add_capabilities()->set_type(
-      FrameworkInfo::Capability::PARTITION_AWARE);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  EXPECT_CALL(sched, registered(&driver, _, _));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->empty());
-
-  TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
-
-  // Return a pending future from authorizer.
-  Future<Nothing> authorize;
-  Promise<bool> promise;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())));
-
-  driver.launchTasks(offers.get()[0].id(), {task});
-
-  // Wait until authorization is in progress.
-  AWAIT_READY(authorize);
-
-  Future<Nothing> slaveLost;
-  EXPECT_CALL(sched, slaveLost(&driver, _))
-    .WillOnce(FutureSatisfy(&slaveLost));
-
-  Future<Nothing> recoverResources =
-    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
-
-  // Stop the slave with explicit shutdown as otherwise with
-  // checkpointing the master will wait for the slave to reconnect.
-  slave.get()->shutdown();
-  slave->reset();
-
-  AWAIT_READY(slaveLost);
-
-  Future<TaskStatus> status;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status));
-
-  // Now complete authorization.
-  promise.set(true);
-
-  // Framework should get a TASK_DROPPED.
-  AWAIT_READY(status);
-
-  EXPECT_EQ(TASK_DROPPED, status->state());
-  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status->source());
-  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, status->reason());
-
-  // No task launch should happen resulting in all resources being
-  // returned to the allocator.
-  AWAIT_READY(recoverResources);
-
-  // Check metrics.
-  JSON::Object stats = Metrics();
-  EXPECT_EQ(0u, stats.values["master/tasks_lost"]);
-  EXPECT_EQ(1u, stats.values["master/tasks_dropped"]);
-  EXPECT_EQ(
-      1u,
-      stats.values["master/task_dropped/source_master/reason_slave_removed"]);
-
-  // Make sure the task is not known to master anymore.
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .Times(0);
-
-  driver.reconcileTasks({});
-
-  // We settle the clock here to ensure any updates sent by the master
-  // are received. There shouldn't be any updates in this case.
-  Clock::pause();
-  Clock::settle();
-
-  driver.stop();
-  driver.join();
-}
-
-
-// This test verifies that a framework removal that comes before
-// '_accept()' is called results in recovery of resources.
-TEST_F(MasterAuthorizationTest, FrameworkRemoved)
-{
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  MockExecutor exec(DEFAULT_EXECUTOR_ID);
-  TestContainerizer containerizer(&exec);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
-  ASSERT_SOME(slave);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  EXPECT_CALL(sched, registered(&driver, _, _));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->empty());
-
-  TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
-
-  // Return a pending future from authorizer.
-  Future<Nothing> authorize;
-  Promise<bool> promise;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())));
-
-  driver.launchTasks(offers.get()[0].id(), {task});
-
-  // Wait until authorization is in progress.
-  AWAIT_READY(authorize);
-
-  Future<Nothing> removeFramework =
-    FUTURE_DISPATCH(_, &MesosAllocatorProcess::removeFramework);
-
-  Future<Nothing> recoverResources =
-    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
-
-  // Now stop the framework.
-  driver.stop();
-  driver.join();
-
-  AWAIT_READY(removeFramework);
-
-  // Now complete authorization.
-  promise.set(true);
-
-  // No task launch should happen resulting in all resources being
-  // returned to the allocator.
-  AWAIT_READY(recoverResources);
-}
-
-
-// This test verifies that two tasks each launched on a different
-// slave with same executor id but different executor info are
-// allowed even when the first task is pending due to authorization.
-TEST_F(MasterAuthorizationTest, PendingExecutorInfoDiffersOnDifferentSlaves)
-{
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  Future<Nothing> registered;
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .WillOnce(FutureSatisfy(&registered));
-
-  driver.start();
-
-  AWAIT_READY(registered);
-
-  Future<vector<Offer>> offers1;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers1));
-
-  // Start the first slave.
-  MockExecutor exec1(DEFAULT_EXECUTOR_ID);
-  TestContainerizer containerizer1(&exec1);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave1 =
-    StartSlave(detector.get(), &containerizer1);
-  ASSERT_SOME(slave1);
-
-  AWAIT_READY(offers1);
-  ASSERT_FALSE(offers1->empty());
-
-  // Launch the first task with the default executor id.
-  ExecutorInfo executor1;
-  executor1 = DEFAULT_EXECUTOR_INFO;
-  executor1.mutable_command()->set_value("exit 1");
-
-  TaskInfo task1 = createTask(
-      offers1.get()[0], executor1.command().value(), executor1.executor_id());
-
-  // Return a pending future from authorizer.
-  // Note that we retire this expectation after its use because
-  // the authorizer will next be called when `slave2` registers and
-  // this expectation would be hit again (and be oversaturated) if
-  // we don't retire. New expectations on `authorizer` will be set
-  // after `slave2` is registered.
-  Future<Nothing> authorize;
-  Promise<bool> promise;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())))
-    .RetiresOnSaturation();
-
-  driver.launchTasks(offers1.get()[0].id(), {task1});
-
-  // Wait until authorization is in progress.
-  AWAIT_READY(authorize);
-
-  Future<vector<Offer>> offers2;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  // Now start the second slave.
-  MockExecutor exec2(DEFAULT_EXECUTOR_ID);
-  TestContainerizer containerizer2(&exec2);
-
-  Try<Owned<cluster::Slave>> slave2 =
-    StartSlave(detector.get(), &containerizer2);
-  ASSERT_SOME(slave2);
-
-  AWAIT_READY(offers2);
-  ASSERT_FALSE(offers2->empty());
-
-  // Now launch the second task with the same executor id but
-  // a different executor command.
-  ExecutorInfo executor2;
-  executor2 = executor1;
-  executor2.mutable_command()->set_value("exit 2");
-
-  TaskInfo task2 = createTask(
-      offers2.get()[0], executor2.command().value(), executor2.executor_id());
-
-  EXPECT_CALL(exec2, registered(_, _, _, _));
-
-  EXPECT_CALL(exec2, launchTask(_, _))
-    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
-
-  Future<TaskStatus> status2;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status2));
-
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(Return(true));
-
-  driver.launchTasks(offers2.get()[0].id(), {task2});
-
-  AWAIT_READY(status2);
-  ASSERT_EQ(TASK_RUNNING, status2->state());
-
-  EXPECT_CALL(exec1, registered(_, _, _, _));
-
-  EXPECT_CALL(exec1, launchTask(_, _))
-    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
-
-  Future<TaskStatus> status1;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status1));
-
-  // Complete authorization of 'task1'.
-  promise.set(true);
-
-  AWAIT_READY(status1);
-  ASSERT_EQ(TASK_RUNNING, status1->state());
-
-  EXPECT_CALL(exec1, shutdown(_))
-    .Times(AtMost(1));
-
-  EXPECT_CALL(exec2, shutdown(_))
-    .Times(AtMost(1));
-
-  driver.stop();
-  driver.join();
-}
-
-
 // This test verifies that a framework registration with authorized
 // role is successful.
 TEST_F(MasterAuthorizationTest, AuthorizedRole)
@@ -1084,6 +468,59 @@ TEST_F(MasterAuthorizationTest, UnauthorizedRole)
   driver.join();
 }
 
+static shared_ptr<const ObjectApprover> getAcceptingObjectApprover()
+{
+  return std::make_shared<AcceptingObjectApprover>();
+}
+
+
+// This test verifies that disconnected frameworks do not own
+// `ObjectApprover`s.
+TEST_F(MasterAuthorizationTest, ObjectApproversDeletedOnDisconnection)
+{
+  shared_ptr<const ObjectApprover> approver = getAcceptingObjectApprover();
+
+  MockAuthorizer authorizer;
+  const weak_ptr<const ObjectApprover> weakApprover {approver};
+
+  EXPECT_CALL(authorizer, getApprover(_, _))
+    .WillRepeatedly(InvokeWithoutArgs([weakApprover]() {
+      auto approver = weakApprover.lock();
+      CHECK(approver);
+      return approver;
+    }));
+
+  const Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
+  ASSERT_SOME(master);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_failover_timeout(Weeks(2).secs());
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  driver.start();
+
+  AWAIT_READY(registered);
+
+  // Disconnect framework but do not tear it down.
+  driver.stop(true);
+  driver.join();
+
+  Clock::pause();
+  Clock::settle();
+
+  // Make sure that the test itself doesn't store approver anymore.
+  approver.reset();
+
+  ASSERT_TRUE(weakApprover.expired());
+}
+
 
 // This test verifies that an authentication request that comes from
 // the same instance of the framework (e.g., ZK blip) before
@@ -1108,15 +545,18 @@ TEST_F(MasterAuthorizationTest, DuplicateRegistration)
 
   // Return pending futures from authorizer.
   Future<Nothing> authorize1;
-  Promise<bool> promise1;
+  Promise<shared_ptr<const ObjectApprover>> promise1;
   Future<Nothing> authorize2;
-  Promise<bool> promise2;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize1),
-                    Return(promise1.future())))
-    .WillOnce(DoAll(FutureSatisfy(&authorize2),
-                    Return(promise2.future())))
-    .WillRepeatedly(Return(true)); // Authorize subsequent registration retries.
+  Promise<shared_ptr<const ObjectApprover>> promise2;
+
+  // Expect requests for two approvers for REGISTER_FRAMEWORK.
+  EXPECT_CALL(authorizer, getApprover(_, authorization::REGISTER_FRAMEWORK))
+    .WillOnce(DoAll(FutureSatisfy(&authorize1), Return(promise1.future())))
+    .WillOnce(DoAll(FutureSatisfy(&authorize2), Return(promise2.future())));
+
+  // Handle requests for all other approvers.
+  EXPECT_CALL(authorizer, getApprover(_, Ne(authorization::REGISTER_FRAMEWORK)))
+    .WillRepeatedly(Return(getAcceptingObjectApprover()));
 
   // Pause the clock to avoid registration retries.
   Clock::pause();
@@ -1133,7 +573,7 @@ TEST_F(MasterAuthorizationTest, DuplicateRegistration)
   AWAIT_READY(authorize2);
 
   // Now complete the first authorization attempt.
-  promise1.set(true);
+  promise1.set(getAcceptingObjectApprover());
 
   // First registration request should succeed because the
   // framework PID did not change.
@@ -1143,7 +583,7 @@ TEST_F(MasterAuthorizationTest, DuplicateRegistration)
     FUTURE_PROTOBUF(FrameworkRegisteredMessage(), _, _);
 
   // Now complete the second authorization attempt.
-  promise2.set(true);
+  promise2.set(getAcceptingObjectApprover());
 
   // Master should acknowledge the second registration attempt too.
   AWAIT_READY(frameworkRegisteredMessage);
@@ -1176,16 +616,16 @@ TEST_F(MasterAuthorizationTest, DuplicateReregistration)
 
   // Return pending futures from authorizer after the first attempt.
   Future<Nothing> authorize2;
-  Promise<bool> promise2;
+  Promise<shared_ptr<const ObjectApprover>> promise2;
   Future<Nothing> authorize3;
-  Promise<bool> promise3;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(Return(true))
-    .WillOnce(DoAll(FutureSatisfy(&authorize2),
-                    Return(promise2.future())))
-    .WillOnce(DoAll(FutureSatisfy(&authorize3),
-                    Return(promise3.future())))
-    .WillRepeatedly(Return(true)); // Authorize subsequent registration retries.
+  Promise<shared_ptr<const ObjectApprover>> promise3;
+  EXPECT_CALL(authorizer, getApprover(_, authorization::REGISTER_FRAMEWORK))
+    .WillOnce(Return(getAcceptingObjectApprover()))
+    .WillOnce(DoAll(FutureSatisfy(&authorize2), Return(promise2.future())))
+    .WillOnce(DoAll(FutureSatisfy(&authorize3), Return(promise3.future())));
+
+  EXPECT_CALL(authorizer, getApprover(_, Ne(authorization::REGISTER_FRAMEWORK)))
+    .WillRepeatedly(Return(getAcceptingObjectApprover()));
 
   // Pause the clock to avoid re-registration retries.
   Clock::pause();
@@ -1214,7 +654,7 @@ TEST_F(MasterAuthorizationTest, DuplicateReregistration)
     .WillOnce(FutureSatisfy(&reregistered));
 
   // Now complete the second authorization attempt.
-  promise2.set(true);
+  promise2.set(getAcceptingObjectApprover());
 
   // First re-registration request should succeed because the
   // framework PID did not change.
@@ -1224,7 +664,7 @@ TEST_F(MasterAuthorizationTest, DuplicateReregistration)
     FUTURE_PROTOBUF(FrameworkReregisteredMessage(), _, _);
 
   // Now complete the third authorization attempt.
-  promise3.set(true);
+  promise3.set(getAcceptingObjectApprover());
 
   // Master should acknowledge the second re-registration attempt too.
   AWAIT_READY(frameworkReregisteredMessage);
@@ -1235,7 +675,7 @@ TEST_F(MasterAuthorizationTest, DuplicateReregistration)
 
 
 // This test ensures that a framework that is removed while
-// authorization for registration is in progress is properly handled.
+// obtaining ObjectApprovers during registration is properly handled.
 TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeRegistration)
 {
   MockAuthorizer authorizer;
@@ -1248,11 +688,13 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeRegistration)
 
   // Return a pending future from authorizer.
   Future<Nothing> authorize;
-  Promise<bool> promise;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())))
-    .WillRepeatedly(Return(true)); // Authorize subsequent registration retries.
+  Promise<shared_ptr<const ObjectApprover>> promise;
+  EXPECT_CALL(authorizer, getApprover(_, authorization::REGISTER_FRAMEWORK))
+    .WillRepeatedly(DoAll(FutureSatisfy(&authorize), Return(promise.future())));
+
+  EXPECT_CALL(authorizer, getApprover(_, Ne(authorization::REGISTER_FRAMEWORK)))
+    .WillRepeatedly(Return(getAcceptingObjectApprover()));
+
 
   // Pause the clock to avoid scheduler registration retries.
   Clock::pause();
@@ -1276,8 +718,8 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeRegistration)
   Future<Nothing> removeFramework =
     FUTURE_DISPATCH(_, &MesosAllocatorProcess::removeFramework);
 
-  // Now complete authorization.
-  promise.set(true);
+  // Now make all the returned approvers ready.
+  promise.set(getAcceptingObjectApprover());
 
   // When the master tries to link to a non-existent framework PID
   // it should realize the framework is gone and remove it.
@@ -1305,13 +747,17 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeReregistration)
   EXPECT_CALL(sched, registered(&driver, _, _))
     .WillOnce(FutureSatisfy(&registered));
 
-  // Return a pending future from authorizer after first attempt.
+  // Return a pending future from authorizer after first request for
+  // REGISTER_FRAMEWORK approver
   Future<Nothing> authorize2;
-  Promise<bool> promise2;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(Return(true))
-    .WillOnce(DoAll(FutureSatisfy(&authorize2),
-                    Return(promise2.future())));
+  Promise<shared_ptr<const ObjectApprover>> promise2;
+  EXPECT_CALL(authorizer, getApprover(_, authorization::REGISTER_FRAMEWORK))
+    .WillOnce(Return(getAcceptingObjectApprover()))
+    .WillOnce(DoAll(FutureSatisfy(&authorize2), Return(promise2.future())));
+
+  // Handle all other actions.
+  EXPECT_CALL(authorizer, getApprover(_, Ne(authorization::REGISTER_FRAMEWORK)))
+    .WillRepeatedly(Return(getAcceptingObjectApprover()));
 
   // Pause the clock to avoid scheduler registration retries.
   Clock::pause();
@@ -1344,7 +790,7 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeReregistration)
   AWAIT_READY(removeFramework);
 
   // Now complete the second authorization attempt.
-  promise2.set(true);
+  promise2.set(getAcceptingObjectApprover());
 
   // Master should drop the second framework re-registration request
   // because the framework PID was removed from 'authenticated' map.
@@ -3189,6 +2635,23 @@ public:
 };
 
 
+class ControllableObjectApprover : public ObjectApprover
+{
+public:
+  ControllableObjectApprover(bool permissive_) : permissive(permissive_) {}
+  void disable() { permissive.store(false); }
+
+  Try<bool> approved(
+      const Option<ObjectApprover::Object>&) const noexcept override
+  {
+    return permissive.load();
+  }
+
+private:
+  std::atomic_bool permissive;
+};
+
+
 INSTANTIATE_TEST_CASE_P(
     AllowedAction,
     MasterOperationAuthorizationTest,
@@ -3215,14 +2678,18 @@ TEST_P(MasterOperationAuthorizationTest, Accept)
 {
   Clock::pause();
 
-  // We use this flag to control when the mock authorizer starts to deny
-  // disallowed actions.
-  std::atomic_bool permissive(true);
+  const auto controllableApprover =
+    std::make_shared<ControllableObjectApprover>(true);
 
   MockAuthorizer authorizer;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillRepeatedly(Invoke([&](const authorization::Request& request) {
-      return permissive || request.action() == GetParam();
+
+  const authorization::Action allowedAction = GetParam();
+  EXPECT_CALL(authorizer, getApprover(_, _))
+    .WillRepeatedly(Invoke([controllableApprover, allowedAction](
+                               const Option<authorization::Subject>&,
+                               const authorization::Action& action) {
+      return action == allowedAction ? getAcceptingObjectApprover()
+                                     : controllableApprover;
     }));
 
   Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
@@ -3476,7 +2943,7 @@ TEST_P(MasterOperationAuthorizationTest, Accept)
   EXPECT_EQ(frameworkId, subscribed->framework_id());
 
   // Start to deny disallowed actions.
-  permissive = false;
+  controllableApprover->disable();
 
   AWAIT_READY(offers);
   ASSERT_EQ(1, offers->offers_size());

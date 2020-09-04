@@ -130,6 +130,10 @@ public:
         mesos::SecretGenerator* secretGenerator,
         VolumeGidManager* volumeGidManager,
         PendingFutureTracker* futureTracker,
+        process::Owned<CSIServer>&& csiServer,
+#ifndef __WINDOWS__
+        const Option<process::network::unix::Socket>& executorSocket,
+#endif // __WINDOWS__
         const Option<Authorizer*>& authorizer);
 
   ~Slave() override;
@@ -155,6 +159,9 @@ public:
       const process::UPID& from,
       RunTaskMessage&& runTaskMessage);
 
+  Option<Error> validateResourceLimitsAndIsolators(
+      const std::vector<TaskInfo>& tasks);
+
   // Made 'virtual' for Slave mocking.
   virtual void runTask(
       const process::UPID& from,
@@ -172,7 +179,8 @@ public:
       Option<TaskGroupInfo> taskGroup,
       const std::vector<ResourceVersionUUID>& resourceVersionUuids,
       const process::UPID& pid,
-      const Option<bool>& launchExecutor);
+      const Option<bool>& launchExecutor,
+      bool executorGeneratedForCommandTask);
 
   // Made 'virtual' for Slave mocking.
   //
@@ -196,7 +204,8 @@ public:
       const Option<TaskInfo>& task,
       const Option<TaskGroupInfo>& taskGroup,
       const std::vector<ResourceVersionUUID>& resourceVersionUuids,
-      const Option<bool>& launchExecutor);
+      const Option<bool>& launchExecutor,
+      bool executorGeneratedForCommandTask);
 
   // This is called when the resource limits of the container have
   // been updated for the given tasks and task groups. If the update is
@@ -471,6 +480,7 @@ public:
       const process::Future<Option<Secret>>& authorizationToken,
       const FrameworkID& frameworkId,
       const ExecutorInfo& executorInfo,
+      const google::protobuf::Map<std::string, Value::Scalar>& executorLimits,
       const Option<TaskInfo>& taskInfo);
 
   void fileAttached(const process::Future<Nothing>& result,
@@ -773,6 +783,14 @@ private:
       const Flags& flags,
       const SlaveID& slaveId);
 
+  // This function is used to compute limits for executors before they
+  // are launched as well as when updating running executors, so we must
+  // accept both `TaskInfo` and `Task` types to handle both cases.
+  google::protobuf::Map<std::string, Value::Scalar> computeExecutorLimits(
+      const Resources& executorResources,
+      const std::vector<TaskInfo>& taskInfos,
+      const std::vector<Task*>& tasks = {}) const;
+
   protobuf::master::Capabilities requiredMasterCapabilities;
 
   const Flags flags;
@@ -871,6 +889,14 @@ private:
 
   PendingFutureTracker* futureTracker;
 
+  process::Owned<CSIServer> csiServer;
+
+#ifndef __WINDOWS__
+  Option<process::network::unix::Socket> executorSocket;
+#endif // __WINDOWS__
+
+  Option<process::http::Server> executorSocketServer;
+
   const Option<Authorizer*> authorizer;
 
   // The most recent estimate of the total amount of oversubscribed
@@ -938,7 +964,8 @@ public:
       const ContainerID& containerId,
       const std::string& directory,
       const Option<std::string>& user,
-      bool checkpoint);
+      bool checkpoint,
+      bool isGeneratedForCommandTask);
 
   ~Executor();
 
@@ -1138,7 +1165,10 @@ public:
 
   const FrameworkID id() const { return info.id(); }
 
-  Try<Executor*> addExecutor(const ExecutorInfo& executorInfo);
+  Try<Executor*> addExecutor(
+    const ExecutorInfo& executorInfo,
+    bool isGeneratedForCommandTask);
+
   Executor* getExecutor(const ExecutorID& executorId) const;
   Executor* getExecutor(const TaskID& taskId) const;
 

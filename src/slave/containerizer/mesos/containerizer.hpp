@@ -36,6 +36,7 @@
 #include <stout/multihashmap.hpp>
 #include <stout/os/int_fd.hpp>
 
+#include "slave/csi_server.hpp"
 #include "slave/gc.hpp"
 #include "slave/state.hpp"
 
@@ -75,7 +76,8 @@ public:
       SecretResolver* secretResolver = nullptr,
       const Option<NvidiaComponents>& nvidia = None(),
       VolumeGidManager* volumeGidManager = nullptr,
-      PendingFutureTracker* futureTracker = nullptr);
+      PendingFutureTracker* futureTracker = nullptr,
+      CSIServer* csiServer = nullptr);
 
   static Try<MesosContainerizer*> create(
       const Flags& flags,
@@ -103,7 +105,9 @@ public:
 
   process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources) override;
+      const Resources& resourceRequests,
+      const google::protobuf::Map<
+          std::string, Value::Scalar>& resourceLimits = {}) override;
 
   process::Future<ResourceStatistics> usage(
       const ContainerID& containerId) override;
@@ -197,7 +201,9 @@ public:
 
   virtual process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources);
+      const Resources& resourceRequests,
+      const google::protobuf::Map<
+          std::string, Value::Scalar>& resourceLimits = {});
 
   virtual process::Future<ResourceStatistics> usage(
       const ContainerID& containerId);
@@ -401,9 +407,10 @@ private:
     // calling cleanup after all isolators have finished isolating.
     process::Future<std::vector<Nothing>> isolation;
 
-    // We keep track of the resources for each container so we can set
-    // the ResourceStatistics limits in usage().
-    Resources resources;
+    // We keep track of the resource requests and limits for each container so
+    // we can set the ResourceStatistics limits in usage().
+    Resources resourceRequests;
+    google::protobuf::Map<std::string, Value::Scalar> resourceLimits;
 
     // The configuration for the container to be launched.
     // This can only be None if the underlying container is launched

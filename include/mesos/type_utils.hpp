@@ -30,6 +30,7 @@
 
 #include <mesos/mesos.hpp>
 
+#include <stout/option.hpp>
 #include <stout/stringify.hpp>
 #include <stout/strings.hpp>
 #include <stout/uuid.hpp>
@@ -87,6 +88,9 @@ bool operator==(const TaskStatus& left, const TaskStatus& right);
 bool operator==(const URL& left, const URL& right);
 bool operator==(const UUID& left, const UUID& right);
 bool operator==(const Volume& left, const Volume& right);
+bool operator==(
+    const Volume::Source::CSIVolume::VolumeCapability& left,
+    const Volume::Source::CSIVolume::VolumeCapability& right);
 
 bool operator!=(const CheckStatusInfo& left, const CheckStatusInfo& right);
 bool operator!=(const ExecutorInfo& left, const ExecutorInfo& right);
@@ -96,6 +100,9 @@ bool operator!=(const Operation& left, const Operation& right);
 bool operator!=(const OperationStatus& left, const OperationStatus& right);
 
 bool operator!=(const TaskStatus& left, const TaskStatus& right);
+bool operator!=(
+    const Volume::Source::CSIVolume::VolumeCapability& left,
+    const Volume::Source::CSIVolume::VolumeCapability& right);
 
 inline bool operator==(const ExecutorID& left, const ExecutorID& right)
 {
@@ -109,10 +116,24 @@ inline bool operator==(const FrameworkID& left, const FrameworkID& right)
 }
 
 
-inline bool operator==(const FrameworkInfo& left, const FrameworkInfo& right)
-{
-  return (left.name() == right.name()) && (left.user() == right.user());
-}
+// This operator, which was comparing only `user` and `name` fields,
+// has been deleted in favor of `typeutils::equivalent()` function (see below)
+// with different semantics.
+bool operator==(const FrameworkInfo& left, const FrameworkInfo& right) = delete;
+
+
+namespace typeutils {
+
+// Returns whether two `FrameworkInfo`s are equivalent for framework
+// subscription purposes or not (i.e. whether subscribing a framework with the
+// `left` should have the same effects as with the `right`).
+bool equivalent(const FrameworkInfo& left, const FrameworkInfo& right);
+
+// Performs the same comparison as `equivalent()` and returns a human-readable
+// diff if the `FrameworkInfo`s are not equivalnt.
+Option<std::string> diff(const FrameworkInfo& left, const FrameworkInfo& right);
+
+} // namespace typeutils {
 
 
 inline bool operator==(const OfferID& left, const OfferID& right)

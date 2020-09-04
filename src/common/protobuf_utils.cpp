@@ -395,6 +395,7 @@ Task createTask(
   t.mutable_task_id()->CopyFrom(task.task_id());
   t.mutable_slave_id()->CopyFrom(task.slave_id());
   t.mutable_resources()->CopyFrom(task.resources());
+  *t.mutable_limits() = task.limits();
 
   if (task.has_executor()) {
     t.mutable_executor_id()->CopyFrom(task.executor().executor_id());
@@ -1140,7 +1141,8 @@ bool operator==(const Capabilities& left, const Capabilities& right)
          left.resourceProvider == right.resourceProvider &&
          left.resizeVolume == right.resizeVolume &&
          left.agentOperationFeedback == right.agentOperationFeedback &&
-         left.agentDraining == right.agentDraining;
+         left.agentDraining == right.agentDraining &&
+         left.taskResourceLimits == right.taskResourceLimits;
 }
 
 

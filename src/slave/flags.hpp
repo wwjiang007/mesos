@@ -46,6 +46,7 @@ public:
   bool hostname_lookup;
   Option<std::string> resources;
   Option<std::string> resource_provider_config_dir;
+  Option<std::string> csi_plugin_config_dir;
   Option<std::string> disk_profile_adaptor;
   std::string isolation;
   std::string launcher;
@@ -182,6 +183,10 @@ public:
 #ifdef USE_SSL_SOCKET
   bool authenticate_http_executors;
 #endif // USE_SSL_SOCKET
+#ifndef __WINDOWS__
+  bool http_executor_domain_sockets;
+  Option<std::string> domain_socket_location;
+#endif // __WINDOWS__
   Option<Path> http_credentials;
   Option<std::string> hooks;
   Option<std::string> secret_resolver;

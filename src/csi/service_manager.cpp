@@ -128,12 +128,19 @@ class ServiceManagerProcess : public Process<ServiceManagerProcess>
 {
 public:
   ServiceManagerProcess(
+      const SlaveID& _agentId,
       const http::URL& _agentUrl,
       const string& _rootDir,
       const CSIPluginInfo& _info,
       const hashset<Service>& services,
       const string& _containerPrefix,
       const Option<string>& _authToken,
+      const Runtime& _runtime,
+      Metrics* _metrics);
+
+  ServiceManagerProcess(
+      const CSIPluginInfo& _info,
+      const hashset<Service>& services,
       const Runtime& _runtime,
       Metrics* _metrics);
 
@@ -168,6 +175,7 @@ private:
   // a new container.
   Future<string> getEndpoint(const ContainerID& containerId);
 
+  const SlaveID agentId;
   const http::URL agentUrl;
   const string rootDir;
   const CSIPluginInfo info;
@@ -180,7 +188,14 @@ private:
 
   http::Headers headers;
   Option<string> apiVersion;
+
+  // This is for the managed CSI plugin which will be launched as
+  // standalone containers.
   hashmap<Service, ContainerID> serviceContainers;
+
+  // This is for the unmanaged CSI plugin which is already deployed
+  // out of Mesos.
+  hashmap<Service, string> serviceEndpoints;
 
   hashmap<ContainerID, Owned<ContainerDaemon>> daemons;
   hashmap<ContainerID, Owned<Promise<string>>> endpoints;
@@ -188,6 +203,7 @@ private:
 
 
 ServiceManagerProcess::ServiceManagerProcess(
+    const SlaveID& _agentId,
     const http::URL& _agentUrl,
     const string& _rootDir,
     const CSIPluginInfo& _info,
@@ -197,6 +213,7 @@ ServiceManagerProcess::ServiceManagerProcess(
     const Runtime& _runtime,
     Metrics* _metrics)
   : ProcessBase(process::ID::generate("csi-service-manager")),
+    agentId(_agentId),
     agentUrl(_agentUrl),
     rootDir(_rootDir),
     info(_info),
@@ -233,8 +250,46 @@ ServiceManagerProcess::ServiceManagerProcess(
 }
 
 
+ServiceManagerProcess::ServiceManagerProcess(
+    const CSIPluginInfo& _info,
+    const hashset<Service>& services,
+    const Runtime& _runtime,
+    Metrics* _metrics)
+  : ProcessBase(process::ID::generate("csi-service-manager")),
+    agentId(),
+    agentUrl(),
+    rootDir(),
+    info(_info),
+    containerPrefix(),
+    authToken(),
+    contentType(ContentType::PROTOBUF),
+    runtime(_runtime),
+    metrics(_metrics)
+{
+  foreach (const Service& service, services) {
+    foreach (const CSIPluginEndpoint& serviceEndpoint, info.endpoints()) {
+      if (serviceEndpoint.csi_service() == service) {
+        serviceEndpoints[service] = serviceEndpoint.endpoint();
+        break;
+      }
+    }
+
+    CHECK(serviceEndpoints.contains(service))
+      << service << " not found for CSI plugin type '" << info.type()
+      << "' and name '" << info.name() << "'";
+  }
+}
+
+
 Future<Nothing> ServiceManagerProcess::recover()
 {
+  // For the unmanaged CSI plugin, we do not need to recover anything.
+  if (!serviceEndpoints.empty()) {
+    return Nothing();
+  }
+
+  CHECK(!serviceContainers.empty());
+
   return getContainers()
     .then(process::defer(self(), [=](
         const hashmap<ContainerID, Option<ContainerStatus>>& containers)
@@ -346,6 +401,21 @@ Future<Nothing> ServiceManagerProcess::recover()
 
 Future<string> ServiceManagerProcess::getServiceEndpoint(const Service& service)
 {
+  // For the unmanaged CSI plugin, get its endpoint from
+  // `serviceEndpoints` directly.
+  if (!serviceEndpoints.empty()) {
+    if (serviceEndpoints.contains(service)) {
+      return serviceEndpoints.at(service);
+    } else {
+      return Failure(
+          stringify(service) + " not found for CSI plugin type '" +
+          info.type() + "' and name '" + info.name() + "'");
+    }
+  }
+
+  // For the managed CSI plugin, get its endpoint via its corresponding
+  // standalone container ID.
+  CHECK(!serviceContainers.empty());
   if (!serviceContainers.contains(service)) {
     return Failure(
         stringify(service) + " not found for CSI plugin type '" + info.type() +
@@ -362,8 +432,15 @@ Future<string> ServiceManagerProcess::getApiVersion()
     return apiVersion.get();
   }
 
-  // Ensure that the plugin has been probed (which does the API version
-  // detection) through `getEndpoint` before returning the API version.
+  // Ensure that the unmanaged CSI plugin has been probed (which does the API
+  // version detection) before returning the API version.
+  if (!serviceEndpoints.empty()) {
+    return probeEndpoint(serviceEndpoints.begin()->second)
+      .then(process::defer(self(), [=] { return CHECK_NOTNONE(apiVersion); }));
+  }
+
+  // For the managed CSI plugin, `probeEndpoint` will be internally called by
+  // `getEndpoint` to do the API version detection.
   CHECK(!serviceContainers.empty());
   return getEndpoint(serviceContainers.begin()->second)
     .then(process::defer(self(), [=] { return CHECK_NOTNONE(apiVersion); }));
@@ -651,8 +728,23 @@ Future<string> ServiceManagerProcess::getEndpoint(
   const string endpoint = "unix://" + endpointPath.get();
   Environment::Variable* endpoint_ =
     commandInfo.mutable_environment()->add_variables();
+
   endpoint_->set_name("CSI_ENDPOINT");
   endpoint_->set_value(endpoint);
+
+  // For some CSI Plugins (like NFS CSI plugin), their node service need
+  // a node ID specified by container orchestrator, so here we expose agent
+  // ID to the plugins, they can use that as the node ID.
+  if (config->services().end() != std::find(
+          config->services().begin(),
+          config->services().end(),
+          NODE_SERVICE)) {
+    Environment::Variable* nodeId =
+      commandInfo.mutable_environment()->add_variables();
+
+    nodeId->set_name("MESOS_AGENT_ID");
+    nodeId->set_value(stringify(agentId));
+  }
 
   ContainerInfo containerInfo;
 
@@ -767,6 +859,7 @@ Future<string> ServiceManagerProcess::getEndpoint(
 
 
 ServiceManager::ServiceManager(
+    const SlaveID& agentId,
     const http::URL& agentUrl,
     const string& rootDir,
     const CSIPluginInfo& info,
@@ -776,12 +869,29 @@ ServiceManager::ServiceManager(
     const Runtime& runtime,
     Metrics* metrics)
   : process(new ServiceManagerProcess(
+        agentId,
         agentUrl,
         rootDir,
         info,
         services,
         containerPrefix,
         authToken,
+        runtime,
+        metrics))
+{
+  process::spawn(CHECK_NOTNULL(process.get()));
+  recovered = process::dispatch(process.get(), &ServiceManagerProcess::recover);
+}
+
+
+ServiceManager::ServiceManager(
+    const CSIPluginInfo& info,
+    const hashset<Service>& services,
+    const process::grpc::client::Runtime& runtime,
+    Metrics* metrics)
+  : process(new ServiceManagerProcess(
+        info,
+        services,
         runtime,
         metrics))
 {

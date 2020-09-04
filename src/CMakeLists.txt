@@ -39,7 +39,6 @@ PROTOC_GENERATE(TARGET mesos/allocator/allocator)
 PROTOC_GENERATE(TARGET mesos/authentication/authentication)
 PROTOC_GENERATE(TARGET mesos/authorizer/acls)
 PROTOC_GENERATE(TARGET mesos/authorizer/authorizer)
-PROTOC_GENERATE(TARGET mesos/csi/types)
 PROTOC_GENERATE(TARGET mesos/maintenance/maintenance)
 PROTOC_GENERATE(TARGET mesos/master/master)
 PROTOC_GENERATE(TARGET mesos/module/hook)
@@ -97,6 +96,7 @@ if (NOT WIN32)
   PROTOC_GENERATE(INTERNAL TARGET csi/state)
   PROTOC_GENERATE(INTERNAL TARGET resource_provider/storage/disk_profile)
   PROTOC_GENERATE(INTERNAL TARGET slave/containerizer/mesos/isolators/docker/volume/state)
+  PROTOC_GENERATE(INTERNAL TARGET slave/containerizer/mesos/isolators/volume/csi/state)
   PROTOC_GENERATE(INTERNAL TARGET slave/containerizer/mesos/provisioner/docker/message)
   PROTOC_GENERATE(INTERNAL TARGET slave/volume_gid_manager/state)
 endif ()
@@ -151,6 +151,7 @@ set(AGENT_SRC
   slave/constants.cpp
   slave/container_daemon.cpp
   slave/container_logger.cpp
+  slave/csi_server.cpp
   slave/flags.cpp
   slave/gc.cpp
   slave/http.cpp
@@ -176,6 +177,7 @@ set(AGENT_SRC
   slave/containerizer/mesos/launcher_tracker.cpp
   slave/containerizer/mesos/mount.cpp
   slave/containerizer/mesos/paths.cpp
+  slave/containerizer/mesos/utils.cpp
   slave/containerizer/mesos/io/switchboard.cpp
   slave/containerizer/mesos/isolators/environment_secret.cpp
   slave/containerizer/mesos/isolators/filesystem/posix.cpp
@@ -188,7 +190,6 @@ set(AGENT_SRC
 
 if (NOT WIN32)
   list(APPEND AGENT_SRC
-    slave/containerizer/mesos/utils.cpp
     slave/containerizer/mesos/isolators/docker/volume/driver.cpp
     slave/containerizer/mesos/isolators/docker/volume/paths.cpp
     slave/containerizer/mesos/isolators/network/cni/paths.cpp
@@ -196,6 +197,7 @@ if (NOT WIN32)
     slave/containerizer/mesos/isolators/posix/disk.cpp
     slave/containerizer/mesos/isolators/posix/rlimits.cpp
     slave/containerizer/mesos/isolators/volume/sandbox_path.cpp
+    slave/containerizer/mesos/isolators/volume/csi/paths.cpp
     slave/containerizer/mesos/provisioner/appc/cache.cpp
     slave/containerizer/mesos/provisioner/appc/fetcher.cpp
     slave/containerizer/mesos/provisioner/appc/paths.cpp
@@ -252,7 +254,6 @@ if (NOT WIN32)
 endif ()
 
 set(CSI_SRC
-  csi/types.cpp
   csi/metrics.cpp
   csi/paths.cpp
   csi/service_manager.cpp
@@ -337,6 +338,7 @@ set(LINUX_SRC
   slave/containerizer/mesos/isolators/volume/image.cpp
   slave/containerizer/mesos/isolators/volume/secret.cpp
   slave/containerizer/mesos/isolators/volume/utils.cpp
+  slave/containerizer/mesos/isolators/volume/csi/isolator.cpp
   slave/containerizer/mesos/provisioner/backends/aufs.cpp
   slave/containerizer/mesos/provisioner/backends/bind.cpp
   slave/containerizer/mesos/provisioner/backends/overlay.cpp)
@@ -408,6 +410,7 @@ set(LOGGING_SRC
   logging/logging.cpp)
 
 set(MASTER_SRC
+  master/authorization.cpp
   master/constants.cpp
   master/flags.cpp
   master/framework.cpp
@@ -426,6 +429,7 @@ set(MASTER_SRC
   master/allocator/allocator.cpp
   master/allocator/mesos/hierarchical.cpp
   master/allocator/mesos/metrics.cpp
+  master/allocator/mesos/offer_constraints_filter.cpp
   master/allocator/mesos/sorter/drf/metrics.cpp
   master/allocator/mesos/sorter/drf/sorter.cpp
   master/allocator/mesos/sorter/random/sorter.cpp
@@ -608,6 +612,7 @@ target_compile_definitions(
   USE_CMAKE_BUILD_CONFIG
   $<$<BOOL:${ENABLE_XFS_DISK_ISOLATOR}>:ENABLE_XFS_DISK_ISOLATOR>
   $<$<BOOL:${ENABLE_LAUNCHER_SEALING}>:ENABLE_LAUNCHER_SEALING>
+  $<$<BOOL:${ENABLE_NVML}>:ENABLE_NVML>
   $<$<BOOL:${ENABLE_PORT_MAPPING_ISOLATOR}>:ENABLE_PORT_MAPPING_ISOLATOR>
   $<$<BOOL:${ENABLE_NETWORK_PORTS_ISOLATOR}>:ENABLE_NETWORK_PORTS_ISOLATOR>
   $<$<BOOL:${ENABLE_SECCOMP_ISOLATOR}>:ENABLE_SECCOMP_ISOLATOR>)
@@ -625,11 +630,11 @@ target_link_libraries(
   sasl2
   zookeeper
   mesos-protobufs
-  $<$<PLATFORM_ID:Linux>:nvml>
-  $<$<BOOL:${HAS_JAVA}>:mesos-java>)
+  $<$<AND:$<PLATFORM_ID:Linux>,$<BOOL:${ENABLE_NVML}>>:nvml>)
 
 if (NOT WIN32)
   target_link_libraries(mesos PUBLIC leveldb)
+  target_link_libraries(mesos PUBLIC re2)
 endif ()
 
 if (ENABLE_SECCOMP_ISOLATOR)
@@ -666,6 +671,26 @@ if (NOT WIN32)
   add_subdirectory(resource_provider/storage)
 endif()
 
+
+install(
+  TARGETS
+    mesos-protobufs
+    mesos
+  RUNTIME DESTINATION ${MESOS_INSTALL_RUNTIME}
+  ARCHIVE DESTINATION ${MESOS_INSTALL_LIBRARIES}
+  LIBRARY DESTINATION ${MESOS_INSTALL_LIBRARIES})
+
+install(
+  DIRECTORY webui
+  DESTINATION ${MESOS_INSTALL_DATA})
+
+if (ENABLE_INSTALL_MODULE_DEPENDENCIES)
+  install(
+    DIRECTORY
+      ${MESOS_PUBLIC_INCLUDE_DIR}
+      ${MESOS_BIN_INCLUDE_DIR}
+    DESTINATION .)
+endif ()
 
 # BUILD THE MESOS TESTS.
 ########################

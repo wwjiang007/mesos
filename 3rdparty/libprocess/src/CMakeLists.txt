@@ -18,7 +18,14 @@
 # https://www.openssl.org
 ############################################
 if (ENABLE_SSL)
-  find_package(OpenSSL REQUIRED)
+  if (ENABLE_LIBEVENT)
+    find_package(OpenSSL REQUIRED)
+  else ()
+    # SSL without Libevent requires a more recent version of OpenSSL
+    # because of the APIs used by the implementation.
+    # TODO(josephw): Add compatibility for OpenSSL 1.0.
+    find_package(OpenSSL 1.1 REQUIRED)
+  endif ()
 endif ()
 
 
@@ -91,6 +98,9 @@ if (ENABLE_SSL)
   if (ENABLE_LIBEVENT)
     list(APPEND PROCESS_SRC
       posix/libevent/libevent_ssl_socket.cpp)
+  else ()
+    list(APPEND PROCESS_SRC
+      ssl/openssl_socket.cpp)
   endif ()
 endif ()
 
@@ -115,7 +125,13 @@ target_compile_definitions(
   $<$<BOOL:${ENABLE_LOCK_FREE_RUN_QUEUE}>:LOCK_FREE_RUN_QUEUE>
   $<$<BOOL:${ENABLE_LOCK_FREE_EVENT_QUEUE}>:LOCK_FREE_EVENT_QUEUE>
   $<$<BOOL:${ENABLE_LAST_IN_FIRST_OUT_FIXED_SIZE_SEMAPHORE}>:LAST_IN_FIRST_OUT_FIXED_SIZE_SEMAPHORE>
-  $<$<PLATFORM_ID:LINUX>:LIBPROCESS_ALLOW_JEMALLOC>)
+  $<$<PLATFORM_ID:Linux>:LIBPROCESS_ALLOW_JEMALLOC>)
 
 target_include_directories(process PUBLIC ../include)
 target_include_directories(process PRIVATE .)
+
+install(
+  TARGETS process
+  RUNTIME DESTINATION ${LIBPROCESS_INSTALL_RUNTIME}
+  LIBRARY DESTINATION ${LIBPROCESS_INSTALL_LIBRARIES}
+  ARCHIVE DESTINATION ${LIBPROCESS_INSTALL_LIBRARIES})

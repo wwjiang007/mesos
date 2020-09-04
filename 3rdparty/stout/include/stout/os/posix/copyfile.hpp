@@ -22,7 +22,7 @@
 #include <stout/stringify.hpp>
 #include <stout/try.hpp>
 
-#include <stout/os/shell.hpp>
+#include <stout/os/exec.hpp>
 #include <stout/os/stat.hpp>
 
 namespace os {
@@ -50,11 +50,11 @@ inline Try<Nothing> copyfile(
     return Error("`destination` was a directory");
   }
 
-  if (!path::absolute(source)) {
+  if (!path::is_absolute(source)) {
     return Error("`source` was a relative path");
   }
 
-  if (!path::absolute(destination)) {
+  if (!path::is_absolute(destination)) {
     return Error("`destination` was a relative path");
   }
 

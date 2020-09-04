@@ -43,6 +43,10 @@
 #include <stout/unreachable.hpp>
 #include <stout/uuid.hpp>
 
+#ifndef __WINDOWS__
+#include "common/domain_sockets.hpp"
+#endif // __WINDOWS__
+
 #include "common/http.hpp"
 #include "common/recordio.hpp"
 #include "common/validation.hpp"
@@ -232,12 +236,54 @@ public:
     }
 #endif // USE_SSL_SOCKET
 
-    agent = ::URL(
-        scheme,
-        upid.address.ip,
-        upid.address.port,
-        upid.id +
-        "/api/v1/executor");
+#ifndef __WINDOWS__
+    value = env.get("MESOS_DOMAIN_SOCKET");
+    if (value.isSome()) {
+      string scheme = "http+unix";
+      std::string path = value.get();
+
+      // Currently this check should not trigger because the agent already
+      // checks the path length on startup. We still do the involved checking
+      // procedure below, on the one hand because the agent might have gotten
+      // a relative path but mainly so we are able to seamlessly start
+      // supporting custom executors with their own rootfs in the future.
+      if (path.size() >= common::DOMAIN_SOCKET_MAX_PATH_LENGTH) {
+        std::string cwd = os::getcwd();
+        VLOG(1) << "Path " << path << " too long, shortening it by using"
+                << " the relative path to " << cwd;
+
+        Try<std::string> relative = path::relative(path, cwd);
+        if (relative.isError()) {
+          EXIT(EXIT_FAILURE)
+            << "Couldnt compute path of " << path
+            << " relative to " << cwd << ": "
+            << relative.error();
+        }
+
+        path = "./" + *relative;
+      }
+
+      if (path.size() >= common::DOMAIN_SOCKET_MAX_PATH_LENGTH) {
+        EXIT(EXIT_FAILURE)
+          << "Cannot use domain sockets for communication as requested: "
+          << "Path " << path << " is longer than 108 characters";
+      }
+
+      agent = ::URL(
+          scheme,
+          path,
+          upid.id + "/api/v1/executor");
+    } else
+#endif
+    {
+      agent = ::URL(
+          scheme,
+          upid.address.ip,
+          upid.address.port,
+          upid.id + "/api/v1/executor");
+    }
+
+    LOG(INFO) << "Using URL " << agent << " for the executor API endpoint";
 
     value = env.get("MESOS_EXECUTOR_AUTHENTICATION_TOKEN");
     if (value.isSome()) {
@@ -515,11 +561,13 @@ protected:
       recoveryTimer = delay(
           recoveryTimeout.get(),
           self(),
-          &Self::_recoveryTimeout);
+          &Self::_recoveryTimeout,
+          failure);
 
       // Backoff and reconnect only if framework checkpointing is enabled.
       backoff();
     } else {
+      LOG(INFO) << "Disconnected from agent: " << failure << "; Shutting down";
       shutdown();
     }
   }
@@ -553,7 +601,7 @@ protected:
     return future;
   }
 
-  void _recoveryTimeout()
+  void _recoveryTimeout(const string& failure)
   {
     // It's possible that a new connection was established since the timeout
     // fired and we were unable to cancel this timeout. If this occurs, don't
@@ -566,7 +614,8 @@ protected:
 
     CHECK_SOME(recoveryTimeout);
     LOG(INFO) << "Recovery timeout of " << recoveryTimeout.get()
-              << " exceeded; Shutting down";
+              << " exceeded following the first connection failure: " << failure
+              << "; Shutting down";
 
     shutdown();
   }

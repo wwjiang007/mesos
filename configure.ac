@@ -18,7 +18,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.61])
-AC_INIT([mesos], [1.10.0])
+AC_INIT([mesos], [1.11.0])
 
 # Have autoconf setup some variables related to the system.
 AC_CANONICAL_HOST
@@ -200,8 +200,6 @@ AC_CONFIG_FILES([include/mesos/version.hpp])
 
 AC_CONFIG_FILES([src/java/generated/org/apache/mesos/MesosNativeLibrary.java])
 
-AC_CONFIG_FILES([mpi/mpiexec-mesos], [chmod +x mpi/mpiexec-mesos])
-
 
 ###############################################################################
 # Optional features.
@@ -267,6 +265,11 @@ AC_ARG_ENABLE([java],
               AS_HELP_STRING([--disable-java],
                              [do not build Java bindings]),
               [], [enable_java=yes])
+
+AC_ARG_ENABLE([nvml],
+              AS_HELP_STRING([--disable-nvml],
+                             [do not use the NVML headers]),
+              [], [enable_nvml=yes])
 
 # TODO(bevers): Eventually make this enabled by default.
 AC_ARG_ENABLE([jemalloc-allocator],
@@ -524,6 +527,13 @@ AC_ARG_WITH([rapidjson],
                            package in lieu of an installed version at a
                            location prefixed by the given path]),
             [without_bundled_rapidjson=yes], [])
+
+AC_ARG_WITH([re2],
+            AS_HELP_STRING([--with-re2@<:@=DIR@:>@],
+                           [excludes building and using the bundled re2
+                            package in lieu of an installed version at a
+                            location prefixed by the given path]),
+            [without_bundled_re2=yes], [])
 
 AC_ARG_WITH([protobuf],
             AS_HELP_STRING([--with-protobuf@<:@=DIR@:>@],
@@ -1385,10 +1395,10 @@ __EOF__
     dir="$JAVA_HOME/jre/lib/server"
     for dir in "$JAVA_HOME/lib/server" "$JAVA_HOME/jre/lib/server"; do
       if test -e "$dir"; then
-	# Note that these are libtool specific flags.
+        # Note that these are libtool specific flags.
         JAVA_TEST_LDFLAGS="-framework JavaVM"
         JAVA_JVM_LIBRARY=$dir/libjvm.dylib
-	break;
+        break;
       fi
     done
   elif test "$OS_NAME" = "linux"; then
@@ -1397,20 +1407,20 @@ __EOF__
       "$JAVA_HOME/jre/lib/"{amd64,i386,arm,aarch64,ppc64,ppc64le,s390,s390x}"/server"
     do
       if test -e "$dir"; then
-	# Note that these are libtool specific flags.
-	JAVA_TEST_LDFLAGS="-L$dir -R$dir -Wl,-ljvm"
-	JAVA_JVM_LIBRARY=$dir/libjvm.so
-	break;
+        # Note that these are libtool specific flags.
+        JAVA_TEST_LDFLAGS="-L$dir -R$dir -Wl,-ljvm"
+        JAVA_JVM_LIBRARY=$dir/libjvm.so
+        break;
       fi
     done
   elif test "$OS_NAME" = "freebsd"; then
     for arch in amd64 i386 arm; do
       dir="$JAVA_HOME/jre/lib/$arch/server"
       if test -e "$dir"; then
-	# Note that these are libtool specific flags.
-	JAVA_TEST_LDFLAGS="-L$dir -R$dir -pthread -Wl,-ljvm"
-	JAVA_JVM_LIBRARY=$dir/libjvm.so
-	break;
+        # Note that these are libtool specific flags.
+        JAVA_TEST_LDFLAGS="-L$dir -R$dir -pthread -Wl,-ljvm"
+        JAVA_JVM_LIBRARY=$dir/libjvm.so
+        break;
       fi
     done
   fi
@@ -1595,6 +1605,8 @@ if test "x$enable_libevent" = "xyes"; then
   else
     with_bundled_libevent=yes
   fi
+
+  AC_DEFINE([USE_LIBEVENT], [1])
 fi
 
 if test "x$enable_ssl" = "xyes"; then
@@ -1602,8 +1614,6 @@ if test "x$enable_ssl" = "xyes"; then
     if test "x$with_bundled_libevent" != "xyes"; then
       MESOS_HAVE_LIBEVENT_SSL()
     fi
-  else
-    AC_MSG_ERROR([SSL is currently only supported with libevent])
   fi
 fi
 
@@ -1783,29 +1793,37 @@ AM_CONDITIONAL(
   [test "x$enable_network_ports_isolator" = "xyes" -o "x$enable_port_mapping_isolator" = "xyes"])
 
 
+AM_CONDITIONAL(
+  [ENABLE_NVML],
+  [test "x$enable_nvml" = "xyes"])
+
+AM_COND_IF([ENABLE_NVML], [AC_DEFINE([ENABLE_NVML])])
+
 # If the user has asked not to include the bundled NVML headers for
 # Nvidia GPU support, check to see if the path to the NVML headers has
 # been specified.  If it has, make sure that the path is absolute. If
 # everything is in order, add this path to the CPPFLAGS.
-if test "x$without_bundled_nvml" = "xyes" || \
-   test "x$enable_bundled" != "xyes"; then
-  if test -n "`echo $with_nvml`"; then
-    if test "$with_nvml" = "${with_nvml#/}"; then
-      AC_MSG_ERROR([The path passed to --with-nvml must be absolute.])
+if test "x$enable_nvml" = "xyes"; then
+  if test "x$without_bundled_nvml" = "xyes" || \
+     test "x$enable_bundled" != "xyes"; then
+    if test -n "`echo $with_nvml`"; then
+      if test "$with_nvml" = "${with_nvml#/}"; then
+        AC_MSG_ERROR([The path passed to --with-nvml must be absolute.])
+      fi
+       CPPFLAGS="-I${with_nvml} $CPPFLAGS"
     fi
-     CPPFLAGS="-I${with_nvml} $CPPFLAGS"
-  fi
 
-  AC_CHECK_HEADERS([nvidia/gdk/nvml.h], [],
-                   [AC_MSG_ERROR([Cannot find the Nvidia NVML headers
--------------------------------------------------------------------
-You have requested the use of a non-bundled NVML but no suitable
-NVML headers could be found. Make sure these headers are either
-installed on the system or the path passed via --with-nvml is correct.
--------------------------------------------------------------------
-  ])])
-else
-  with_bundled_nvml=yes
+    AC_CHECK_HEADERS([nvidia/gdk/nvml.h], [],
+                     [AC_MSG_ERROR([Cannot find the Nvidia NVML headers
+  -------------------------------------------------------------------
+  You have requested the use of a non-bundled NVML but no suitable
+  NVML headers could be found. Make sure these headers are either
+  installed on the system or the path passed via --with-nvml is correct.
+  -------------------------------------------------------------------
+    ])])
+  else
+    with_bundled_nvml=yes
+  fi
 fi
 
 AM_CONDITIONAL([WITH_BUNDLED_NVML],
@@ -2007,6 +2025,49 @@ else
 fi
 
 AM_CONDITIONAL([WITH_BUNDLED_RAPIDJSON], [test "x$with_bundled_rapidjson" = "xyes"])
+
+# Check if re2 prefix path was supplied and if so, add it to CPPFLAGS
+# while extending it by /include and to LDFLAGS while extending it by
+# /lib.
+if test -n "`echo $with_re2`"; then
+  CPPFLAGS="$CPPFLAGS -I${with_re2}/include"
+  LDFLAGS="$LDFLAGS -L${with_re2}/lib"
+fi
+
+# Check if user has asked us to use a preinstalled re2, or if they
+# asked us to ignore all bundled libraries while compiling and
+# linking.
+if test "x$without_bundled_re2" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Check if headers and library were located.
+  AC_CHECK_HEADERS([re2/re2.h],
+                   [AC_LINK_IFELSE(
+                        [AC_LANG_PROGRAM([#include <re2/re2.h>], [])],
+                        [TEST_LIBS="$TEST_LIBS -lre2"] [found_re2=yes],
+                        [AC_MSG_WARN([re2 is not installed.])])])
+
+  if test "x$found_re2" = "xyes"; then
+    with_bundled_re2=no
+  else
+    AC_MSG_ERROR([cannot find re2
+-------------------------------------------------------------------
+You have requested the use of a non-bundled re2 but no suitable
+re2 could be found.
+
+You may want specify the location of re2 by providing a prefix
+path via --with-re2=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+  fi
+else
+  with_bundled_re2=yes
+fi
+
+AM_CONDITIONAL([WITH_BUNDLED_RE2],
+               [test "x$with_bundled_re2" = "xyes"])
+
+
 
 
 # Check if Sasl2 prefix path was provided, and if so, add it to
@@ -2682,7 +2743,7 @@ There are two possible workarounds for this issue:
   PYTHON_LDFLAGS="$LDFLAGS $GFLAGS_LIBS"
 
   AS_IF([test "x$ax_cv_cxx_compiler_vendor" = "xclang"],
-	[PYTHON_CPPFLAGS="$PYTHON_CPPFLAGS -Qunused-arguments"
+        [PYTHON_CPPFLAGS="$PYTHON_CPPFLAGS -Qunused-arguments"
          PYTHON_CFLAGS="$PYTHON_CFLAGS -Qunused-arguments"])
 
   AC_SUBST([PYTHON_CPPFLAGS])

@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <memory>
+
 #include <mesos/mesos.hpp>
 
 #include <process/async.hpp>
@@ -25,6 +27,8 @@
 #include <process/pid.hpp>
 
 #include "tests/mesos.hpp"
+
+using std::shared_ptr;
 
 using mesos::authorization::VIEW_EXECUTOR;
 using mesos::authorization::VIEW_FLAGS;
@@ -104,10 +108,13 @@ protected:
 };
 
 
-// This authorizer will not satisfy any futures from `getObjectApprover()`
+// This authorizer will not satisfy any futures from `getApprover()`
 // until it is told to, presumably from the test body.
 //
 // It effectively acts as a giant gate for certain requests.
+//
+// TODO(asekretenko): Find a way to gate requests without relying on
+// authorizer.
 class BlockingAuthorizerProcess
   : public process::Process<BlockingAuthorizerProcess>
 {
@@ -115,19 +122,19 @@ public:
   BlockingAuthorizerProcess(Authorizer* underlying)
     : ProcessBase(process::ID::generate("blocking-authorizer")),
       underlying_(underlying),
-      blocked_(true) {}
+      blocked_(false) {}
 
   Future<bool> authorized(const authorization::Request& request)
   {
     return underlying_->authorized(request);
   }
 
-  Future<Owned<ObjectApprover>> getObjectApprover(
+  Future<shared_ptr<const ObjectApprover>> getApprover(
       const Option<authorization::Subject>& subject,
       const authorization::Action& action)
   {
-    Future<Owned<ObjectApprover>> future =
-      underlying_->getObjectApprover(subject, action);
+    Future<shared_ptr<const ObjectApprover>> future =
+      underlying_->getApprover(subject, action);
 
     if (!blocked_) {
       return future;
@@ -144,7 +151,14 @@ public:
     return promises_.size();
   }
 
-  // Satisfies all future and prior calls made to `getObjectApprover`.
+  Future<Nothing> block()
+  {
+    blocked_ = true;
+
+    return Nothing();
+  }
+
+  // Satisfies all future and prending calls made to `getApprover`.
   Future<Nothing> unleash()
   {
     CHECK_EQ(promises_.size(), futures_.size());
@@ -163,8 +177,8 @@ public:
 
 private:
   Authorizer* underlying_;
-  std::queue<Future<Owned<ObjectApprover>>> futures_;
-  std::queue<Promise<Owned<ObjectApprover>>> promises_;
+  std::queue<Future<shared_ptr<const ObjectApprover>>> futures_;
+  std::queue<Promise<shared_ptr<const ObjectApprover>>> promises_;
   bool blocked_;
 };
 
@@ -192,13 +206,13 @@ public:
         request);
   }
 
-  Future<Owned<ObjectApprover>> getObjectApprover(
+  Future<shared_ptr<const ObjectApprover>> getApprover(
       const Option<authorization::Subject>& subject,
       const authorization::Action& action) override
   {
     return process::dispatch(
         process_.get(),
-        &BlockingAuthorizerProcess::getObjectApprover,
+        &BlockingAuthorizerProcess::getApprover,
         subject,
         action);
   }
@@ -208,6 +222,13 @@ public:
     return process::dispatch(
         process_.get(),
         &BlockingAuthorizerProcess::pending);
+  }
+
+  Future<Nothing> block()
+  {
+    return process::dispatch(
+        process_.get(),
+        &BlockingAuthorizerProcess::block);
   }
 
   Future<Nothing> unleash()
@@ -259,6 +280,11 @@ void MasterLoadTest::prepareCluster(Authorizer* authorizer)
   slave_ = slave.get();
 
   AWAIT_READY(slaveRegisteredMessage);
+
+  // NOTE: Authorizer is blocked after preparing the cluster, otherwise
+  // framework registration, which also uses `prepareObjectApprover(...) will
+  // be blocked too.
+  authorizer_->block();
 }
 
 
@@ -390,15 +416,20 @@ TEST_F(MasterLoadTest, SimultaneousBatchedRequests)
 
     Response reference;
     if (request.endpoint == "/state") {
-      reference = readOnlyHandler.state(queryParameters, approvers);
+      reference = readOnlyHandler.state(
+          ContentType::JSON, queryParameters, approvers).first;
     } else if (request.endpoint == "/state-summary") {
-      reference = readOnlyHandler.stateSummary(queryParameters, approvers);
+      reference = readOnlyHandler.stateSummary(
+          ContentType::JSON, queryParameters, approvers).first;
     } else if (request.endpoint == "/roles") {
-      reference = readOnlyHandler.roles(queryParameters, approvers);
+      reference = readOnlyHandler.roles(
+          ContentType::JSON, queryParameters, approvers).first;
     } else if (request.endpoint == "/frameworks") {
-      reference = readOnlyHandler.frameworks(queryParameters, approvers);
+      reference = readOnlyHandler.frameworks(
+          ContentType::JSON, queryParameters, approvers).first;
     } else if (request.endpoint == "/slaves") {
-      reference = readOnlyHandler.slaves(queryParameters, approvers);
+      reference = readOnlyHandler.slaves(
+          ContentType::JSON, queryParameters, approvers).first;
     } else {
       UNREACHABLE();
     }

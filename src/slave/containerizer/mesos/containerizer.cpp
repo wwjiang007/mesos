@@ -61,6 +61,7 @@
 
 #include "module/manager.hpp"
 
+#include "slave/csi_server.hpp"
 #include "slave/gc.hpp"
 #include "slave/paths.hpp"
 #include "slave/slave.hpp"
@@ -105,7 +106,6 @@
 #include "slave/containerizer/mesos/isolators/docker/volume/isolator.hpp"
 #include "slave/containerizer/mesos/isolators/filesystem/linux.hpp"
 #include "slave/containerizer/mesos/isolators/filesystem/shared.hpp"
-#include "slave/containerizer/mesos/isolators/gpu/nvidia.hpp"
 #include "slave/containerizer/mesos/isolators/linux/capabilities.hpp"
 #include "slave/containerizer/mesos/isolators/linux/devices.hpp"
 #include "slave/containerizer/mesos/isolators/linux/nnp.hpp"
@@ -115,6 +115,7 @@
 #include "slave/containerizer/mesos/isolators/volume/host_path.hpp"
 #include "slave/containerizer/mesos/isolators/volume/image.hpp"
 #include "slave/containerizer/mesos/isolators/volume/secret.hpp"
+#include "slave/containerizer/mesos/isolators/volume/csi/isolator.hpp"
 #endif // __linux__
 
 #if ENABLE_SECCOMP_ISOLATOR
@@ -181,7 +182,8 @@ Try<MesosContainerizer*> MesosContainerizer::create(
     SecretResolver* secretResolver,
     const Option<NvidiaComponents>& nvidia,
     VolumeGidManager* volumeGidManager,
-    PendingFutureTracker* futureTracker)
+    PendingFutureTracker* futureTracker,
+    CSIServer* csiServer)
 {
   Try<hashset<string>> isolations = [&flags]() -> Try<hashset<string>> {
     const vector<string> tokens(strings::tokenize(flags.isolation, ","));
@@ -468,6 +470,11 @@ Try<MesosContainerizer*> MesosContainerizer::create(
       [secretResolver] (const Flags& flags) -> Try<Isolator*> {
         return VolumeSecretIsolatorProcess::create(flags, secretResolver);
       }},
+
+    {"volume/csi",
+      [csiServer] (const Flags& flags) -> Try<Isolator*> {
+        return VolumeCSIIsolatorProcess::create(flags, csiServer);
+      }},
 #endif // __linux__
 
     // Disk isolators.
@@ -735,12 +742,14 @@ Future<Connection> MesosContainerizer::attach(
 
 Future<Nothing> MesosContainerizer::update(
     const ContainerID& containerId,
-    const Resources& resources)
+    const Resources& resourceRequests,
+    const google::protobuf::Map<string, Value::Scalar>& resourceLimits)
 {
   return dispatch(process.get(),
                   &MesosContainerizerProcess::update,
                   containerId,
-                  resources);
+                  resourceRequests,
+                  resourceLimits);
 }
 
 
@@ -1449,7 +1458,8 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::launch(
 
   Owned<Container> container(new Container());
   container->config = containerConfig;
-  container->resources = containerConfig.resources();
+  container->resourceRequests = containerConfig.resources();
+  container->resourceLimits = containerConfig.limits();
   container->directory = containerConfig.directory();
 
   // Maintain the 'children' list in the parent's 'Container' struct,
@@ -2407,7 +2417,8 @@ Future<Option<ContainerTermination>> MesosContainerizerProcess::wait(
 
 Future<Nothing> MesosContainerizerProcess::update(
     const ContainerID& containerId,
-    const Resources& resources)
+    const Resources& resourceRequests,
+    const google::protobuf::Map<string, Value::Scalar>& resourceLimits)
 {
   CHECK(!containerId.has_parent());
 
@@ -2430,7 +2441,8 @@ Future<Nothing> MesosContainerizerProcess::update(
 
   // NOTE: We update container's resources before isolators are updated
   // so that subsequent containerizer->update can be handled properly.
-  container->resources = resources;
+  container->resourceRequests = resourceRequests;
+  container->resourceLimits = resourceLimits;
 
   // Update each isolator.
   vector<Future<Nothing>> futures;
@@ -2442,7 +2454,8 @@ Future<Nothing> MesosContainerizerProcess::update(
       continue;
     }
 
-    futures.push_back(isolator->update(containerId, resources));
+    futures.push_back(
+        isolator->update(containerId, resourceRequests, resourceLimits));
   }
 
   // Wait for all isolators to complete.
@@ -2451,12 +2464,11 @@ Future<Nothing> MesosContainerizerProcess::update(
 }
 
 
-// Resources are used to set the limit fields in the statistics but
-// are optional because they aren't known after recovery until/unless
-// update() is called.
 Future<ResourceStatistics> _usage(
     const ContainerID& containerId,
-    const Option<Resources>& resources,
+    const Option<Resources>& resourceRequests,
+    const Option<google::protobuf::Map<string, Value::Scalar>>& resourceLimits,
+    bool enableCfsQuota,
     const vector<Future<ResourceStatistics>>& statistics)
 {
   ResourceStatistics result;
@@ -2475,17 +2487,76 @@ Future<ResourceStatistics> _usage(
     }
   }
 
-  if (resources.isSome()) {
-    // Set the resource allocations.
-    Option<Bytes> mem = resources->mem();
-    if (mem.isSome()) {
-      result.set_mem_limit_bytes(mem->bytes());
+  Option<double> cpuRequest, cpuLimit, memLimit;
+  Option<Bytes> memRequest;
+
+  if (resourceRequests.isSome()) {
+    cpuRequest = resourceRequests->cpus();
+    memRequest = resourceRequests->mem();
+  }
+
+  if (resourceLimits.isSome()) {
+    foreach (auto&& limit, resourceLimits.get()) {
+      if (limit.first == "cpus") {
+        cpuLimit = limit.second.value();
+      } else if (limit.first == "mem") {
+        memLimit = limit.second.value();
+      }
+    }
+  }
+
+  if (cpuRequest.isSome()) {
+    result.set_cpus_soft_limit(cpuRequest.get());
+  }
+
+  if (cpuLimit.isSome()) {
+    // Get the total CPU numbers of this node, we will use it to set container's
+    // hard CPU limit if the CPU limit specified by framework is infinity.
+    static Option<long> totalCPUs;
+    if (totalCPUs.isNone()) {
+      Try<long> cpus = os::cpus();
+      if (cpus.isError()) {
+        return Failure(
+            "Failed to auto-detect the number of cpus: " + cpus.error());
+      }
+
+      totalCPUs = cpus.get();
     }
 
-    Option<double> cpus = resources->cpus();
-    if (cpus.isSome()) {
-      result.set_cpus_limit(cpus.get());
+    CHECK_SOME(totalCPUs);
+
+    result.set_cpus_limit(
+        std::isinf(cpuLimit.get()) ? totalCPUs.get() : cpuLimit.get());
+  } else if (enableCfsQuota && cpuRequest.isSome()) {
+    result.set_cpus_limit(cpuRequest.get());
+  }
+
+  if (memRequest.isSome()) {
+    result.set_mem_soft_limit_bytes(memRequest->bytes());
+  }
+
+  if (memLimit.isSome()) {
+    // Get the total memory of this node, we will use it to set container's hard
+    // memory limit if the memory limit specified by framework is infinity.
+    static Option<Bytes> totalMem;
+    if (totalMem.isNone()) {
+      Try<os::Memory> mem = os::memory();
+      if (mem.isError()) {
+        return Failure(
+            "Failed to auto-detect the size of main memory: " + mem.error());
+      }
+
+      totalMem = mem->total;
     }
+
+    CHECK_SOME(totalMem);
+
+    result.set_mem_limit_bytes(
+        std::isinf(memLimit.get())
+          ? totalMem->bytes()
+          : Megabytes(static_cast<uint64_t>(memLimit.get())).bytes());
+  } else if (memRequest.isSome()) {
+    result.set_mem_limit_bytes(memRequest->bytes());
   }
 
   return result;
@@ -2511,14 +2582,39 @@ Future<ResourceStatistics> MesosContainerizerProcess::usage(
     futures.push_back(isolator->usage(containerId));
   }
 
+  Option<Resources> resourceRequests;
+  Option<google::protobuf::Map<string, Value::Scalar>> resourceLimits;
+
+  // TODO(idownes): After recovery top-level container's resource requests and
+  // limits won't be known until after an update() because they aren't part of
+  // the SlaveState.
+  //
+  // For nested containers, we will get their resource requests and limits from
+  // their `ContainerConfig` since the `resourceRequests` and `resourceLimits`
+  // fields in the `Container` struct won't be recovered for nested containers
+  // after agent restart and update() won't be called for nested containers.
+  if (containerId.has_parent()) {
+    if (containers_.at(containerId)->config.isSome()) {
+      resourceRequests = containers_.at(containerId)->config->resources();
+      resourceLimits = containers_.at(containerId)->config->limits();
+    }
+  } else {
+    resourceRequests = containers_.at(containerId)->resourceRequests;
+    resourceLimits = containers_.at(containerId)->resourceLimits;
+  }
+
   // Use await() here so we can return partial usage statistics.
-  // TODO(idownes): After recovery resources won't be known until
-  // after an update() because they aren't part of the SlaveState.
   return await(futures)
     .then(lambda::bind(
           _usage,
           containerId,
-          containers_.at(containerId)->resources,
+          resourceRequests,
+          resourceLimits,
+#ifdef __linux__
+          flags.cgroups_enable_cfs,
+#else
+          false,
+#endif
           lambda::_1));
 }
 

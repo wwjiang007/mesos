@@ -70,7 +70,9 @@ public:
 
   process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources) override;
+      const Resources& resourceRequests,
+      const google::protobuf::Map<
+          std::string, Value::Scalar>& resourceLimits = {}) override;
 
   process::Future<ResourceStatistics> usage(
       const ContainerID& containerId) override;
@@ -148,6 +150,8 @@ private:
   process::Future<Nothing> __cleanup(
       const ContainerID& containerId,
       const std::vector<process::Future<Nothing>>& futures);
+
+  process::Owned<Info> findCgroupInfo(const ContainerID& containerId) const;
 
   const Flags flags;
 

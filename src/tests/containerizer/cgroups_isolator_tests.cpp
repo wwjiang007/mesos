@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <limits>
+
 #include <process/gmock.hpp>
 #include <process/gtest.hpp>
 #include <process/queue.hpp>
@@ -21,11 +23,14 @@
 #include <stout/format.hpp>
 #include <stout/gtest.hpp>
 
+#include <stout/os/exec.hpp>
+
 #include <mesos/v1/scheduler.hpp>
 
 #include "slave/gc_process.hpp"
 
 #include "slave/containerizer/mesos/containerizer.hpp"
+#include "slave/containerizer/mesos/paths.hpp"
 
 #include "slave/containerizer/mesos/isolators/cgroups/constants.hpp"
 #include "slave/containerizer/mesos/isolators/cgroups/subsystems/net_cls.hpp"
@@ -50,8 +55,11 @@ using mesos::internal::slave::CGROUP_SUBSYSTEM_NET_CLS_NAME;
 using mesos::internal::slave::CGROUP_SUBSYSTEM_NET_PRIO_NAME;
 using mesos::internal::slave::CGROUP_SUBSYSTEM_PERF_EVENT_NAME;
 using mesos::internal::slave::CGROUP_SUBSYSTEM_PIDS_NAME;
+using mesos::internal::slave::CPU_SHARES_PER_CPU;
 using mesos::internal::slave::CPU_SHARES_PER_CPU_REVOCABLE;
+using mesos::internal::slave::CPU_CFS_PERIOD;
 using mesos::internal::slave::DEFAULT_EXECUTOR_CPUS;
+using mesos::internal::slave::DEFAULT_EXECUTOR_MEM;
 
 using mesos::internal::slave::Containerizer;
 using mesos::internal::slave::Fetcher;
@@ -61,10 +69,14 @@ using mesos::internal::slave::NetClsHandle;
 using mesos::internal::slave::NetClsHandleManager;
 using mesos::internal::slave::Slave;
 
+using mesos::internal::slave::containerizer::paths::getCgroupPath;
+
 using mesos::master::detector::MasterDetector;
 
+using mesos::v1::scheduler::Call;
 using mesos::v1::scheduler::Event;
 
+using process::Clock;
 using process::Future;
 using process::Owned;
 using process::Queue;
@@ -77,6 +89,7 @@ using std::string;
 using std::vector;
 
 using testing::_;
+using testing::AllOf;
 using testing::DoAll;
 using testing::InvokeWithoutArgs;
 using testing::Return;
@@ -373,13 +386,16 @@ TEST_F(CgroupsIsolatorTest, ROOT_CGROUPS_RevocableCpu)
 }
 
 
-TEST_F(CgroupsIsolatorTest, ROOT_CGROUPS_CFS_EnableCfs)
+// This test verifies that a task launched with 0.5 cpu and 32MB memory as its
+// resource requests (but no resource limits specified) will have its CPU and
+// memory's soft & hard limits and OOM score adjustment set correctly.
+TEST_F(CgroupsIsolatorTest, ROOT_CGROUPS_CFS_CommandTaskNoLimits)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "cgroups/cpu";
+  flags.isolation = "cgroups/cpu,cgroups/mem";
 
   // Enable CFS to cap CPU utilization.
   flags.cgroups_enable_cfs = true;
@@ -421,23 +437,22 @@ TEST_F(CgroupsIsolatorTest, ROOT_CGROUPS_CFS_EnableCfs)
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->empty());
 
-  // Generate random numbers to max out a single core. We'll run this
-  // for 0.5 seconds of wall time so it should consume approximately
-  // 250 ms of total cpu time when limited to 0.5 cpu. We use
-  // /dev/urandom to prevent blocking on Linux when there's
-  // insufficient entropy.
-  string command =
-    "cat /dev/urandom > /dev/null & "
-    "export MESOS_TEST_PID=$! && "
-    "sleep 0.5 && "
-    "kill $MESOS_TEST_PID";
+  // We will launch a task with 0.5 cpu and 32MB memory, and the command
+  // executor will be given 0.1 cpu (`DEFAULT_EXECUTOR_CPUS`) and 32MB
+  // memory (DEFAULT_EXECUTOR_MEM) by default, so we need 0.6 cpu and 64MB
+  // in total.
+  ASSERT_GE(
+      Resources(offers.get()[0].resources()).cpus().get(),
+      0.5 + DEFAULT_EXECUTOR_CPUS);
 
-  ASSERT_GE(Resources(offers.get()[0].resources()).cpus().get(), 0.5);
+  ASSERT_GE(
+       Resources(offers.get()[0].resources()).mem().get(),
+       Megabytes(32) + DEFAULT_EXECUTOR_MEM);
 
   TaskInfo task = createTask(
       offers.get()[0].slave_id(),
-      Resources::parse("cpus:0.5").get(),
-      command);
+      Resources::parse("cpus:0.5;mem:32").get(),
+      SLEEP_COMMAND(1000));
 
   Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
@@ -459,22 +474,772 @@ TEST_F(CgroupsIsolatorTest, ROOT_CGROUPS_CFS_EnableCfs)
 
   ContainerID containerId = *(containers->begin());
 
-  Future<ResourceStatistics> usage = containerizer->usage(containerId);
-  AWAIT_READY(usage);
+  Result<string> cpuHierarchy = cgroups::hierarchy("cpu");
+  ASSERT_SOME(cpuHierarchy);
 
-  // Expect that no more than 300 ms of cpu time has been consumed. We
-  // also check that at least 50 ms of cpu time has been consumed so
-  // this test will fail if the host system is very heavily loaded.
-  // This behavior is correct because under such conditions we aren't
-  // actually testing the CFS cpu limiter.
-  double cpuTime = usage->cpus_system_time_secs() +
-                   usage->cpus_user_time_secs();
+  Result<string> memoryHierarchy = cgroups::hierarchy("memory");
+  ASSERT_SOME(memoryHierarchy);
 
-  EXPECT_GE(0.30, cpuTime);
-  EXPECT_LE(0.05, cpuTime);
+  string cgroup = path::join(flags.cgroups_root, containerId.value());
+
+  // Ensure the CPU shares and CFS quota are correctly set for the container.
+  EXPECT_SOME_EQ(
+      (uint64_t)(CPU_SHARES_PER_CPU * (0.5 + DEFAULT_EXECUTOR_CPUS)),
+      cgroups::cpu::shares(cpuHierarchy.get(), cgroup));
+
+  Try<Duration> cfsQuota =
+    cgroups::cpu::cfs_quota_us(cpuHierarchy.get(), cgroup);
+
+  ASSERT_SOME(cfsQuota);
+
+  double expectedCFSQuota = (0.5 + DEFAULT_EXECUTOR_CPUS) * CPU_CFS_PERIOD.ms();
+  EXPECT_EQ(expectedCFSQuota, cfsQuota->ms());
+
+  // Ensure the memory soft and hard limits are correctly set for the container.
+  EXPECT_SOME_EQ(
+      Megabytes(32) + DEFAULT_EXECUTOR_MEM,
+      cgroups::memory::soft_limit_in_bytes(memoryHierarchy.get(), cgroup));
+
+  EXPECT_SOME_EQ(
+      Megabytes(32) + DEFAULT_EXECUTOR_MEM,
+      cgroups::memory::limit_in_bytes(memoryHierarchy.get(), cgroup));
+
+  Future<ContainerStatus> status = containerizer->status(containerId);
+  AWAIT_READY(status);
+  ASSERT_TRUE(status->has_executor_pid());
+
+  // Ensure the OOM score adjustment is set to the default value (i.e. 0).
+  Try<string> read = os::read(
+      strings::format("/proc/%d/oom_score_adj", status->executor_pid()).get());
+
+  ASSERT_SOME(read);
+
+  Try<int32_t> oomScoreAdj = numify<int32_t>(strings::trim(read.get()));
+  ASSERT_SOME_EQ(0, oomScoreAdj);
 
   driver.stop();
   driver.join();
+}
+
+
+// This test verifies that a task launched with resource limits specified
+// will have its CPU and memory's soft & hard limits and OOM score adjustment
+// set correctly.
+TEST_F(CgroupsIsolatorTest, ROOT_CGROUPS_CFS_CommandTaskLimits)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  // Start agent with 2 CPUs, total host memory and 1024MB disk.
+  Try<os::Memory> memory = os::memory();
+  ASSERT_SOME(memory);
+
+  uint64_t totalMemInMB = memory->total.bytes() / 1024 / 1024;
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "cgroups/cpu,cgroups/mem";
+  flags.resources =
+    strings::format("cpus:2;mem:%d;disk:1024", totalMemInMB).get();
+
+  Fetcher fetcher(flags);
+
+  Try<MesosContainerizer*> _containerizer =
+    MesosContainerizer::create(flags, true, &fetcher);
+
+  ASSERT_SOME(_containerizer);
+
+  Owned<MesosContainerizer> containerizer(_containerizer.get());
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      detector.get(),
+      containerizer.get(),
+      flags);
+
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+
+  MesosSchedulerDriver driver(
+      &sched,
+      DEFAULT_FRAMEWORK_INFO,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  // Launch a task with 0.2 cpu request, 0.5 cpu limit, half of
+  // host total memory - `DEFAULT_EXECUTOR_MEM` as memory request
+  // and half of host total memory as memory limit.
+  string resourceRequests = strings::format(
+      "cpus:0.2;mem:%d;disk:1024",
+      totalMemInMB/2 - DEFAULT_EXECUTOR_MEM.bytes() / 1024 / 1024).get();
+
+  Value::Scalar cpuLimit, memLimit;
+  cpuLimit.set_value(0.5);
+  memLimit.set_value(totalMemInMB/2);
+
+  google::protobuf::Map<string, Value::Scalar> resourceLimits;
+  resourceLimits.insert({"cpus", cpuLimit});
+  resourceLimits.insert({"mem", memLimit});
+
+  TaskInfo task = createTask(
+      offers.get()[0].slave_id(),
+      Resources::parse(resourceRequests).get(),
+      SLEEP_COMMAND(1000),
+      None(),
+      "test-task",
+      id::UUID::random().toString(),
+      resourceLimits);
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning));
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  Future<hashset<ContainerID>> containers = containerizer->containers();
+  AWAIT_READY(containers);
+  ASSERT_EQ(1u, containers->size());
+
+  ContainerID containerId = *(containers->begin());
+
+  Result<string> cpuHierarchy = cgroups::hierarchy("cpu");
+  ASSERT_SOME(cpuHierarchy);
+
+  Result<string> memoryHierarchy = cgroups::hierarchy("memory");
+  ASSERT_SOME(memoryHierarchy);
+
+  string cgroup = path::join(flags.cgroups_root, containerId.value());
+
+  // The command executor will be given 0.1 cpu (`DEFAULT_EXECUTOR_CPUS`)
+  // by default, so in total the CPU shares of the executor container
+  // should be 0.3.
+  EXPECT_SOME_EQ(
+      (uint64_t)(CPU_SHARES_PER_CPU * 0.3),
+      cgroups::cpu::shares(cpuHierarchy.get(), cgroup));
+
+  // The 0.1 cpu given to the command executor is also included in the cpu
+  // limit, so in total the CFS quota should be 0.6.
+  Try<Duration> cfsQuota =
+    cgroups::cpu::cfs_quota_us(cpuHierarchy.get(), cgroup);
+
+  ASSERT_SOME(cfsQuota);
+
+  double expectedCFSQuota =
+    (cpuLimit.value() + DEFAULT_EXECUTOR_CPUS) * CPU_CFS_PERIOD.ms();
+
+  EXPECT_EQ(expectedCFSQuota, cfsQuota->ms());
+
+  // The command executor will be given 32MB (`DEFAULT_EXECUTOR_MEM`) by default
+  // so in total the memory soft limit should be half of host total memory.
+  EXPECT_SOME_EQ(
+      Megabytes(totalMemInMB/2),
+      cgroups::memory::soft_limit_in_bytes(memoryHierarchy.get(), cgroup));
+
+  // The 32MB memory given to the command executor is also included in the
+  // memory limit, so in total the memory limit should be half of host total
+  // memory + 32MB.
+  EXPECT_SOME_EQ(
+      Megabytes(memLimit.value()) + DEFAULT_EXECUTOR_MEM,
+      cgroups::memory::limit_in_bytes(memoryHierarchy.get(), cgroup));
+
+  Future<ContainerStatus> status = containerizer->status(containerId);
+  AWAIT_READY(status);
+  ASSERT_TRUE(status->has_executor_pid());
+
+  // Ensure the OOM score adjustment is correctly set for the container.
+  Try<string> read = os::read(
+      strings::format("/proc/%d/oom_score_adj", status->executor_pid()).get());
+
+  ASSERT_SOME(read);
+
+  // Since the memory request is half of host total memory (please note that
+  // `DEFAULT_EXECUTOR_MEM` is also included in memory request), so the OOM
+  // score adjustment should be about 500, see `MemorySubsystemProcess::isolate`
+  // for the detailed algorithm.
+  Try<int32_t> oomScoreAdj = numify<int32_t>(strings::trim(read.get()));
+  ASSERT_SOME(oomScoreAdj);
+
+  EXPECT_GT(502, oomScoreAdj.get());
+  EXPECT_LT(498, oomScoreAdj.get());
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that a task launched with infinite resource
+// limits specified will have its CPU and memory's hard limits set
+// correctly to infinite values.
+TEST_F(CgroupsIsolatorTest, ROOT_CGROUPS_CFS_CommandTaskInfiniteLimits)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "cgroups/cpu,cgroups/mem";
+
+  Fetcher fetcher(flags);
+
+  Try<MesosContainerizer*> _containerizer =
+    MesosContainerizer::create(flags, true, &fetcher);
+
+  ASSERT_SOME(_containerizer);
+
+  Owned<MesosContainerizer> containerizer(_containerizer.get());
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      detector.get(),
+      containerizer.get());
+
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+
+  MesosSchedulerDriver driver(
+      &sched,
+      DEFAULT_FRAMEWORK_INFO,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  // Launch a task with infinite resource limits.
+  Value::Scalar cpuLimit, memLimit;
+  cpuLimit.set_value(std::numeric_limits<double>::infinity());
+  memLimit.set_value(std::numeric_limits<double>::infinity());
+
+  google::protobuf::Map<string, Value::Scalar> resourceLimits;
+  resourceLimits.insert({"cpus", cpuLimit});
+  resourceLimits.insert({"mem", memLimit});
+
+  TaskInfo task = createTask(
+      offers.get()[0].slave_id(),
+      offers.get()[0].resources(),
+      "sleep 1000",
+      None(),
+      "test-task",
+      id::UUID::random().toString(),
+      resourceLimits);
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning));
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  Future<hashset<ContainerID>> containers = containerizer->containers();
+  AWAIT_READY(containers);
+  ASSERT_EQ(1u, containers->size());
+
+  ContainerID containerId = *(containers->begin());
+
+  Result<string> cpuHierarchy = cgroups::hierarchy("cpu");
+  ASSERT_SOME(cpuHierarchy);
+
+  Result<string> memoryHierarchy = cgroups::hierarchy("memory");
+  ASSERT_SOME(memoryHierarchy);
+
+  string cgroup = path::join(flags.cgroups_root, containerId.value());
+
+  // The CFS quota should be -1 which means infinite quota.
+  Try<string> quota =
+    cgroups::read(cpuHierarchy.get(), cgroup, "cpu.cfs_quota_us");
+
+  ASSERT_SOME(quota);
+  EXPECT_EQ("-1", strings::trim(quota.get()));
+
+  // Root cgroup (e.g., `/sys/fs/cgroup/memory/`) cannot have any limits set, so
+  // its hard limit must be infinity.
+  Try<Bytes> rootCgrouplimit =
+    cgroups::memory::limit_in_bytes(memoryHierarchy.get(), "");
+
+  ASSERT_SOME(rootCgrouplimit);
+
+  // The memory hard limit should be same as root cgroup's, i.e. infinity.
+  EXPECT_SOME_EQ(
+      rootCgrouplimit.get(),
+      cgroups::memory::limit_in_bytes(memoryHierarchy.get(), cgroup));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies the default executor container's CPU and memory
+// soft & hard limits can be updated correctly when launching task groups
+// and killing tasks, and also verifies task's CPU and memory soft & hard
+// limits can be set correctly.
+TEST_F(CgroupsIsolatorTest, ROOT_CGROUPS_CFS_TaskGroupLimits)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = CreateMasterFlags();
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  // Disable AuthN on the agent.
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "cgroups/cpu,cgroups/mem";
+  flags.cgroups_enable_cfs = true;
+  flags.authenticate_http_readwrite = false;
+
+  Fetcher fetcher(flags);
+
+  Try<MesosContainerizer*> _containerizer =
+    MesosContainerizer::create(flags, true, &fetcher);
+
+  ASSERT_SOME(_containerizer);
+
+  Owned<MesosContainerizer> containerizer(_containerizer.get());
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), containerizer.get(), flags);
+
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
+
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers1;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers1));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid, ContentType::PROTOBUF, scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      "cpus:0.1;mem:32;disk:32",
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers1);
+  ASSERT_FALSE(offers1->offers().empty());
+
+  const v1::Offer& offer1 = offers1->offers(0);
+  const v1::AgentID& agentId = offer1.agent_id();
+
+  // Launch the first task group which has two tasks, task1 has no resource
+  // limits specified but task2 has.
+  v1::TaskInfo taskInfo1 = v1::createTask(
+      agentId,
+      v1::Resources::parse("cpus:0.1;mem:32;disk:32").get(),
+      SLEEP_COMMAND(1000));
+
+  mesos::v1::Value::Scalar cpuLimit, memLimit;
+  cpuLimit.set_value(0.5);
+  memLimit.set_value(64);
+
+  google::protobuf::Map<string, mesos::v1::Value::Scalar> resourceLimits;
+  resourceLimits.insert({"cpus", cpuLimit});
+  resourceLimits.insert({"mem", memLimit});
+
+  v1::TaskInfo taskInfo2 = v1::createTask(
+      agentId,
+      v1::Resources::parse("cpus:0.1;mem:32;disk:32").get(),
+      SLEEP_COMMAND(1000),
+      None(),
+      "test-task",
+      id::UUID::random().toString(),
+      resourceLimits);
+
+  taskInfo1.mutable_container()->set_type(mesos::v1::ContainerInfo::MESOS);
+  taskInfo1.mutable_container()->mutable_linux_info()->set_share_cgroups(false);
+  taskInfo2.mutable_container()->set_type(mesos::v1::ContainerInfo::MESOS);
+  taskInfo2.mutable_container()->mutable_linux_info()->set_share_cgroups(false);
+
+  Future<v1::scheduler::Event::Update> startingUpdate1;
+  Future<v1::scheduler::Event::Update> runningUpdate1;
+  Future<v1::scheduler::Event::Update> killedUpdate1;
+
+  testing::Sequence task1;
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_STARTING))))
+    .InSequence(task1)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingUpdate1),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .InSequence(task1)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&runningUpdate1),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo1.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_KILLED))))
+    .InSequence(task1)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&killedUpdate1),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  Future<v1::scheduler::Event::Update> startingUpdate2;
+  Future<v1::scheduler::Event::Update> runningUpdate2;
+  Future<v1::scheduler::Event::Update> killedUpdate2;
+
+  testing::Sequence task2;
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_STARTING))))
+    .InSequence(task2)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingUpdate2),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .InSequence(task2)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&runningUpdate2),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo2.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_KILLED))))
+    .InSequence(task2)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&killedUpdate2),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  Future<v1::scheduler::Event::Offers> offers2;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return());
+
+  {
+    v1::Offer::Operation launchGroup = v1::LAUNCH_GROUP(
+        executorInfo,
+        v1::createTaskGroupInfo({taskInfo1, taskInfo2}));
+
+    Call call = v1::createCallAccept(frameworkId, offer1, {launchGroup});
+
+    // Set a 0s filter to immediately get another offer to launch
+    // the second task group.
+    call.mutable_accept()->mutable_filters()->set_refuse_seconds(0);
+
+    mesos.send(call);
+  }
+
+  AWAIT_READY(startingUpdate1);
+  AWAIT_READY(runningUpdate1);
+
+  AWAIT_READY(startingUpdate2);
+  AWAIT_READY(runningUpdate2);
+
+  Future<hashset<ContainerID>> containers = containerizer->containers();
+  AWAIT_READY(containers);
+  ASSERT_EQ(3u, containers->size());
+
+  // Get task container IDs.
+  const v1::ContainerStatus& containerStatus1 =
+    runningUpdate1->status().container_status();
+
+  ASSERT_TRUE(containerStatus1.has_container_id());
+  ASSERT_TRUE(containerStatus1.container_id().has_parent());
+
+  const v1::ContainerID& taskContainerId1 = containerStatus1.container_id();
+
+  const v1::ContainerStatus& containerStatus2 =
+    runningUpdate2->status().container_status();
+
+  ASSERT_TRUE(containerStatus2.has_container_id());
+  ASSERT_TRUE(containerStatus2.container_id().has_parent());
+
+  const v1::ContainerID& taskContainerId2 = containerStatus2.container_id();
+
+  EXPECT_EQ(taskContainerId1.parent(), taskContainerId2.parent());
+
+  // Get the executor container ID.
+  const v1::ContainerID& executorContainerId = taskContainerId1.parent();
+
+  Result<string> cpuHierarchy = cgroups::hierarchy("cpu");
+  ASSERT_SOME(cpuHierarchy);
+
+  Result<string> memoryHierarchy = cgroups::hierarchy("memory");
+  ASSERT_SOME(memoryHierarchy);
+
+  const string& executorCgroup =
+    path::join(flags.cgroups_root, executorContainerId.value());
+
+  const string& taskCgroup1 =
+    getCgroupPath(flags.cgroups_root, devolve(taskContainerId1));
+
+  const string& taskCgroup2 =
+    getCgroupPath(flags.cgroups_root, devolve(taskContainerId2));
+
+  // The CPU shares of the executor container is the sum of its own CPU
+  // request (0.1) + task1's CPU request (0.1) + task2's CPU request (0.1),
+  // i.e. 0.3.
+  EXPECT_SOME_EQ(
+      (uint64_t)(CPU_SHARES_PER_CPU * 0.3),
+      cgroups::cpu::shares(cpuHierarchy.get(), executorCgroup));
+
+  // The CPU shares of task1 is its CPU request (0.1).
+  EXPECT_SOME_EQ(
+      (uint64_t)(CPU_SHARES_PER_CPU * 0.1),
+      cgroups::cpu::shares(cpuHierarchy.get(), taskCgroup1));
+
+  // The CPU shares of task2 is its CPU request (0.1).
+  EXPECT_SOME_EQ(
+      (uint64_t)(CPU_SHARES_PER_CPU * 0.1),
+      cgroups::cpu::shares(cpuHierarchy.get(), taskCgroup2));
+
+  // The CFS quota of the executor container is the sum of its own CPU
+  // request (0.1) + task1's CPU request (0.1) + task2's CPU limit (0.5),
+  // i.e. 0.7.
+  Try<Duration> cfsQuota =
+    cgroups::cpu::cfs_quota_us(cpuHierarchy.get(), executorCgroup);
+
+  ASSERT_SOME(cfsQuota);
+  EXPECT_EQ(0.7 * CPU_CFS_PERIOD.ms(), cfsQuota->ms());
+
+  // The CFS quota of task1 is its CPU request (0.1).
+  cfsQuota = cgroups::cpu::cfs_quota_us(cpuHierarchy.get(), taskCgroup1);
+  ASSERT_SOME(cfsQuota);
+  EXPECT_EQ(0.1 * CPU_CFS_PERIOD.ms(), cfsQuota->ms());
+
+  // The CFS quota of task2 is its CPU limit (0.5).
+  cfsQuota = cgroups::cpu::cfs_quota_us(cpuHierarchy.get(), taskCgroup2);
+  ASSERT_SOME(cfsQuota);
+  EXPECT_EQ(0.5 * CPU_CFS_PERIOD.ms(), cfsQuota->ms());
+
+  // The memory soft limit of the executor container is the sum of its
+  // own memory request (32MB) + task1's memory request (32MB) + task2's
+  // memory request (32MB), i.e. 96MB.
+  EXPECT_SOME_EQ(
+      Megabytes(96),
+      cgroups::memory::soft_limit_in_bytes(
+          memoryHierarchy.get(), executorCgroup));
+
+  // The memory soft limit of task1 is its memory request (32MB).
+  EXPECT_SOME_EQ(
+      Megabytes(32),
+      cgroups::memory::soft_limit_in_bytes(
+          memoryHierarchy.get(), taskCgroup1));
+
+  // The memory soft limit of task2 is its memory request (32MB).
+  EXPECT_SOME_EQ(
+      Megabytes(32),
+      cgroups::memory::soft_limit_in_bytes(
+          memoryHierarchy.get(), taskCgroup2));
+
+  // The memory hard limit of the executor container is the sum of its
+  // own memory request (32MB) + task1's memory request (32MB) + task2's
+  // memory limit (64MB), i.e. 128MB.
+  EXPECT_SOME_EQ(
+      Megabytes(128),
+      cgroups::memory::limit_in_bytes(memoryHierarchy.get(), executorCgroup));
+
+  // The memory hard limit of task1 is its memory request (32MB).
+  EXPECT_SOME_EQ(
+      Megabytes(32),
+      cgroups::memory::limit_in_bytes(memoryHierarchy.get(), taskCgroup1));
+
+  // The memory hard limit of task2 is its memory limit (64MB).
+  EXPECT_SOME_EQ(
+      Megabytes(64),
+      cgroups::memory::limit_in_bytes(memoryHierarchy.get(), taskCgroup2));
+
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+  Clock::resume();
+
+  AWAIT_READY(offers2);
+  ASSERT_FALSE(offers1->offers().empty());
+
+  const v1::Offer& offer2 = offers2->offers(0);
+
+  // Launch the second task group which has only one task: task3, and this
+  // task has no resource limits specified.
+  v1::TaskInfo taskInfo3 = v1::createTask(
+      agentId,
+      v1::Resources::parse("cpus:0.1;mem:32;disk:32").get(),
+      SLEEP_COMMAND(1000));
+
+  taskInfo3.mutable_container()->set_type(mesos::v1::ContainerInfo::MESOS);
+  taskInfo3.mutable_container()->mutable_linux_info()->set_share_cgroups(false);
+
+  Future<v1::scheduler::Event::Update> startingUpdate3;
+  Future<v1::scheduler::Event::Update> runningUpdate3;
+
+  testing::Sequence task3;
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo3.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_STARTING))))
+    .InSequence(task3)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingUpdate3),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo3.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .InSequence(task3)
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&runningUpdate3),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer2,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({taskInfo3}))}));
+
+  AWAIT_READY(startingUpdate3);
+  AWAIT_READY(runningUpdate3);
+
+  // The CPU shares of the executor container is the sum of its own CPU
+  // request (0.1) + task1's CPU request (0.1) + task2's CPU request (0.1)
+  // + task3's CPU request (0.1), i.e. 0.4.
+  EXPECT_SOME_EQ(
+      (uint64_t)(CPU_SHARES_PER_CPU * 0.4),
+      cgroups::cpu::shares(cpuHierarchy.get(), executorCgroup));
+
+  // The CFS quota of the executor container is the sum of its own CPU
+  // request (0.1) + task1's CPU request (0.1) + task2's CPU limit (0.5)
+  // + task3's CPU request (0.1), i.e. 0.8.
+  cfsQuota = cgroups::cpu::cfs_quota_us(cpuHierarchy.get(), executorCgroup);
+  ASSERT_SOME(cfsQuota);
+  EXPECT_EQ(0.8 * CPU_CFS_PERIOD.ms(), cfsQuota->ms());
+
+  // The memory soft limit of the executor container is the sum of its
+  // own memory request (32MB) + task1's memory request (32MB) + task2's
+  // memory request (32MB) + task3's memory request (32MB) i.e. 128MB.
+  EXPECT_SOME_EQ(
+      Megabytes(128),
+      cgroups::memory::soft_limit_in_bytes(
+          memoryHierarchy.get(), executorCgroup));
+
+  // The memory hard limit of the executor container is the sum of its
+  // own memory request (32MB) + task1's memory request (32MB) + task2's
+  // memory limit (64MB) + task3's memory request (32MB), i.e. 160MB.
+  EXPECT_SOME_EQ(
+      Megabytes(160),
+      cgroups::memory::limit_in_bytes(memoryHierarchy.get(), executorCgroup));
+
+  // Now kill a task in the first task group.
+  mesos.send(v1::createCallKill(frameworkId, taskInfo1.task_id()));
+
+  // Both of the two tasks in the first group will be killed.
+  AWAIT_READY(killedUpdate1);
+  AWAIT_READY(killedUpdate2);
+
+  // The CPU shares of the executor container is the sum of its own CPU
+  // request (0.1) + task3's CPU request (0.1), i.e. 0.2.
+  EXPECT_SOME_EQ(
+      (uint64_t)(CPU_SHARES_PER_CPU * 0.2),
+      cgroups::cpu::shares(cpuHierarchy.get(), executorCgroup));
+
+  // The CFS quota of the executor container is also the sum of its own CPU
+  // request (0.1) + task3's CPU request (0.1), i.e. 0.2.
+  cfsQuota = cgroups::cpu::cfs_quota_us(cpuHierarchy.get(), executorCgroup);
+  ASSERT_SOME(cfsQuota);
+  EXPECT_EQ(0.2 * CPU_CFS_PERIOD.ms(), cfsQuota->ms());
+
+  // The memory soft limit of the executor container is the sum of its
+  // own memory request (32MB) + task3's memory request (32MB) i.e. 64MB.
+  EXPECT_SOME_EQ(
+      Megabytes(64),
+      cgroups::memory::soft_limit_in_bytes(
+          memoryHierarchy.get(), executorCgroup));
+
+  // We only update the memory hard limit if it is the first time or when
+  // we're raising the existing limit (see `MemorySubsystemProcess::update`
+  // for details). So now the memory hard limit of the executor container
+  // should still be 160MB.
+  EXPECT_SOME_EQ(
+      Megabytes(160),
+      cgroups::memory::limit_in_bytes(memoryHierarchy.get(), executorCgroup));
 }
 
 
@@ -726,7 +1491,8 @@ TEST_F(CgroupsIsolatorTest, ROOT_CGROUPS_CreateRecursively)
   // We should remove cgroups_root after the slave being started
   // because slave will create cgroups_root dir during startup
   // if it's not present.
-  ASSERT_SOME(cgroups::remove(hierarchy.get(), flags.cgroups_root));
+  ASSERT_SOME(os::rmdir(
+        path::join(hierarchy.get(), flags.cgroups_root), false));
   ASSERT_FALSE(os::exists(flags.cgroups_root));
 
   MockScheduler sched;

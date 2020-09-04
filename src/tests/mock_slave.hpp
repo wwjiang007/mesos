@@ -31,6 +31,7 @@
 #include <mesos/slave/resource_estimator.hpp>
 
 #include <process/future.hpp>
+#include <process/owned.hpp>
 #include <process/pid.hpp>
 
 #include <stout/duration.hpp>
@@ -40,6 +41,7 @@
 
 #include "messages/messages.hpp"
 
+#include "slave/csi_server.hpp"
 #include "slave/slave.hpp"
 
 using ::testing::_;
@@ -101,6 +103,7 @@ public:
       SecretGenerator* secretGenerator,
       slave::VolumeGidManager* volumeGidManager,
       PendingFutureTracker* futureTracker,
+      process::Owned<slave::CSIServer>&& csiServer,
       const Option<Authorizer*>& authorizer);
 
   MOCK_METHOD6(___run, void(
@@ -153,13 +156,14 @@ public:
       const std::vector<ResourceVersionUUID>& resourceVersionUuids,
       const Option<bool>& launchExecutor);
 
-  MOCK_METHOD6(__run, void(
+  MOCK_METHOD7(__run, void(
       const FrameworkInfo& frameworkInfo,
       const ExecutorInfo& executorInfo,
       const Option<TaskInfo>& task,
       const Option<TaskGroupInfo>& taskGroup,
       const std::vector<ResourceVersionUUID>& resourceVersionUuids,
-      const Option<bool>& launchExecutor));
+      const Option<bool>& launchExecutor,
+      bool executorGeneratedForCommandTask));
 
   void unmocked___run(
       const FrameworkInfo& frameworkInfo,
@@ -167,7 +171,8 @@ public:
       const Option<TaskInfo>& task,
       const Option<TaskGroupInfo>& taskGroup,
       const std::vector<ResourceVersionUUID>& resourceVersionUuids,
-      const Option<bool>& launchExecutor);
+      const Option<bool>& launchExecutor,
+      bool executorGeneratedForCommandTask);
 
   MOCK_METHOD6(runTaskGroup, void(
       const process::UPID& from,

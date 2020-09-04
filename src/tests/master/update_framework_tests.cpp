@@ -19,8 +19,6 @@
 
 #include <gmock/gmock.h>
 
-#include <google/protobuf/util/message_differencer.h>
-
 #include <mesos/executor.hpp>
 
 #include <mesos/v1/mesos.hpp>
@@ -119,28 +117,6 @@ static TFrameworkInfo changeAllMutableFields(const TFrameworkInfo& oldInfo)
   return newInfo;
 }
 
-
-template <class TFrameworkInfo>
-static Option<std::string> diff(
-    const TFrameworkInfo& lhs, const TFrameworkInfo& rhs)
-{
-  const google::protobuf::Descriptor* descriptor = TFrameworkInfo::descriptor();
-  google::protobuf::util::MessageDifferencer differencer;
-
-  differencer.TreatAsSet(descriptor->FindFieldByName("capabilities"));
-  differencer.TreatAsSet(descriptor->FindFieldByName("roles"));
-
-  string result;
-  differencer.ReportDifferencesToString(&result);
-
-  if (differencer.Compare(lhs, rhs)) {
-    return None();
-  }
-
-  return result;
-}
-
-
 namespace v1 {
 
 
@@ -193,7 +169,9 @@ class UpdateFrameworkTest : public MesosTest {};
 static Future<APIResult> callUpdateFramework(
     Mesos* mesos,
     const FrameworkInfo& info,
-    const vector<string>& suppressedRoles = {})
+    const vector<string>& suppressedRoles = {},
+    const Option<::mesos::v1::scheduler::OfferConstraints>& offerConstraints =
+      None())
 {
   CHECK(info.has_id());
 
@@ -203,6 +181,12 @@ static Future<APIResult> callUpdateFramework(
   *call.mutable_update_framework()->mutable_framework_info() = info;
   *call.mutable_update_framework()->mutable_suppressed_roles() =
     RepeatedPtrField<string>(suppressedRoles.begin(), suppressedRoles.end());
+
+  if (offerConstraints.isSome()) {
+    *call.mutable_update_framework()->mutable_offer_constraints() =
+      *offerConstraints;
+  }
+
   return mesos->call(call);
 }
 
@@ -249,10 +233,11 @@ TEST_F(UpdateFrameworkTest, UserChangeFails)
 
   FrameworkInfo expected = DEFAULT_FRAMEWORK_INFO;
   *expected.mutable_id() = subscribed->framework_id();
-  EXPECT_NONE(diff(frameworks->frameworks(0).framework_info(), expected));
+  EXPECT_NONE(::mesos::v1::typeutils::diff(
+      frameworks->frameworks(0).framework_info(), expected));
 
   // Sanity check for diff()
-  EXPECT_SOME(diff(update, expected));
+  EXPECT_SOME(::mesos::v1::typeutils::diff(update, expected));
 }
 
 
@@ -299,10 +284,11 @@ TEST_F(UpdateFrameworkTest, PrincipalChangeFails)
 
   FrameworkInfo expected = DEFAULT_FRAMEWORK_INFO;
   *expected.mutable_id() = subscribed->framework_id();
-  EXPECT_NONE(diff(frameworks->frameworks(0).framework_info(), expected));
+  EXPECT_NONE(::mesos::v1::typeutils::diff(
+      frameworks->frameworks(0).framework_info(), expected));
 
   // Sanity check for diff()
-  EXPECT_SOME(diff(update, expected));
+  EXPECT_SOME(::mesos::v1::typeutils::diff(update, expected));
 }
 
 
@@ -350,10 +336,11 @@ TEST_F(UpdateFrameworkTest, CheckpointingChangeFails)
 
   FrameworkInfo expected = DEFAULT_FRAMEWORK_INFO;
   *expected.mutable_id() = subscribed->framework_id();
-  EXPECT_NONE(diff(frameworks->frameworks(0).framework_info(), expected));
+  EXPECT_NONE(::mesos::v1::typeutils::diff(
+      frameworks->frameworks(0).framework_info(), expected));
 
   // Sanity check for diff()
-  EXPECT_SOME(diff(update, expected));
+  EXPECT_SOME(::mesos::v1::typeutils::diff(update, expected));
 }
 
 
@@ -438,13 +425,104 @@ TEST_F(UpdateFrameworkTest, MutableFieldsUpdateSuccessfully)
   const FrameworkInfo& frameworkInfo =
     frameworks->frameworks(0).framework_info();
 
-  EXPECT_NONE(diff(frameworkInfo, update));
+  EXPECT_NONE(::mesos::v1::typeutils::diff(frameworkInfo, update));
 
   AWAIT_READY(updateFrameworkMessage);
-  EXPECT_NONE(diff(evolve(updateFrameworkMessage->framework_info()), update));
+  EXPECT_NONE(::mesos::v1::typeutils::diff(
+      evolve(updateFrameworkMessage->framework_info()), update));
 
   AWAIT_READY(frameworkUpdated);
-  EXPECT_NONE(diff(frameworkUpdated->framework().framework_info(), update));
+  EXPECT_NONE(::mesos::v1::typeutils::diff(
+      frameworkUpdated->framework().framework_info(), update));
+};
+
+
+// This test issues two UpdateFrameworkCalls: the first one with the same
+// `FrameworkInfo`, the second with mutated `FrameworkInfo`,
+// and verifies that the first call does NOT result in updates
+// to agents/subscribers.
+TEST_F(UpdateFrameworkTest, NoRedundantUpdates)
+{
+  Try<Owned<cluster::Master>> master = StartMaster(CreateMasterFlags());
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master->get()->createDetector();
+
+  // Subscribe to master v1 API.
+  MockMasterAPISubscriber masterAPISubscriber;
+  AWAIT_READY(masterAPISubscriber.subscribe(master.get()->pid));
+
+  Future<Nothing> agentAdded;
+  EXPECT_CALL(masterAPISubscriber, agentAdded(_))
+    .WillOnce(FutureSatisfy(&agentAdded));
+
+  // We need an agent to test the UpdateFrameworkMessage.
+  mesos::internal::slave::Flags slaveFlags = CreateSlaveFlags();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  // To test the UpdateFrameworkMessage, we should wait for the agent
+  // to be added before calling UPDATE_FRAMEWORK.
+  AWAIT_READY(agentAdded);
+
+  // Expect a single FRAMEWORK_UPDATED event.
+  Future<v1::master::Event::FrameworkUpdated> frameworkUpdated;
+  EXPECT_CALL(masterAPISubscriber, frameworkUpdated(_))
+    .WillOnce(FutureArg<0>(&frameworkUpdated));
+
+  // Expect UpdateFrameworkMessage to be sent from the master to the agent.
+  Future<UpdateFrameworkMessage> updateFrameworkMessage = FUTURE_PROTOBUF(
+      UpdateFrameworkMessage(), master->get()->pid, slave->get()->pid);
+
+  // Start the scheduler, wait for connection and then subscribe.
+  auto scheduler = std::make_shared<MockHTTPScheduler>();
+
+  Future<Nothing> connected;
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(SendSubscribe(DEFAULT_FRAMEWORK_INFO));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  TestMesos mesos(master->get()->pid, ContentType::PROTOBUF, scheduler);
+
+  // To send UPDATE_FRAMEWORK, we need to obtain a framework ID.
+  AWAIT_READY(subscribed);
+
+  // Issue an UPDATE_FRAMEWORK that does not touch `FrameworkInfo`.
+  FrameworkInfo update1 = DEFAULT_FRAMEWORK_INFO;
+  *update1.mutable_id() = subscribed->framework_id();
+  Future<APIResult> result1 = callUpdateFramework(&mesos, update1);
+
+  AWAIT_READY(result1);
+  ASSERT_EQ(result1->status_code(), 200u);
+
+  // Verify that the first update has not resulted in broadcasts to
+  // agents/subscribers.
+  Clock::pause();
+  Clock::settle();
+  ASSERT_TRUE(frameworkUpdated.isPending());
+  ASSERT_TRUE(updateFrameworkMessage.isPending());
+
+  // Change `FrameworkInfo` via UPDATE_FRAMEWORK.
+  const FrameworkInfo update2 = changeAllMutableFields(update1);
+  Future<APIResult> result2 = callUpdateFramework(&mesos, update2);
+
+  AWAIT_READY(result2);
+  EXPECT_EQ(result2->status_code(), 200u);
+
+  // Verify that the broadcasts report the second update.
+  AWAIT_READY(updateFrameworkMessage);
+  EXPECT_NONE(::mesos::v1::typeutils::diff(
+      evolve(updateFrameworkMessage->framework_info()), update2));
+
+  AWAIT_READY(frameworkUpdated);
+  EXPECT_NONE(::mesos::v1::typeutils::diff(
+      frameworkUpdated->framework().framework_info(), update2));
 };
 
 
@@ -725,6 +803,103 @@ TEST_F(UpdateFrameworkTest, RemoveAndUnsuppress)
 }
 
 
+// This test ensures that it is possible to modify offer constraints
+// via the UpdateFramework call.
+TEST_F(UpdateFrameworkTest, OfferConstraints)
+{
+  using ::mesos::v1::scheduler::AttributeConstraint;
+  using ::mesos::v1::scheduler::OfferConstraints;
+
+  mesos::internal::master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master->get()->createDetector();
+
+  mesos::internal::slave::Flags slaveFlags = CreateSlaveFlags();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(Invoke([](Mesos* mesos) {
+      Call call;
+      call.set_type(Call::SUBSCRIBE);
+      *call.mutable_subscribe()->mutable_framework_info() =
+        DEFAULT_FRAMEWORK_INFO;
+
+      AttributeConstraint* constraint =
+        (*call.mutable_subscribe()
+            ->mutable_offer_constraints()
+            ->mutable_role_constraints())[DEFAULT_FRAMEWORK_INFO.roles(0)]
+          .add_groups()
+          ->add_attribute_constraints();
+
+      *constraint->mutable_selector()->mutable_attribute_name() = "foo";
+      *constraint->mutable_predicate()->mutable_exists() =
+        AttributeConstraint::Predicate::Exists();
+
+      mesos->send(call);
+    }));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  Future<Event::Subscribed> subscribed;
+
+  EXPECT_CALL(*scheduler, subscribed(_, _)).WillOnce(FutureArg<1>(&subscribed));
+
+  // Expect that the framework gets no offers.
+  EXPECT_CALL(*scheduler, offers(_, _)).Times(AtMost(0));
+
+  TestMesos mesos(master->get()->pid, ContentType::PROTOBUF, scheduler);
+
+  AWAIT_READY(subscribed);
+
+  // Trigger allocation to ensure that the agent is not offered before changing
+  // offer constraints.
+  Clock::pause();
+  Clock::settle();
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  // Expect an offer after constraints change.
+  Future<Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _)).WillOnce(FutureArg<1>(&offers));
+
+  // Change constraint to `NotExists` so that the agent will now be offered to
+  // the framework.
+  {
+    FrameworkInfo framework = DEFAULT_FRAMEWORK_INFO;
+    *framework.mutable_id() = subscribed->framework_id();
+
+    OfferConstraints constraints;
+    AttributeConstraint* constraint =
+      (*constraints.mutable_role_constraints())[framework.roles(0)]
+        .add_groups()
+        ->add_attribute_constraints();
+
+    *constraint->mutable_selector()->mutable_attribute_name() = "foo";
+    *constraint->mutable_predicate()->mutable_not_exists() =
+      AttributeConstraint::Predicate::NotExists();
+
+    AWAIT_READY(callUpdateFramework(&mesos, framework, {}, constraints));
+  }
+
+  Clock::pause();
+  Clock::settle();
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers);
+  EXPECT_EQ(offers->offers().size(), 1);
+
+  // TODO(asekretenko): After master starts exposing offer constraints via
+  // its endpoints (MESOS-10179), check the constraints in the endpoints.
+}
+
+
 } // namespace scheduler {
 } // namespace v1 {
 
@@ -890,10 +1065,11 @@ TEST_F(UpdateFrameworkV0Test, MutableFieldsUpdateSuccessfully)
 
   AWAIT_READY(updateFrameworkMessage);
 
-  EXPECT_NONE(diff(updateFrameworkMessage->framework_info(), update));
+  EXPECT_NONE(::mesos::typeutils::diff(
+      updateFrameworkMessage->framework_info(), update));
 
   AWAIT_READY(frameworkUpdated);
-  EXPECT_NONE(diff(
+  EXPECT_NONE(::mesos::typeutils::diff(
       devolve(frameworkUpdated->framework().framework_info()), update));
 
   Future<v1::master::Response::GetFrameworks> frameworks =
@@ -903,7 +1079,7 @@ TEST_F(UpdateFrameworkV0Test, MutableFieldsUpdateSuccessfully)
   const FrameworkInfo& reportedFrameworkInfo =
     devolve(frameworks->frameworks(0).framework_info());
 
-  EXPECT_NONE(diff(reportedFrameworkInfo, update));
+  EXPECT_NONE(::mesos::typeutils::diff(reportedFrameworkInfo, update));
 
   driver.stop();
   driver.join();
@@ -1071,11 +1247,6 @@ TEST_F(UpdateFrameworkV0Test, SuppressedRoles)
   v1::MockMasterAPISubscriber masterAPISubscriber;
   AWAIT_READY(masterAPISubscriber.subscribe(master.get()->pid));
 
-  // Expect FRAMEWORK_UPDATED event after update.
-  Future<v1::master::Event::FrameworkUpdated> frameworkUpdated;
-  EXPECT_CALL(masterAPISubscriber, frameworkUpdated(_))
-    .WillOnce(FutureArg<0>(&frameworkUpdated));
-
   Future<Nothing> secondAgentAdded;
   EXPECT_CALL(masterAPISubscriber, agentAdded(_))
     .WillOnce(Return())
@@ -1116,7 +1287,12 @@ TEST_F(UpdateFrameworkV0Test, SuppressedRoles)
 
   driver.updateFramework(update, suppressedRoles);
 
-  AWAIT_READY(frameworkUpdated);
+  // Ensure that the allocator processes the update, so that this test
+  // does not rely on Master maintaining an ordering between scheduler API calls
+  // processing and agent registration.
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
 
   Try<Owned<cluster::Slave>> newSlave = StartSlave(detector.get());
   ASSERT_SOME(newSlave);
@@ -1146,15 +1322,6 @@ TEST_F(UpdateFrameworkV0Test, UnsuppressClearsFilters)
   mesos::internal::master::Flags masterFlags = CreateMasterFlags();
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
-
-  v1::MockMasterAPISubscriber masterAPISubscriber;
-  AWAIT_READY(masterAPISubscriber.subscribe(master.get()->pid));
-
-  Future<v1::master::Event::FrameworkUpdated> frameworkUpdated1;
-  Future<v1::master::Event::FrameworkUpdated> frameworkUpdated2;
-  EXPECT_CALL(masterAPISubscriber, frameworkUpdated(_))
-    .WillOnce(FutureArg<0>(&frameworkUpdated1))
-    .WillOnce(FutureArg<0>(&frameworkUpdated2));
 
   Owned<MasterDetector> detector = master->get()->createDetector();
 
@@ -1195,10 +1362,7 @@ TEST_F(UpdateFrameworkV0Test, UnsuppressClearsFilters)
     update.roles().begin(), update.roles().end());
 
   driver.updateFramework(update, suppressedRoles);
-  AWAIT_READY(frameworkUpdated1);
-
   driver.updateFramework(update, {});
-  AWAIT_READY(frameworkUpdated2);
 
   // Now the previously declined agent should be re-offered.
   Clock::pause();

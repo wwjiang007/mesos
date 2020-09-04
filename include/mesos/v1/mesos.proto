@@ -1038,6 +1038,10 @@ message AgentInfo {
       // This expresses the ability for the agent to automatically drain tasks
       // in preparation for operator maintenance. This capability is required.
       AGENT_DRAINING = 7;
+
+      // This expresses the ability for the agent to launch tasks which specify
+      // resource limits for CPU and/or memory.
+      TASK_RESOURCE_LIMITS = 8;
     }
 
     // Enum fields should be optional, see: MESOS-4997.
@@ -1047,7 +1051,7 @@ message AgentInfo {
 
 
 /**
- * Describes the container configuration to run a CSI plugin component.
+ * Describes the container configuration to run a managed CSI plugin.
  */
 message CSIPluginContainerInfo {
   enum Service {
@@ -1060,6 +1064,15 @@ message CSIPluginContainerInfo {
   optional CommandInfo command = 2;
   repeated Resource resources = 3;
   optional ContainerInfo container = 4;
+}
+
+
+/**
+ * Describes the endpoint of an unmanaged CSI plugin service.
+ */
+message CSIPluginEndpoint {
+  required CSIPluginContainerInfo.Service csi_service = 1;
+  required string endpoint = 2;
 }
 
 
@@ -1087,13 +1100,41 @@ message CSIPluginInfo {
   // that the concatenation of type and name is unique in the cluster, and it
   // remains the same if the instance is migrated to another agent (e.g., there
   // is a change in the agent ID).
-  required string name = 2;
+  optional string name = 2 [default = "default"];
 
-  // A list of container configurations to run CSI plugin components.
+  // We support two kinds of CSI plugins:
+  //   1. Managed CSI plugins: This is the plugin which will be launched by
+  //      Mesos as standalone container, and Mesos will internally determine
+  //      its endpoint when launching it and manage its whole lifecyle. For this
+  //      kind of plugins, the `containers` field below must be specified.
+  //   2. Unmanaged CSI plugins: This is the plugin which is launched out of
+  //      Mesos (e.g., manually launched by the operator). For this kind of
+  //      plugins, the `endpoints` field below must be specified because Mesos
+  //      needs it to call CSI gRPC methods.
+  // Please note that only one of the `containers` and `endpoints` fields should
+  // be specified.
+
+  // A list of container configurations to run managed CSI plugin.
   // The controller service will be served by the first configuration
   // that contains `CONTROLLER_SERVICE`, and the node service will be
   // served by the first configuration that contains `NODE_SERVICE`.
   repeated CSIPluginContainerInfo containers = 3;
+
+  // The service endpoints of the unmanaged CSI plugin. An endpoint is usually
+  // a path to a Unix domain socket.
+  repeated CSIPluginEndpoint endpoints = 4;
+
+  // The root directory of all the target paths managed by the CSI plugin.
+  // Each volume will be published by the CSI plugin at a sub-directory
+  // under this path.
+  optional string target_path_root = 5;
+
+  // For some CSI plugins which implement CSI v1 spec, they expect the target
+  // path is an existing path which is actually not CSI v1 spec compliant. In
+  // such case this field should be set to `true` as a work around for those
+  // plugins. For the CSI plugins which implement CSI v0 spec, this field will
+  // be just ignored.
+  optional bool target_path_exists = 6;
 }
 
 
@@ -1715,8 +1756,11 @@ message ResourceStatistics {
   optional double cpus_user_time_secs = 2;
   optional double cpus_system_time_secs = 3;
 
-  // Number of CPUs allocated.
+  // Hard CPU limit.
   optional double cpus_limit = 4;
+
+  // Soft CPU limit.
+  optional double cpus_soft_limit = 45;
 
   // cpu.stat on process throttling (for contention issues).
   optional uint32 cpus_nr_periods = 7;
@@ -1735,10 +1779,10 @@ message ResourceStatistics {
   // Total memory + swap usage. This is set if swap is enabled.
   optional uint64 mem_total_memsw_bytes = 37;
 
-  // Hard memory limit for a container.
+  // Hard memory limit.
   optional uint64 mem_limit_bytes = 6;
 
-  // Soft memory limit for a container.
+  // Soft memory limit.
   optional uint64 mem_soft_limit_bytes = 38;
 
   // Broken out memory usage information: pagecache, rss (anonymous),
@@ -2272,6 +2316,9 @@ message TaskInfo {
   // It is the executor's responsibility to implement this, so it might not be
   // supported by all custom executors.
   optional DurationInfo max_completion_time = 14;
+
+  // Resource limits associated with the task.
+  map<string, Value.Scalar> limits = 15;
 }
 
 
@@ -2344,6 +2391,9 @@ message Task {
 
   // Specific user under which task is running.
   optional string user = 14;
+
+  // Resource limits associated with the task.
+  map<string, Value.Scalar> limits = 17;
 }
 
 
@@ -3001,10 +3051,10 @@ message Volume {
   // TODO(gyliu513): Make this as `optional` after deprecation cycle of 1.0.
   required Mode mode = 3;
 
-  // Path pointing to a directory or file in the container. If the
-  // path is a relative path, it is relative to the container work
-  // directory. If the path is an absolute path, that path must
-  // already exist.
+  // Path pointing to a directory or file in the container. If the path
+  // is a relative path, it is relative to the container work directory.
+  // If the path is an absolute path and the container does not have its
+  // own rootfs, that path must already exist in the agent host rootfs.
   required string container_path = 1;
 
   // The following specifies the source of this volume. At most one of
@@ -3032,6 +3082,7 @@ message Volume {
       HOST_PATH = 4;
       SANDBOX_PATH = 2;
       SECRET = 3;
+      CSI_VOLUME = 5;
     }
 
     message DockerVolume {
@@ -3070,6 +3121,94 @@ message Volume {
       required string path = 2;
     }
 
+    // A volume which will be handled by the `volume/csi` isolator.
+    message CSIVolume {
+      // The name of the CSI plugin.
+      required string plugin_name = 1;
+
+      // Specifies a capability of a volume.
+      // https://github.com/container-storage-interface/spec/blob/v1.3.0/csi.proto#L379:L438
+      message VolumeCapability {
+        // Indicates that the volume will be accessed via the block device API.
+        message BlockVolume {
+          // Intentionally empty, for now.
+        }
+
+        // Indicates that the volume will be accessed via the filesystem API.
+        message MountVolume {
+          // The filesystem type. An empty string is equal to an unspecified
+          // field value.
+          optional string fs_type = 1;
+
+          // The mount options that can be used for the volume. This field is
+          // OPTIONAL. `mount_flags` MAY contain sensitive information.
+          // Therefore, Mesos and the Plugin MUST NOT leak this information
+          // to untrusted entities. The total size of this repeated field
+          // SHALL NOT exceed 4 KiB.
+          repeated string mount_flags = 2;
+        }
+
+        // Specifies how a volume can be accessed.
+        message AccessMode {
+          enum Mode {
+            UNKNOWN = 0;
+
+            // Can only be published once as read/write on a single node, at
+            // any given time.
+            SINGLE_NODE_WRITER = 1;
+
+            // Can only be published once as readonly on a single node, at
+            // any given time.
+            SINGLE_NODE_READER_ONLY = 2;
+
+            // Can be published as readonly at multiple nodes simultaneously.
+            MULTI_NODE_READER_ONLY = 3;
+
+            // Can be published at multiple nodes simultaneously. Only one of
+            // the node can be used as read/write. The rest will be readonly.
+            MULTI_NODE_SINGLE_WRITER = 4;
+
+            // Can be published as read/write at multiple nodes
+            // simultaneously.
+            MULTI_NODE_MULTI_WRITER = 5;
+          }
+
+          required Mode mode = 1;
+        }
+
+        // Specifies what API the volume will be accessed using. One of the
+        // following fields MUST be specified.
+        oneof access_type {
+          BlockVolume block = 1;
+          MountVolume mount = 2;
+        }
+
+        required AccessMode access_mode = 3;
+      }
+
+      // Specifies the parameters used to stage/publish a pre-provisioned volume
+      // on an agent host. The fields are merged from `NodeStageVolumeRequest`
+      // and `NodePublishVolumeRequest` protobuf messages defined in CSI spec
+      // except two fields `staging_target_path` and `target_path` which will be
+      // internally determined by Mesos when staging/publishing the volume.
+      message StaticProvisioning {
+        required string volume_id = 1;
+        required VolumeCapability volume_capability = 2;
+        optional bool readonly = 3;
+
+        // The secrets needed for staging/publishing the volume, e.g.:
+        // {
+        //   "username": {"type": REFERENCE, "reference": {"name": "U_SECRET"}},
+        //   "password": {"type": REFERENCE, "reference": {"name": "P_SECRET"}}
+        // }
+        map<string, Secret> node_stage_secrets = 4;
+        map<string, Secret> node_publish_secrets = 5;
+        map<string, string> volume_context = 6;
+      }
+
+      optional StaticProvisioning static_provisioning = 2;
+    }
+
     // Enum fields should be optional, see: MESOS-4997.
     optional Type type = 1;
 
@@ -3085,6 +3224,8 @@ message Volume {
     // The volume/secret isolator uses the secret-fetcher module (third-party or
     // internal) downloads the secret and makes it available at container_path.
     optional Secret secret = 4;
+
+    optional CSIVolume csi_volume = 6;
   }
 
   optional Source source = 5;
@@ -3328,6 +3469,21 @@ message LinuxInfo {
   // note that we only support setting this field when the `ipc_mode` field is
   // set to `PRIVATE` otherwise the container launch will be rejected.
   optional uint32 shm_size = 7;
+
+  // If set as 'true', the container will share the cgroups from its parent
+  // container, otherwise it will have its own cgroups created. Please note:
+  // 1. For tasks in a task group launched via the LAUNCH_GROUP operation,
+  //    this field may be set to 'true' or 'false'. Resource limits may only be
+  //    set for tasks in a task group when this field is set to 'false'.
+  // 2. For tasks launched via the LAUNCH operation, this field may only be set
+  //    to 'true', and in this case resource limits may be set on these tasks.
+  // 3. For containers launched via the agent's LAUNCH_NESTED_CONTAINER_SESSION
+  //    call, this field must be set to 'true'.
+  // 4. For executor containers, this field may only be set to 'false'.
+  // 5. All tasks under a single executor must share the same value of this
+  //    field, if it is set. Note that this means that all tasks within a single
+  //    task group must set this field to the same value.
+  optional bool share_cgroups = 8 [default = true];
 }
 
 

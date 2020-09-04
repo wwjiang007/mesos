@@ -38,7 +38,7 @@
 
 #include "slave/constants.hpp"
 
-#include "slave/containerizer/mesos/linux_launcher.hpp"
+#include "slave/containerizer/mesos/paths.hpp"
 
 using std::list;
 using std::set;
@@ -94,7 +94,8 @@ collectContainerListeners(
 
   foreach (const ContainerID& containerId, containerIds) {
     // Reconstruct the cgroup path from the container ID.
-    string cgroup = LinuxLauncher::cgroup(cgroupsRoot, containerId);
+    string cgroup =
+      containerizer::paths::getCgroupPath(cgroupsRoot, containerId);
 
     VLOG(1) << "Checking processes for container " << containerId
             << " in cgroup " << cgroup;
@@ -543,7 +544,8 @@ Future<ContainerLimitation> NetworkPortsIsolatorProcess::watch(
 
 Future<Nothing> NetworkPortsIsolatorProcess::update(
     const ContainerID& containerId,
-    const Resources& resources)
+    const Resources& resourceRequests,
+    const google::protobuf::Map<string, Value::Scalar>& resourceLimits)
 {
   if (!infos.contains(containerId)) {
     LOG(INFO) << "Ignoring update for unknown container " << containerId;
@@ -557,7 +559,7 @@ Future<Nothing> NetworkPortsIsolatorProcess::update(
   // processes in the corresponding cgroup.
   if (containerId.has_parent()) {
     // Child containers don't get resources, only the parents do.
-    CHECK(resources.empty());
+    CHECK(resourceRequests.empty());
 
     // Verify that we know about the root for this container.
     CHECK(infos.contains(protobuf::getRootContainerId(containerId)));
@@ -565,7 +567,7 @@ Future<Nothing> NetworkPortsIsolatorProcess::update(
     return Nothing();
   }
 
-  Option<Value::Ranges> ports = resources.ports();
+  Option<Value::Ranges> ports = resourceRequests.ports();
   if (ports.isSome()) {
     const Owned<Info>& info = infos.at(containerId);
     info->allocatedPorts = rangesToIntervalSet<uint16_t>(ports.get()).get();

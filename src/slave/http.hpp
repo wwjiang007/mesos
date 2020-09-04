@@ -183,15 +183,19 @@ private:
       ContentType acceptType,
       const Option<process::http::authentication::Principal>& principal) const;
 
-  mesos::agent::Response::GetFrameworks _getFrameworks(
-      const process::Owned<ObjectApprovers>& approvers ) const;
+  std::function<void(JSON::ObjectWriter*)> jsonifyGetFrameworks(
+      const process::Owned<ObjectApprovers>& approvers) const;
+  std::string serializeGetFrameworks(
+      const process::Owned<ObjectApprovers>& approvers) const;
 
   process::Future<process::http::Response> getExecutors(
       const mesos::agent::Call& call,
       ContentType acceptType,
       const Option<process::http::authentication::Principal>& principal) const;
 
-  mesos::agent::Response::GetExecutors _getExecutors(
+  std::function<void(JSON::ObjectWriter*)> jsonifyGetExecutors(
+      const process::Owned<ObjectApprovers>& approvers) const;
+  std::string serializeGetExecutors(
       const process::Owned<ObjectApprovers>& approvers) const;
 
   process::Future<process::http::Response> getOperations(
@@ -204,7 +208,9 @@ private:
       ContentType acceptType,
       const Option<process::http::authentication::Principal>& principal) const;
 
-  mesos::agent::Response::GetTasks _getTasks(
+  std::function<void(JSON::ObjectWriter*)> jsonifyGetTasks(
+      const process::Owned<ObjectApprovers>& approvers) const;
+  std::string serializeGetTasks(
       const process::Owned<ObjectApprovers>& approvers) const;
 
   process::Future<process::http::Response> getAgent(
@@ -222,7 +228,9 @@ private:
       ContentType acceptType,
       const Option<process::http::authentication::Principal>& principal) const;
 
-  mesos::agent::Response::GetState _getState(
+  std::function<void(JSON::ObjectWriter*)> jsonifyGetState(
+      const process::Owned<ObjectApprovers>& approvers) const;
+  std::string serializeGetState(
       const process::Owned<ObjectApprovers>& approvers) const;
 
   process::Future<process::http::Response> launchNestedContainer(
@@ -245,7 +253,9 @@ private:
   process::Future<process::http::Response> _launchContainer(
       const ContainerID& containerId,
       const CommandInfo& commandInfo,
-      const Option<Resources>& resources,
+      const Option<Resources>& resourceRequests,
+      const Option<
+          google::protobuf::Map<std::string, Value::Scalar>>& resourceLimits,
       const Option<ContainerInfo>& containerInfo,
       const Option<mesos::slave::ContainerClass>& containerClass,
       ContentType acceptType,

@@ -2760,9 +2760,7 @@ void ProcessManager::handle(
   }
 
   if (use(receiver)) {
-    // The promise is created here but its ownership is passed
-    // into the HttpEvent created below.
-    Promise<Response>* promise(new Promise<Response>());
+    std::unique_ptr<Promise<Response>> promise(new Promise<Response>());
 
     PID<HttpProxy> proxy = socket_manager->proxy(socket);
 
@@ -2772,7 +2770,9 @@ void ProcessManager::handle(
 
     // TODO(benh): Use the sender PID in order to capture
     // happens-before timing relationships for testing.
-    deliver(receiver, new HttpEvent(request, promise));
+    deliver(
+        receiver,
+        new HttpEvent(std::unique_ptr<Request>(request), std::move(promise)));
 
     return;
   }
@@ -3842,7 +3842,11 @@ Future<Response> ProcessBase::_consume(
       Future<bool> authorization = true;
 
       if (authorization_callbacks.load() != nullptr) {
-        const string callback_path = path::join("/" + pid.id, name);
+        // Pass the "/" separator to avoid the windows "\" separator
+        // getting implicitly used on windows (we don't want that to
+        // happen for this http request path!)
+        const string callback_path =
+          path::join("/" + pid.id, name, os::POSIX_PATH_SEPARATOR);
 
         synchronized (authorization_callbacks_mutex) {
           AuthorizationCallbacks* callbacks = authorization_callbacks.load();

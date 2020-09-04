@@ -14,23 +14,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <mesos/csi/types.hpp>
+syntax = "proto3";
 
-#include <google/protobuf/util/message_differencer.h>
+package mesos.internal.slave;
 
-using google::protobuf::util::MessageDifferencer;
-
-namespace mesos {
-namespace csi {
-namespace types {
-
-bool operator==(const VolumeCapability& left, const VolumeCapability& right)
-{
-  // NOTE: `MessageDifferencer::Equivalent` would ignore unknown fields and load
-  // default values for unset fields (which are indistinguishable in proto3).
-  return MessageDifferencer::Equivalent(left, right);
+message CSIVolume {
+  string plugin_name = 1;
+  string id = 2;
 }
 
-} // namespace types {
-} // namespace csi {
-} // namespace mesos {
+
+message CSIVolumes {
+  repeated CSIVolume volumes = 1;
+}

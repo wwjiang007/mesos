@@ -535,6 +535,10 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
         secretGenerators->back(),
         nullptr,
         nullptr,
+        nullptr,
+#ifndef __WINDOWS__
+        None(),
+#endif // __WINDOWS__
         authorizer_); // Same authorizer as master.
 
     slaves[containerizer.get()] = slave;

@@ -14,27 +14,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef __MESOS_CSI_TYPES_HPP__
-#define __MESOS_CSI_TYPES_HPP__
+#include <mesos/type_utils.hpp>
 
-// ONLY USEFUL AFTER RUNNING PROTOC.
-#include <mesos/csi/types.pb.h>
+#include <stout/path.hpp>
+#include <stout/stringify.hpp>
+
+#include "slave/containerizer/mesos/isolators/volume/csi/paths.hpp"
+
+using std::string;
 
 namespace mesos {
+namespace internal {
+namespace slave {
 namespace csi {
-namespace types {
+namespace paths {
 
-bool operator==(const VolumeCapability& left, const VolumeCapability& right);
-
-
-inline bool operator!=(
-    const VolumeCapability& left, const VolumeCapability& right)
+string getContainerDir(const string& rootDir, const ContainerID& containerId)
 {
-  return !(left == right);
+  return path::join(rootDir, stringify(containerId));
 }
 
-} // namespace types {
-} // namespace csi {
-} // namespace mesos {
 
-#endif // __MESOS_CSI_TYPES_HPP__
+string getVolumesPath(const string& rootDir, const ContainerID& containerId)
+{
+  return path::join(getContainerDir(rootDir, containerId), "volumes");
+}
+
+} // namespace paths {
+} // namespace csi {
+} // namespace slave {
+} // namespace internal {
+} // namespace mesos {

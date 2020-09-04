@@ -22,6 +22,7 @@
 
 // ONLY USEFUL AFTER RUNNING PROTOC.
 #include <mesos/allocator/allocator.pb.h>
+#include <mesos/scheduler/scheduler.pb.h>
 
 #include <mesos/maintenance/maintenance.hpp>
 
@@ -65,6 +66,77 @@ struct Options
   size_t maxCompletedFrameworks = 0;
 
   bool publishPerFrameworkMetrics = true;
+};
+
+
+namespace internal {
+class OfferConstraintsFilterImpl;
+
+} // namespace internal {
+
+
+class OfferConstraintsFilter
+{
+public:
+  // TODO(asekretenko): Given that most dependants of the public allocator
+  // interface do not care about filter creation, we should consider decoupling
+  // the filter construction interface (which at this point consists of the
+  // `struct Options` and the `create()` method) from the allocator interface.
+  struct Options
+  {
+    struct RE2Limits
+    {
+      Bytes maxMem;
+      int maxProgramSize;
+    };
+
+    RE2Limits re2Limits;
+  };
+
+  static Try<OfferConstraintsFilter> create(
+      const Options& options,
+      scheduler::OfferConstraints&& constraints);
+
+  OfferConstraintsFilter() = delete;
+
+  // Definitions of these need `OfferConstraintsFilterImpl` to be a complete
+  // type.
+  OfferConstraintsFilter(OfferConstraintsFilter&&);
+  OfferConstraintsFilter& operator=(OfferConstraintsFilter&&);
+  ~OfferConstraintsFilter();
+
+  /**
+   * Returns `true` if the allocator is allowed to offer resoureces
+   * on the agent to the framework's role, and `false` otherwise.
+   */
+  bool isAgentExcluded(
+      const std::string& role,
+      const SlaveInfo& agentInfo) const;
+
+  // TODO(asekretenko): Add a method for filtering `Resources` on an agent.
+
+private:
+  std::unique_ptr<internal::OfferConstraintsFilterImpl> impl;
+
+  OfferConstraintsFilter(internal::OfferConstraintsFilterImpl&& impl_);
+};
+
+
+/**
+ * Per-framework allocator-specific options that are not part of
+ * `FrameworkInfo`.
+ */
+struct FrameworkOptions
+{
+  /**
+   * The set of roles for which the allocator should not generate offers.
+   */
+  std::set<std::string> suppressedRoles;
+
+  /**
+   * The internal representation of framework's offer constraints.
+   */
+  Option<OfferConstraintsFilter> offerConstraintsFilter;
 };
 
 
@@ -155,14 +227,14 @@ public:
    *
    * @param active Whether the framework is initially activated.
    *
-   * @param suppressedRoles List of suppressed roles for this framework.
+   * @param options Initial FrameworkOptions of this framework.
    */
   virtual void addFramework(
       const FrameworkID& frameworkId,
       const FrameworkInfo& frameworkInfo,
       const hashmap<SlaveID, Resources>& used,
       bool active,
-      const std::set<std::string>& suppressedRoles) = 0;
+      FrameworkOptions&& options) = 0;
 
   /**
    * Removes a framework from the Mesos cluster. It is up to an allocator to
@@ -187,19 +259,16 @@ public:
       const FrameworkID& frameworkId) = 0;
 
   /**
-   * Updates capabilities of a framework in the Mesos cluster.
+   * Updates FrameworkInfo and FrameworkOptions.
    *
-   * This will be invoked when a framework is re-added. As some of the
-   * framework's capabilities may be updated when re-added, this API should
-   * update the capabilities of the newly added framework to Mesos cluster to
-   * reflect the latest framework info. Please refer to the design document here
-   * https://cwiki.apache.org/confluence/display/MESOS/Design+doc:+Updating+Framework+Info // NOLINT
-   * for more details related to framework update.
+   * NOTE: Effective framework options can also be changed via other methods.
+   * For example, `suppress()` and `revive()` change the suppression state
+   * of framework's roles.
    */
   virtual void updateFramework(
       const FrameworkID& frameworkId,
       const FrameworkInfo& frameworkInfo,
-      const std::set<std::string>& suppressedRoles) = 0;
+      FrameworkOptions&& options) = 0;
 
   /**
    * Adds or re-adds an agent to the Mesos cluster. It is invoked when a
@@ -215,6 +284,11 @@ public:
    * @param used Resources that are allocated on the current agent. The
    *     allocator should avoid double accounting when yet unknown frameworks
    *     are added later in `addFramework()`.
+   *
+   * TODO(asekretenko): Ideally, to get rig of an intermediate allocator state
+   * when some resources are used by nonexistent frameworks, we should change
+   * the interface so that per-agent per-framework used resources and the
+   * not yet known frameworks that are using them are added atomically.
    */
   virtual void addSlave(
       const SlaveID& slaveId,

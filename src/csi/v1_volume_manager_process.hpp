@@ -24,7 +24,7 @@
 
 #include <mesos/mesos.hpp>
 
-#include <mesos/csi/types.hpp>
+#include <mesos/secret/resolver.hpp>
 
 #include <process/future.hpp>
 #include <process/grpc.hpp>
@@ -64,25 +64,26 @@ public:
       const hashset<Service> _services,
       const process::grpc::client::Runtime& _runtime,
       ServiceManager* _serviceManager,
-      Metrics* _metrics);
+      Metrics* _metrics,
+      SecretResolver* _secretResolver);
 
   process::Future<Nothing> recover();
 
   process::Future<std::vector<VolumeInfo>> listVolumes();
 
   process::Future<Bytes> getCapacity(
-      const types::VolumeCapability& capability,
+      const CSIVolume::VolumeCapability& capability,
       const google::protobuf::Map<std::string, std::string>& parameters);
 
   process::Future<VolumeInfo> createVolume(
       const std::string& name,
       const Bytes& capacity,
-      const types::VolumeCapability& capability,
+      const CSIVolume::VolumeCapability& capability,
       const google::protobuf::Map<std::string, std::string>& parameters);
 
   process::Future<Option<Error>> validateVolume(
       const VolumeInfo& volumeInfo,
-      const types::VolumeCapability& capability,
+      const CSIVolume::VolumeCapability& capability,
       const google::protobuf::Map<std::string, std::string>& parameters);
 
   process::Future<bool> deleteVolume(const std::string& volumeId);
@@ -91,7 +92,9 @@ public:
 
   process::Future<Nothing> detachVolume(const std::string& volumeId);
 
-  process::Future<Nothing> publishVolume(const std::string& volumeId);
+  process::Future<Nothing> publishVolume(
+      const std::string& volumeId,
+      const Option<state::VolumeState>& volumeState = None());
 
   process::Future<Nothing> unpublishVolume(const std::string& volumeId);
 
@@ -169,6 +172,17 @@ private:
 
   void garbageCollectMountPath(const std::string& volumeId);
 
+  // Removes the metadata associated with a particular volume both
+  // from memory and from disk.
+  void removeVolume(const std::string& volumeId);
+
+  // If the volume manager was initialized with a non-null secret resolver, this
+  // helper function will resolve any secrets in the provided map.
+  // Returns a map containing the resolved secrets.
+  process::Future<google::protobuf::Map<std::string, std::string>>
+    resolveSecrets(
+        const google::protobuf::Map<std::string, Secret>& secrets);
+
   const std::string rootDir;
   const CSIPluginInfo info;
   const hashset<Service> services;
@@ -176,6 +190,8 @@ private:
   process::grpc::client::Runtime runtime;
   ServiceManager* serviceManager;
   Metrics* metrics;
+  SecretResolver* secretResolver;
+  const std::string mountRootDir;
 
   Option<std::string> bootId;
   Option<PluginCapabilities> pluginCapabilities;

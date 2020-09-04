@@ -25,6 +25,10 @@
 
 #include <mesos/type_utils.hpp>
 
+#ifndef __WINDOWS__
+#include "common/domain_sockets.hpp"
+#endif // __WINDOWS__
+
 #include "common/http.hpp"
 #include "common/parse.hpp"
 #include "common/protobuf_utils.hpp"
@@ -109,6 +113,50 @@ mesos::internal::slave::Flags::Flags()
       "{\n"
       "  \"type\": \"org.mesos.apache.rp.local.storage\",\n"
       "  \"name\": \"lvm\"\n"
+      "}");
+
+  add(&Flags::csi_plugin_config_dir,
+      "csi_plugin_config_dir",
+      "Path to a directory that contains CSI plugin configs.\n"
+      "Each file in the config dir should contain a JSON object representing\n"
+      "a `CSIPluginInfo` object which can be either a managed CSI plugin\n"
+      "(i.e. the plugin launched by Mesos as a standalone container) or an\n"
+      "unmanaged CSI plugin (i.e. the plugin launched out of Mesos).\n"
+      "\n"
+      "Example config files in this directory:\n"
+      "{\n"
+      "  \"type\": \"org.apache.mesos.csi.managed-plugin\",\n"
+      "  \"containers\": [\n"
+      "    {\n"
+      "      \"services\": [\n"
+      "        \"CONTROLLER_SERVICE\",\n"
+      "        \"NODE_SERVICE\"\n"
+      "      ],\n"
+      "      \"command\": {\n"
+      "        \"shell\": false,\n"
+      "        \"value\": \"managed-plugin\",\n"
+      "        \"arguments\": [\n"
+      "          \"managed-plugin\",\n"
+      "          \"--endpoint=$(CSI_ENDPOINT)\"\n"
+      "        ]\n"
+      "      },\n"
+      "      \"resources\": [\n"
+      "        {\"name\": \"cpus\", \"type\": \"SCALAR\", \"scalar\": {\"value\": 0.1}},\n" // NOLINT(whitespace/line_length)
+      "        {\"name\": \"mem\", \"type\": \"SCALAR\", \"scalar\": {\"value\": 1024}}\n" // NOLINT(whitespace/line_length)
+      "      ]\n"
+      "    }\n"
+      "  ]\n"
+      "}\n"
+      "\n"
+      "{\n"
+      "  \"type\": \"org.apache.mesos.csi.unmanaged-plugin\",\n"
+      "  \"endpoints\": [\n"
+      "    {\n"
+      "      \"csi_service\": \"NODE_SERVICE\",\n"
+      "      \"endpoint\": \"/var/lib/unmanaged-plugin/csi.sock\"\n"
+      "    }\n"
+      "  ],\n"
+      "  \"target_path_root\": \"/mnt/unmanaged-plugin\"\n"
       "}");
 
   add(&Flags::disk_profile_adaptor,
@@ -808,7 +856,8 @@ mesos::internal::slave::Flags::Flags()
       "agent_features",
       "JSON representation of agent features to whitelist. We always require\n"
       "'MULTI_ROLE', 'HIERARCHICAL_ROLE', 'RESERVATION_REFINEMENT',\n"
-      "'AGENT_OPERATION_FEEDBACK', and 'AGENT_DRAINING'.\n"
+      "'AGENT_OPERATION_FEEDBACK', 'RESOURCE_PROVIDER', 'AGENT_DRAINING', and\n"
+      "'TASK_RESOURCE_LIMITS'.\n"
       "\n"
       "Example:\n"
       "{\n"
@@ -817,7 +866,9 @@ mesos::internal::slave::Flags::Flags()
       "        {\"type\": \"HIERARCHICAL_ROLE\"},\n"
       "        {\"type\": \"RESERVATION_REFINEMENT\"},\n"
       "        {\"type\": \"AGENT_OPERATION_FEEDBACK\"},\n"
-      "        {\"type\": \"AGENT_DRAINING\"}\n"
+      "        {\"type\": \"RESOURCE_PROVIDER\"},\n"
+      "        {\"type\": \"AGENT_DRAINING\"},\n"
+      "        {\"type\": \"TASK_RESOURCE_LIMITS\"}\n"
       "    ]\n"
       "}\n",
       [](const Option<SlaveCapabilities>& agentFeatures) -> Option<Error> {
@@ -830,23 +881,14 @@ mesos::internal::slave::Flags::Flags()
               !capabilities.hierarchicalRole ||
               !capabilities.reservationRefinement ||
               !capabilities.agentOperationFeedback ||
-              !capabilities.agentDraining) {
+              !capabilities.resourceProvider ||
+              !capabilities.agentDraining ||
+              !capabilities.taskResourceLimits) {
             return Error(
                 "At least the following agent features need to be enabled:"
                 " MULTI_ROLE, HIERARCHICAL_ROLE, RESERVATION_REFINEMENT,"
-                " AGENT_OPERATION_FEEDBACK, and AGENT_DRAINING");
-          }
-
-          if (capabilities.resizeVolume && !capabilities.resourceProvider) {
-            return Error(
-                "RESIZE_VOLUME feature requires RESOURCE_PROVIDER feature");
-          }
-
-          if (capabilities.agentOperationFeedback &&
-              !capabilities.resourceProvider) {
-            return Error(
-                "AGENT_OPERATION_FEEDBACK feature"
-                " requires RESOURCE_PROVIDER feature");
+                " AGENT_OPERATION_FEEDBACK, RESOURCE_PROVIDER, AGENT_DRAINING,"
+                " and TASK_RESOURCE_LIMITS");
           }
         }
 
@@ -983,6 +1025,27 @@ mesos::internal::slave::Flags::Flags()
       "C:\\mesos\\sandbox"
 #endif // __WINDOWS__
       );
+
+#ifndef __WINDOWS__
+  add(&Flags::domain_socket_location,
+      "domain_socket_location",
+      "Location on the host filesystem of the domain socket used for\n"
+      "communication with executors.\n Alternatively, this can be set to"
+      "'systemd:<identifier>' to use the domain socket with the given\n"
+      "identifier, which is expected to be passed by systemd.\n"
+      "This flag will be ignored unless the '--http_executor_domain_sockets'\n"
+      "flag is also set to true. Total path length must be less than 108\n"
+      "characters.\n Will be set to <runtime_dir>/agent.sock by default.",
+      [](const Option<string>& location) -> Option<Error> {
+        if (location.isSome() &&
+            location->size() >= common::DOMAIN_SOCKET_MAX_PATH_LENGTH) {
+          return Error(
+              "Domain socket location cannot be longer than 108 characters.");
+        }
+
+        return None();
+      });
+#endif // __WINDOWS__
 
   add(&Flags::default_container_dns,
       "default_container_dns",
@@ -1380,6 +1443,15 @@ mesos::internal::slave::Flags::Flags()
       "flag is only available when Mesos is built with SSL support.",
       false);
 #endif // USE_SSL_SOCKET
+
+#ifndef __WINDOWS__
+  add(&Flags::http_executor_domain_sockets,
+      "http_executor_domain_sockets",
+      "If true, the agent will provide a unix domain sockets that the\n"
+      "executor can use to connect to the agent, instead of relying on\n"
+      "a TCP connection.",
+      false);
+#endif // __WINDOWS__
 
   add(&Flags::http_credentials,
       "http_credentials",

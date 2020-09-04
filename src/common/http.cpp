@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include <map>
+#include <memory>
 #include <ostream>
 #include <set>
 #include <string>
@@ -63,6 +64,7 @@
 using std::map;
 using std::ostream;
 using std::set;
+using std::shared_ptr;
 using std::string;
 using std::vector;
 
@@ -631,6 +633,10 @@ JSON::Object model(const Task& task)
   object.values["state"] = TaskState_Name(task.state());
   object.values["resources"] = model(task.resources());
 
+  if (!task.limits().empty()) {
+    object.values["limits"] = model(task.limits());
+  }
+
   if (task.has_user()) {
     object.values["user"] = task.user();
   }
@@ -781,6 +787,18 @@ JSON::Object model(const FileInfo& fileInfo)
   file.values["gid"] = fileInfo.gid();
 
   return file;
+}
+
+
+JSON::Object model(const google::protobuf::Map<string, Value_Scalar>& map)
+{
+  JSON::Object result, scalar;
+
+  foreach (auto item, map) {
+    result.values[item.first] = item.second.value();
+  }
+
+  return result;
 }
 
 }  // namespace internal {
@@ -1080,6 +1098,17 @@ void json(
 }
 
 
+// Used to include resource limits in JSON output.
+void json(
+    JSON::ObjectWriter* writer,
+    const google::protobuf::Map<string, Value_Scalar>& map)
+{
+  foreach (auto item, map) {
+    writer->field(item.first, item.second.value());
+  }
+}
+
+
 void json(JSON::ObjectWriter* writer, const Task& task)
 {
   writer->field("id", task.task_id().value());
@@ -1089,6 +1118,10 @@ void json(JSON::ObjectWriter* writer, const Task& task)
   writer->field("slave_id", task.slave_id().value());
   writer->field("state", TaskState_Name(task.state()));
   writer->field("resources", task.resources());
+
+  if (!task.limits().empty()) {
+    writer->field("limits", task.limits());
+  }
 
   // Tasks are not allowed to mix resources allocated to
   // different roles, see MESOS-6636.
@@ -1182,12 +1215,10 @@ Future<Owned<ObjectApprovers>> ObjectApprovers::create(
     authorization::createSubject(principal);
 
   if (authorizer.isNone()) {
-    hashmap<authorization::Action, Owned<ObjectApprover>> approvers;
+    hashmap<authorization::Action, shared_ptr<const ObjectApprover>> approvers;
 
     foreach (authorization::Action action, _actions) {
-      approvers.put(
-          action,
-          Owned<ObjectApprover>(new AcceptingObjectApprover()));
+      approvers.put(action, std::make_shared<AcceptingObjectApprover>());
     }
 
     return Owned<ObjectApprovers>(
@@ -1195,11 +1226,11 @@ Future<Owned<ObjectApprovers>> ObjectApprovers::create(
   }
 
   return process::collect(lambda::map<vector>(
-      [&](authorization::Action action) -> Future<Owned<ObjectApprover>> {
-        return authorizer.get()->getObjectApprover(subject, action);
+      [&](authorization::Action action) {
+        return authorizer.get()->getApprover(subject, action);
       },
       _actions))
-    .then([=](const vector<Owned<ObjectApprover>>& _approvers) {
+    .then([=](const vector<shared_ptr<const ObjectApprover>>& _approvers) {
       return Owned<ObjectApprovers>(
           new ObjectApprovers(lambda::zip(_actions, _approvers), principal));
     });

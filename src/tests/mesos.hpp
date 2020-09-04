@@ -19,6 +19,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -82,6 +83,7 @@
 #include "resource_provider/detector.hpp"
 
 #include "slave/constants.hpp"
+#include "slave/csi_server.hpp"
 #include "slave/slave.hpp"
 
 #include "slave/containerizer/containerizer.hpp"
@@ -193,6 +195,12 @@ struct SlaveOptions
     return *this;
   }
 
+  SlaveOptions& withCsiServer(const process::Owned<slave::CSIServer>& csiServer)
+  {
+    this->csiServer = csiServer;
+    return *this;
+  }
+
   mesos::master::detector::MasterDetector* detector;
   bool mock;
   Option<slave::Flags> flags;
@@ -205,6 +213,7 @@ struct SlaveOptions
   Option<mesos::SecretGenerator*> secretGenerator;
   Option<Authorizer*> authorizer;
   Option<PendingFutureTracker*> futureTracker;
+  Option<process::Owned<slave::CSIServer>> csiServer;
 };
 
 
@@ -844,6 +853,66 @@ inline TVolume createVolumeFromDockerImage(
 }
 
 
+template <typename TVolume>
+inline TVolume createVolumeCsi(
+    const std::string& pluginName,
+    const std::string volumeId,
+    const std::string& containerPath,
+    const typename TVolume::Source::CSIVolume::VolumeCapability
+      ::AccessMode::Mode mode,
+    bool readonly)
+{
+  TVolume volume;
+  volume.set_container_path(containerPath);
+
+  typename TVolume::Source* source = volume.mutable_source();
+  source->set_type(TVolume::Source::CSI_VOLUME);
+  source->mutable_csi_volume()->set_plugin_name(pluginName);
+
+  typename TVolume::Source::CSIVolume::StaticProvisioning* staticInfo =
+    source->mutable_csi_volume()->mutable_static_provisioning();
+
+  staticInfo->set_volume_id(volumeId);
+  staticInfo->set_readonly(readonly);
+  staticInfo->mutable_volume_capability()->mutable_mount();
+  staticInfo->mutable_volume_capability()
+    ->mutable_access_mode()->set_mode(mode);
+
+  typedef typename TVolume::Source::CSIVolume::VolumeCapability::AccessMode
+    CSIAccessMode;
+
+  // Set the top-level `mode` field of the volume based on the values of the
+  // CSI access mode and the `readonly` field.
+  typename TVolume::Mode mesosMode;
+
+  switch (mode) {
+    case CSIAccessMode::SINGLE_NODE_WRITER:
+    case CSIAccessMode::MULTI_NODE_SINGLE_WRITER:
+    case CSIAccessMode::MULTI_NODE_MULTI_WRITER: {
+      if (readonly) {
+        mesosMode = TVolume::RO;
+      } else {
+        mesosMode = TVolume::RW;
+      }
+
+      break;
+    }
+
+    case CSIAccessMode::SINGLE_NODE_READER_ONLY:
+    case CSIAccessMode::MULTI_NODE_READER_ONLY:
+    default: {
+      mesosMode = TVolume::RO;
+
+      break;
+    }
+  }
+
+  volume.set_mode(mesosMode);
+
+  return volume;
+}
+
+
 template <typename TNetworkInfo>
 inline TNetworkInfo createNetworkInfo(
     const std::string& networkName)
@@ -910,20 +979,25 @@ template <
     typename TResources,
     typename TExecutorInfo,
     typename TCommandInfo,
-    typename TOffer>
+    typename TOffer,
+    typename TScalar>
 inline TTaskInfo createTask(
     const TSlaveID& slaveId,
-    const TResources& resources,
+    const TResources& resourceRequests,
     const TCommandInfo& command,
     const Option<TExecutorID>& executorId = None(),
     const std::string& name = "test-task",
-    const std::string& id = id::UUID::random().toString())
+    const std::string& id = id::UUID::random().toString(),
+    const google::protobuf::Map<std::string, TScalar>& resourceLimits = {})
 {
   TTaskInfo task;
   task.set_name(name);
   task.mutable_task_id()->set_value(id);
   setAgentID(&task, slaveId);
-  task.mutable_resources()->CopyFrom(resources);
+  task.mutable_resources()->CopyFrom(resourceRequests);
+  if (!resourceLimits.empty()) {
+    *task.mutable_limits() = resourceLimits;
+  }
   if (executorId.isSome()) {
     TExecutorInfo executor;
     executor.mutable_executor_id()->CopyFrom(executorId.get());
@@ -944,14 +1018,16 @@ template <
     typename TResources,
     typename TExecutorInfo,
     typename TCommandInfo,
-    typename TOffer>
+    typename TOffer,
+    typename TScalar>
 inline TTaskInfo createTask(
     const TSlaveID& slaveId,
-    const TResources& resources,
+    const TResources& resourceRequests,
     const std::string& command,
     const Option<TExecutorID>& executorId = None(),
     const std::string& name = "test-task",
-    const std::string& id = id::UUID::random().toString())
+    const std::string& id = id::UUID::random().toString(),
+    const google::protobuf::Map<std::string, TScalar>& resourceLimits = {})
 {
   return createTask<
       TTaskInfo,
@@ -960,13 +1036,15 @@ inline TTaskInfo createTask(
       TResources,
       TExecutorInfo,
       TCommandInfo,
-      TOffer>(
+      TOffer,
+      TScalar>(
           slaveId,
-          resources,
+          resourceRequests,
           createCommandInfo<TCommandInfo>(command),
           executorId,
           name,
-          id);
+          id,
+          resourceLimits);
 }
 
 
@@ -977,13 +1055,15 @@ template <
     typename TResources,
     typename TExecutorInfo,
     typename TCommandInfo,
-    typename TOffer>
+    typename TOffer,
+    typename TScalar>
 inline TTaskInfo createTask(
     const TOffer& offer,
     const std::string& command,
     const Option<TExecutorID>& executorId = None(),
     const std::string& name = "test-task",
-    const std::string& id = id::UUID::random().toString())
+    const std::string& id = id::UUID::random().toString(),
+    const google::protobuf::Map<std::string, TScalar>& resourceLimits = {})
 {
   return createTask<
       TTaskInfo,
@@ -992,13 +1072,15 @@ inline TTaskInfo createTask(
       TResources,
       TExecutorInfo,
       TCommandInfo,
-      TOffer>(
+      TOffer,
+      TScalar>(
           getAgentID(offer),
           offer.resources(),
           command,
           executorId,
           name,
-          id);
+          id,
+          resourceLimits);
 }
 
 
@@ -1723,6 +1805,14 @@ inline Volume createVolumeFromDockerImage(Args&&... args)
 
 
 template <typename... Args>
+inline Volume createVolumeCsi(Args&&... args)
+{
+  return common::createVolumeCsi<Volume>(
+      std::forward<Args>(args)...);
+}
+
+
+template <typename... Args>
 inline NetworkInfo createNetworkInfo(Args&&... args)
 {
   return common::createNetworkInfo<NetworkInfo>(std::forward<Args>(args)...);
@@ -1750,7 +1840,8 @@ inline TaskInfo createTask(Args&&... args)
       Resources,
       ExecutorInfo,
       CommandInfo,
-      Offer>(std::forward<Args>(args)...);
+      Offer,
+      Value::Scalar>(std::forward<Args>(args)...);
 }
 
 
@@ -2012,6 +2103,14 @@ inline mesos::v1::Volume createVolumeFromDockerImage(Args&&... args)
 
 
 template <typename... Args>
+inline mesos::v1::Volume createVolumeCsi(Args&&... args)
+{
+  return common::createVolumeCsi<mesos::v1::Volume>(
+      std::forward<Args>(args)...);
+}
+
+
+template <typename... Args>
 inline mesos::v1::NetworkInfo createNetworkInfo(Args&&... args)
 {
   return common::createNetworkInfo<mesos::v1::NetworkInfo>(
@@ -2040,7 +2139,8 @@ inline mesos::v1::TaskInfo createTask(Args&&... args)
       mesos::v1::Resources,
       mesos::v1::ExecutorInfo,
       mesos::v1::CommandInfo,
-      mesos::v1::Offer>(std::forward<Args>(args)...);
+      mesos::v1::Offer,
+      mesos::v1::Value::Scalar>(std::forward<Args>(args)...);
 }
 
 
@@ -3553,7 +3653,8 @@ public:
       authorized, process::Future<bool>(const authorization::Request& request));
 
   MOCK_METHOD2(
-      getObjectApprover, process::Future<process::Owned<ObjectApprover>>(
+      getApprover,
+      process::Future<std::shared_ptr<const ObjectApprover>>(
           const Option<authorization::Subject>& subject,
           const authorization::Action& action));
 };

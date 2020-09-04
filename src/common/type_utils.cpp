@@ -26,10 +26,14 @@
 #include <stout/protobuf.hpp>
 
 #include "messages/messages.hpp"
+#include "common/type_utils_differencers.hpp"
 
 using std::ostream;
 using std::string;
 using std::vector;
+using std::unique_ptr;
+
+using ::mesos::typeutils::internal::createFrameworkInfoDifferencer;
 
 namespace mesos {
 
@@ -192,6 +196,16 @@ bool operator==(const Volume& left, const Volume& right)
   return left.container_path() == right.container_path() &&
     left.host_path() == right.host_path() &&
     left.mode() == right.mode();
+}
+
+
+bool operator==(
+    const Volume::Source::CSIVolume::VolumeCapability& left,
+    const Volume::Source::CSIVolume::VolumeCapability& right)
+{
+  // NOTE: `MessageDifferencer::Equivalent` would ignore unknown fields and load
+  // default values for unset fields (which are indistinguishable in proto3).
+  return google::protobuf::util::MessageDifferencer::Equivalent(left, right);
 }
 
 
@@ -648,6 +662,14 @@ bool operator!=(const TaskStatus& left, const TaskStatus& right)
 }
 
 
+bool operator!=(
+    const Volume::Source::CSIVolume::VolumeCapability& left,
+    const Volume::Source::CSIVolume::VolumeCapability& right)
+{
+  return !(left == right);
+}
+
+
 bool operator==(const CheckStatusInfo& left, const CheckStatusInfo& right)
 {
   return left.SerializeAsString() == right.SerializeAsString();
@@ -658,6 +680,31 @@ bool operator!=(const CheckStatusInfo& left, const CheckStatusInfo& right)
 {
   return !(left == right);
 }
+
+
+namespace typeutils {
+
+bool equivalent(const FrameworkInfo& left, const FrameworkInfo& right)
+{
+  return createFrameworkInfoDifferencer<FrameworkInfo>()->Compare(left, right);
+}
+
+
+Option<string> diff(const FrameworkInfo& left, const FrameworkInfo& right)
+{
+  unique_ptr<::google::protobuf::util::MessageDifferencer> differencer{
+    createFrameworkInfoDifferencer<FrameworkInfo>()};
+
+  string result;
+  differencer->ReportDifferencesToString(&result);
+  if (differencer->Compare(left, right)) {
+    return None();
+  }
+
+  return result;
+}
+
+} // namespace typeutils {
 
 
 ostream& operator<<(ostream& stream, const CapabilityInfo& capabilityInfo)

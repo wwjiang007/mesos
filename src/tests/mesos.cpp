@@ -348,6 +348,7 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(const SlaveOptions& options)
       options.secretGenerator,
       options.authorizer,
       options.futureTracker,
+      options.csiServer,
       options.mock);
 
   if (slave.isSome() && !options.mock) {
@@ -543,9 +544,8 @@ MockAuthorizer::MockAuthorizer()
   EXPECT_CALL(*this, authorized(_))
     .WillRepeatedly(Return(true));
 
-  EXPECT_CALL(*this, getObjectApprover(_, _))
-    .WillRepeatedly(Return(Owned<ObjectApprover>(
-        new AcceptingObjectApprover())));
+  EXPECT_CALL(*this, getApprover(_, _))
+    .WillRepeatedly(Return(std::make_shared<AcceptingObjectApprover>()));
 }
 
 

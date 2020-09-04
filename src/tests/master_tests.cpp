@@ -199,7 +199,7 @@ TEST_F(MasterTest, TaskRunning)
 
   Future<Nothing> update;
   EXPECT_CALL(containerizer,
-              update(_, Resources(offers.get()[0].resources())))
+              update(_, Resources(offers.get()[0].resources()), _))
     .WillOnce(DoAll(FutureSatisfy(&update),
                     Return(Nothing())));
 
@@ -274,7 +274,7 @@ TEST_F(MasterTest, ShutdownFrameworkWhileTaskRunning)
 
   Future<Nothing> update;
   EXPECT_CALL(containerizer,
-              update(_, Resources(offer.resources())))
+              update(_, Resources(offer.resources()), _))
     .WillOnce(DoAll(FutureSatisfy(&update),
                     Return(Nothing())));
 
@@ -4330,7 +4330,15 @@ TEST_F(MasterTest, TasksEndpoint)
   TestContainerizer containerizer(&exec);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
+
+  // We must enable the CPU and memory isolators on the agent so that it can
+  // accept resource limits.
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "cgroups/cpu,cgroups/mem";
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &containerizer, flags);
+
   ASSERT_SOME(slave);
 
   MockScheduler sched;
@@ -4357,6 +4365,8 @@ TEST_F(MasterTest, TasksEndpoint)
   task1.mutable_slave_id()->MergeFrom(offer->slave_id());
   task1.mutable_resources()->MergeFrom(
       Resources::parse("cpus:0.1;mem:12").get());
+  (*task1.mutable_limits())["cpus"].set_value(0.5);
+  (*task1.mutable_limits())["mem"].set_value(64);
   task1.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
 
   TaskInfo task2;
@@ -4418,7 +4428,11 @@ TEST_F(MasterTest, TasksEndpoint)
                 "\"framework_id\":\"" + frameworkId->value() + "\","
                 "\"id\":\"1\","
                 "\"name\":\"test1\","
-                "\"state\":\"TASK_RUNNING\""
+                "\"state\":\"TASK_RUNNING\","
+                "\"limits\":{"
+                "  \"cpus\":0.5,"
+                "  \"mem\":64"
+                "}"
               "},{"
                 "\"executor_id\":\"default\","
                 "\"framework_id\":\"" + frameworkId->value() + "\","
@@ -4442,7 +4456,11 @@ TEST_F(MasterTest, TasksEndpoint)
                 "\"framework_id\":\"" + frameworkId->value() + "\","
                 "\"id\":\"1\","
                 "\"name\":\"test1\","
-                "\"state\":\"TASK_RUNNING\""
+                "\"state\":\"TASK_RUNNING\","
+                "\"limits\":{"
+                "  \"cpus\":0.5,"
+                "  \"mem\":64"
+                "}"
             "}]"
         "}");
 
@@ -5319,7 +5337,8 @@ TEST_F(MasterTest, StateEndpointAgentCapabilities)
         "RESOURCE_PROVIDER",
         "RESIZE_VOLUME",
         "AGENT_OPERATION_FEEDBACK",
-        "AGENT_DRAINING"
+        "AGENT_DRAINING",
+        "TASK_RESOURCE_LIMITS"
       ]
     )~");
 
@@ -5719,7 +5738,7 @@ TEST_F(MasterTest, TaskLabels)
 
   Future<Nothing> update;
   EXPECT_CALL(containerizer,
-              update(_, Resources(offers.get()[0].resources())))
+              update(_, Resources(offers.get()[0].resources()), _))
     .WillOnce(DoAll(FutureSatisfy(&update),
                     Return(Nothing())));
 
@@ -6145,7 +6164,7 @@ TEST_F(MasterTest, TaskDiscoveryInfo)
 
   Future<Nothing> update;
   EXPECT_CALL(containerizer,
-              update(_, Resources(offers.get()[0].resources())))
+              update(_, Resources(offers.get()[0].resources()), _))
     .WillOnce(DoAll(FutureSatisfy(&update),
                     Return(Nothing())));
 
@@ -10177,7 +10196,7 @@ TEST_P(MasterTestPrePostReservationRefinement, LaunchTask)
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
 
   Future<Nothing> update;
-  EXPECT_CALL(containerizer, update(_, inboundResources(offer.resources())))
+  EXPECT_CALL(containerizer, update(_, inboundResources(offer.resources()), _))
     .WillOnce(DoAll(FutureSatisfy(&update), Return(Nothing())));
 
   Future<TaskStatus> status;
@@ -10572,109 +10591,6 @@ TEST_P(MasterTestPrePostReservationRefinement,
 }
 
 
-// This test verifies that hitting the `/state` endpoint before '_accept()'
-// is called results in pending tasks being reported correctly.
-TEST_P(MasterTestPrePostReservationRefinement, StateEndpointPendingTasks)
-{
-  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
-  frameworkInfo.set_roles(0, DEFAULT_TEST_ROLE);
-
-  // TODO(mpark): Remove this once `RESERVATION_REFINEMENT`
-  // is removed from `DEFAULT_FRAMEWORK_INFO`.
-  frameworkInfo.clear_capabilities();
-  frameworkInfo.add_capabilities()->set_type(
-      FrameworkInfo::Capability::MULTI_ROLE);
-
-  if (GetParam()) {
-    frameworkInfo.add_capabilities()->set_type(
-        FrameworkInfo::Capability::RESERVATION_REFINEMENT);
-  }
-
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
-  ASSERT_SOME(slave);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  EXPECT_CALL(sched, registered(&driver, _, _));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->empty());
-
-  Offer offer = offers->front();
-
-  TaskInfo task;
-  task.set_name("");
-  task.mutable_task_id()->set_value("1");
-  task.mutable_slave_id()->MergeFrom(offer.slave_id());
-  task.mutable_resources()->MergeFrom(offer.resources());
-  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
-
-  // Return a pending future from authorizer.
-  Future<Nothing> authorize;
-  Promise<bool> promise;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())));
-
-  driver.launchTasks(offer.id(), {task});
-
-  // Wait until authorization is in progress.
-  AWAIT_READY(authorize);
-
-  Future<Response> response = process::http::get(
-      master.get()->pid,
-      "state",
-      None(),
-      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
-
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
-
-  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
-  ASSERT_SOME(parse);
-
-  JSON::Value result = parse.get();
-
-  JSON::Object expected = {
-    {
-      "frameworks",
-      JSON::Array {
-        JSON::Object {
-          {
-            "tasks",
-            JSON::Array {
-              JSON::Object {
-                { "id", "1" },
-                { "role", frameworkInfo.roles(0) },
-                { "state", "TASK_STAGING" }
-              }
-            }
-          }
-        }
-      }
-    }
-  };
-
-  EXPECT_TRUE(result.contains(expected));
-
-  driver.stop();
-  driver.join();
-}
-
-
 // This test verifies that an operator can reserve and unreserve
 // resources through the master operator API in both
 // "(pre|post)-reservation-refinement" formats.
@@ -10997,7 +10913,7 @@ TEST_F(MasterTest, LostTaskCleanup) {
   EXPECT_CALL(exec, launchTask(_, _))
     .WillRepeatedly(SendStatusUpdateFromTask(TASK_RUNNING));
 
-  EXPECT_CALL(containerizer, update(_, _))
+  EXPECT_CALL(containerizer, update(_, _, _))
     .WillRepeatedly(Return(Nothing()));
 
   Promise<Option<ContainerTermination>> hang;

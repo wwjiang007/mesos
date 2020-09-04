@@ -420,7 +420,7 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
     // a dependency on that isolator, and it assumes that if the
     // container specifies a rootfs the sandbox is already bind
     // mounted into the container.
-    if (path::absolute(_volume.container_path())) {
+    if (path::is_absolute(_volume.container_path())) {
       // To specify a docker volume for a container, operators should
       // be allowed to define the 'container_path' either as an absolute
       // path or a relative path. Please see linux filesystem isolator
@@ -658,6 +658,13 @@ Future<Nothing> DockerVolumeIsolatorProcess::cleanup(
     futures.push_back(this->unmount(volume.driver(), volume.name()));
   }
 
+  // Erase the `Info` struct of this container before unmounting the volumes.
+  // This is to ensure the reference count of the volume will not be wrongly
+  // increased if unmounting volumes fail, otherwise next time when another
+  // container using the same volume is destroyed, we would NOT unmount the
+  // volume since its reference count would be larger than 1.
+  infos.erase(containerId);
+
   return await(futures)
     .then(defer(
         PID<DockerVolumeIsolatorProcess>(this),
@@ -671,8 +678,6 @@ Future<Nothing> DockerVolumeIsolatorProcess::_cleanup(
     const ContainerID& containerId,
     const vector<Future<Nothing>>& futures)
 {
-  CHECK(infos.contains(containerId));
-
   vector<string> messages;
   foreach (const Future<Nothing>& future, futures) {
     if (!future.isReady()) {
@@ -696,9 +701,6 @@ Future<Nothing> DockerVolumeIsolatorProcess::_cleanup(
 
   LOG(INFO) << "Removed the checkpoint directory at '" << containerDir
             << "' for container " << containerId;
-
-  // Remove all this container's docker volume information from infos.
-  infos.erase(containerId);
 
   return Nothing();
 }

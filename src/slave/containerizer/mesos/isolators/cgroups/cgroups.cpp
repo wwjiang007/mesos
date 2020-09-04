@@ -44,6 +44,7 @@
 
 using mesos::internal::protobuf::slave::containerSymlinkOperation;
 
+using mesos::slave::ContainerClass;
 using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLaunchInfo;
 using mesos::slave::ContainerLimitation;
@@ -205,10 +206,17 @@ Future<Nothing> CgroupsIsolatorProcess::recover(
   // Recover active containers first.
   vector<Future<Nothing>> recovers;
   foreach (const ContainerState& state, states) {
-    // If we are a nested container, we do not need to recover
-    // anything since only top-level containers will have cgroups
+    // If we are a nested container with shared cgroups, we do not
+    // need to recover anything since its ancestor will have cgroups
     // created for them.
-    if (state.container_id().has_parent()) {
+    const bool shareCgroups =
+      (state.has_container_info() &&
+       state.container_info().has_linux_info() &&
+       state.container_info().linux_info().has_share_cgroups())
+        ? state.container_info().linux_info().share_cgroups()
+        : true;
+
+    if (state.container_id().has_parent() && shareCgroups) {
       continue;
     }
 
@@ -247,7 +255,6 @@ Future<Nothing> CgroupsIsolatorProcess::_recover(
   hashset<ContainerID> unknownOrphans;
 
   foreach (const string& hierarchy, subsystems.keys()) {
-    // TODO(jieyu): Use non-recursive version of `cgroups::get`.
     Try<vector<string>> cgroups = cgroups::get(
         hierarchy,
         flags.cgroups_root);
@@ -266,18 +273,28 @@ Future<Nothing> CgroupsIsolatorProcess::_recover(
         continue;
       }
 
-      ContainerID containerId;
-      containerId.set_value(Path(cgroup).basename());
+      // Need to parse the cgroup to see if it's one we created (i.e.,
+      // matches our separator structure) or one that someone else
+      // created (e.g., in the future we might have nested containers
+      // that are managed by something else rooted within the cgroup
+      // hierarchy).
+      Option<ContainerID> containerId =
+        containerizer::paths::parseCgroupPath(flags.cgroups_root, cgroup);
 
-      // Skip containerId which already have been recovered.
-      if (infos.contains(containerId)) {
+      if (containerId.isNone()) {
+        LOG(INFO) << "Not recovering cgroup " << cgroup;
         continue;
       }
 
-      if (orphans.contains(containerId)) {
-        knownOrphans.insert(containerId);
+      // Skip containerId which already have been recovered.
+      if (infos.contains(containerId.get())) {
+        continue;
+      }
+
+      if (orphans.contains(containerId.get())) {
+        knownOrphans.insert(containerId.get());
       } else {
-        unknownOrphans.insert(containerId);
+        unknownOrphans.insert(containerId.get());
       }
     }
   }
@@ -334,7 +351,8 @@ Future<Nothing> CgroupsIsolatorProcess::__recover(
 Future<Nothing> CgroupsIsolatorProcess::___recover(
     const ContainerID& containerId)
 {
-  const string cgroup = path::join(flags.cgroups_root, containerId.value());
+  const string cgroup =
+    containerizer::paths::getCgroupPath(flags.cgroups_root, containerId);
 
   vector<Future<Nothing>> recovers;
   hashset<string> recoveredSubsystems;
@@ -396,7 +414,7 @@ Future<Nothing> CgroupsIsolatorProcess::____recover(
 
   infos[containerId] = Owned<Info>(new Info(
       containerId,
-      path::join(flags.cgroups_root, containerId.value())));
+      containerizer::paths::getCgroupPath(flags.cgroups_root, containerId)));
 
   infos[containerId]->subsystems = recoveredSubsystems;
 
@@ -408,10 +426,18 @@ Future<Option<ContainerLaunchInfo>> CgroupsIsolatorProcess::prepare(
     const ContainerID& containerId,
     const ContainerConfig& containerConfig)
 {
-  // Only prepare cgroups for top-level containers. Nested container
-  // will inherit cgroups from its root container, so here we just
+  // If the nested container shares cgroups with its parent container,
+  // we don't need to prepare cgroups. In this case, the nested container
+  // will inherit cgroups from its ancestor, so here we just
   // need to do the container-specific cgroups mounts.
-  if (containerId.has_parent()) {
+  const bool shareCgroups =
+    (containerConfig.has_container_info() &&
+     containerConfig.container_info().has_linux_info() &&
+     containerConfig.container_info().linux_info().has_share_cgroups())
+      ? containerConfig.container_info().linux_info().share_cgroups()
+      : true;
+
+  if (containerId.has_parent() && shareCgroups) {
     return __prepare(containerId, containerConfig);
   }
 
@@ -419,11 +445,16 @@ Future<Option<ContainerLaunchInfo>> CgroupsIsolatorProcess::prepare(
     return Failure("Container has already been prepared");
   }
 
+  CHECK(containerConfig.container_class() != ContainerClass::DEBUG);
+
+  CHECK(!containerId.has_parent() || !containerId.parent().has_parent())
+    << "2nd level or greater nested cgroups are not supported";
+
   // We save 'Info' into 'infos' first so that even if 'prepare'
   // fails, we can properly cleanup the *side effects* created below.
   infos[containerId] = Owned<Info>(new Info(
       containerId,
-      path::join(flags.cgroups_root, containerId.value())));
+      containerizer::paths::getCgroupPath(flags.cgroups_root, containerId)));
 
   vector<Future<Nothing>> prepares;
 
@@ -453,10 +484,12 @@ Future<Option<ContainerLaunchInfo>> CgroupsIsolatorProcess::prepare(
       infos[containerId]->subsystems.insert(subsystem->name());
       prepares.push_back(subsystem->prepare(
           containerId,
-          infos[containerId]->cgroup));
+          infos[containerId]->cgroup,
+          containerConfig));
     }
 
-    // Chown the cgroup so the executor can create nested cgroups. Do
+    // Chown the cgroup so the executor or a nested container whose
+    // `share_cgroups` is false can create nested cgroups. Do
     // not recurse so the control files are still owned by the slave
     // user and thus cannot be changed by the executor.
     //
@@ -534,7 +567,10 @@ Future<Option<ContainerLaunchInfo>> CgroupsIsolatorProcess::_prepare(
         strings::join(";", errors));
   }
 
-  return update(containerId, containerConfig.resources())
+  return update(
+      containerId,
+      containerConfig.resources(),
+      containerConfig.limits())
     .then(defer(
         PID<CgroupsIsolatorProcess>(this),
         &CgroupsIsolatorProcess::__prepare,
@@ -552,10 +588,6 @@ Future<Option<ContainerLaunchInfo>> CgroupsIsolatorProcess::__prepare(
   if (!containerConfig.has_rootfs()) {
     return None();
   }
-
-  const ContainerID rootContainerId = protobuf::getRootContainerId(containerId);
-
-  CHECK(infos.contains(rootContainerId));
 
   ContainerLaunchInfo launchInfo;
   launchInfo.add_clone_namespaces(CLONE_NEWNS);
@@ -580,9 +612,16 @@ Future<Option<ContainerLaunchInfo>> CgroupsIsolatorProcess::__prepare(
   // For the subsystem loaded by this isolator, do the container-specific
   // cgroups mount, e.g.:
   //   mount --bind /sys/fs/cgroup/memory/mesos/<containerId> /sys/fs/cgroup/memory // NOLINT(whitespace/line_length)
+  Owned<Info> info = findCgroupInfo(containerId);
+  if (!info.get()) {
+    return Failure(
+        "Failed to find cgroup for container " +
+        stringify(containerId));
+  }
+
   foreach (const string& hierarchy, subsystems.keys()) {
     *launchInfo.add_mounts() = protobuf::slave::createContainerMount(
-        path::join(hierarchy, infos[rootContainerId]->cgroup),
+        path::join(hierarchy, info->cgroup),
         path::join(
             containerConfig.rootfs(),
             "/sys/fs/cgroup",
@@ -664,13 +703,10 @@ Future<Nothing> CgroupsIsolatorProcess::isolate(
     pid_t pid)
 {
   // We currently can't call `subsystem->isolate()` on nested
-  // containers, because we don't call `prepare()`, `recover()`, or
-  // `cleanup()` on them either. If we were to call `isolate()` on
-  // them, the call would likely fail because the subsystem doesn't
-  // know about the container. This is currently OK because the only
-  // cgroup isolator that even implements `isolate()` is the
-  // `NetClsSubsystem` and it doesn't do anything with the `pid`
-  // passed in.
+  // containers with shared cgroups, because we don't call `prepare()`,
+  // `recover()`, or `cleanup()` on them either. If we were to call
+  // `isolate()` on them, the call would likely fail because the subsystem
+  // doesn't know about the container.
   //
   // TODO(klueska): In the future we should revisit this to make
   // sure that doing things this way is sufficient (or otherwise
@@ -678,7 +714,7 @@ Future<Nothing> CgroupsIsolatorProcess::isolate(
 
   vector<Future<Nothing>> isolates;
 
-  if (!containerId.has_parent()) {
+  if (infos.contains(containerId)) {
     foreachvalue (const Owned<Subsystem>& subsystem, subsystems) {
       isolates.push_back(subsystem->isolate(
           containerId,
@@ -722,14 +758,16 @@ Future<Nothing> CgroupsIsolatorProcess::_isolate(
         strings::join(";", errors));
   }
 
-  // If we are a nested container, we inherit the cgroup from our parent.
-  const ContainerID rootContainerId = protobuf::getRootContainerId(containerId);
-
-  if (!infos.contains(rootContainerId)) {
-    return Failure("Failed to isolate the container: Unknown root container");
+  // If we are a nested container with shared cgroups,
+  // we inherit the cgroup from our parent.
+  Owned<Info> info = findCgroupInfo(containerId);
+  if (!info.get()) {
+    return Failure(
+        "Failed to find cgroup for container " +
+        stringify(containerId));
   }
 
-  const string& cgroup = infos[rootContainerId]->cgroup;
+  const string& cgroup = info->cgroup;
 
   // TODO(haosdent): Use foreachkey once MESOS-5037 is resolved.
   foreach (const string& hierarchy, subsystems.keys()) {
@@ -737,7 +775,8 @@ Future<Nothing> CgroupsIsolatorProcess::_isolate(
     // upgrade, the newly added cgroup subsystems do not
     // exist on old container's cgroup hierarchy. So skip
     // assigning the pid to this cgroup subsystem.
-    if (containerId.has_parent() && !cgroups::exists(hierarchy, cgroup)) {
+    if (containerId.has_parent() && containerId != info->containerId &&
+        !cgroups::exists(hierarchy, cgroup)) {
       LOG(INFO) << "Skipping assigning pid " << stringify(pid)
                 << " to cgroup at '" << path::join(hierarchy, cgroup)
                 << "' for container " << containerId
@@ -770,15 +809,21 @@ Future<Nothing> CgroupsIsolatorProcess::_isolate(
 Future<ContainerLimitation> CgroupsIsolatorProcess::watch(
     const ContainerID& containerId)
 {
-  // Since we do not maintain cgroups for nested containers
-  // directly, we simply return a pending future here, indicating
+  // Since we do not maintain cgroups for nested containers with shared
+  // cgroups directly, we simply return a pending future here, indicating
   // that the limit for the nested container will never be reached.
-  if (containerId.has_parent()) {
-    return Future<ContainerLimitation>();
-  }
-
   if (!infos.contains(containerId)) {
-    return Failure("Unknown container");
+    // TODO(abudnik): We should return a failure for the nested container
+    // whose `share_cgroups` is false but `infos` does not contain it.
+    // This may happen due to a bug in our code.
+    //
+    // NOTE: We return a pending future for a non-existent nested container
+    // whose ancestor is known to the cgroups isolator.
+    if (findCgroupInfo(containerId).get()) {
+      return Future<ContainerLimitation>();
+    } else {
+      return Failure("Unknown container");
+    }
   }
 
   foreachvalue (const Owned<Subsystem>& subsystem, subsystems) {
@@ -812,12 +857,9 @@ void CgroupsIsolatorProcess::_watch(
 
 Future<Nothing> CgroupsIsolatorProcess::update(
     const ContainerID& containerId,
-    const Resources& resources)
+    const Resources& resourceRequests,
+    const google::protobuf::Map<string, Value::Scalar>& resourceLimits)
 {
-  if (containerId.has_parent()) {
-    return Failure("Not supported for nested containers");
-  }
-
   if (!infos.contains(containerId)) {
     return Failure("Unknown container");
   }
@@ -828,7 +870,8 @@ Future<Nothing> CgroupsIsolatorProcess::update(
       updates.push_back(subsystem->update(
           containerId,
           infos[containerId]->cgroup,
-          resources));
+          resourceRequests,
+          resourceLimits));
     }
   }
 
@@ -865,10 +908,6 @@ Future<Nothing> CgroupsIsolatorProcess::_update(
 Future<ResourceStatistics> CgroupsIsolatorProcess::usage(
     const ContainerID& containerId)
 {
-  if (containerId.has_parent()) {
-    return Failure("Not supported for nested containers");
-  }
-
   if (!infos.contains(containerId)) {
     return Failure("Unknown container");
   }
@@ -905,15 +944,17 @@ Future<ResourceStatistics> CgroupsIsolatorProcess::usage(
 Future<ContainerStatus> CgroupsIsolatorProcess::status(
     const ContainerID& containerId)
 {
-  // TODO(jieyu): Currently, all nested containers share the same
-  // cgroup as their parent container. Revisit this once this is no
-  // long true.
-  if (containerId.has_parent()) {
-    return status(containerId.parent());
-  }
-
+  // If we are a nested container unknown to the isolator,
+  // we try to find the status of its ancestor.
   if (!infos.contains(containerId)) {
-    return Failure("Unknown container");
+    // TODO(abudnik): We should return a failure for the nested container
+    // whose `share_cgroups` is false but `infos` does not contain it.
+    // This may happen due to a bug in our code.
+    if (containerId.has_parent()) {
+      return status(containerId.parent());
+    } else {
+      return Failure("Unknown container");
+    }
   }
 
   vector<Future<ContainerStatus>> statuses;
@@ -947,15 +988,8 @@ Future<ContainerStatus> CgroupsIsolatorProcess::status(
 Future<Nothing> CgroupsIsolatorProcess::cleanup(
     const ContainerID& containerId)
 {
-  // If we are a nested container, we do not need to clean anything up
-  // since only top-level containers should have cgroups created for them.
-  if (containerId.has_parent()) {
-    return Nothing();
-  }
-
   if (!infos.contains(containerId)) {
     VLOG(1) << "Ignoring cleanup request for unknown container " << containerId;
-
     return Nothing();
   }
 
@@ -1047,6 +1081,27 @@ Future<Nothing> CgroupsIsolatorProcess::__cleanup(
   infos.erase(containerId);
 
   return Nothing();
+}
+
+
+Owned<CgroupsIsolatorProcess::Info> CgroupsIsolatorProcess::findCgroupInfo(
+    const ContainerID& containerId) const
+{
+  Option<ContainerID> current = containerId;
+  while (current.isSome()) {
+    Option<Owned<Info>> info = infos.get(current.get());
+    if (info.isSome()) {
+      return info.get();
+    }
+
+    if (!current->has_parent()) {
+      break;
+    }
+
+    current = current->parent();
+  }
+
+  return nullptr;
 }
 
 } // namespace slave {

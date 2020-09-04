@@ -17,6 +17,7 @@
 #include <sys/types.h>
 
 #include <climits>
+#include <cmath>
 #include <sstream>
 
 #include <process/collect.hpp>
@@ -31,11 +32,14 @@
 
 #include "common/protobuf_utils.hpp"
 
+#include "slave/containerizer/mesos/utils.hpp"
+
 #include "slave/containerizer/mesos/isolators/cgroups/subsystems/memory.hpp"
 
 using cgroups::memory::pressure::Counter;
 using cgroups::memory::pressure::Level;
 
+using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLimitation;
 
 using process::Failure;
@@ -123,6 +127,7 @@ Future<Nothing> MemorySubsystemProcess::recover(
   }
 
   infos.put(containerId, Owned<Info>(new Info));
+  infos[containerId]->hardLimitUpdated = true;
 
   oomListen(containerId, cgroup);
   pressureListen(containerId, cgroup);
@@ -133,16 +138,99 @@ Future<Nothing> MemorySubsystemProcess::recover(
 
 Future<Nothing> MemorySubsystemProcess::prepare(
     const ContainerID& containerId,
-    const string& cgroup)
+    const string& cgroup,
+    const ContainerConfig& containerConfig)
 {
   if (infos.contains(containerId)) {
     return Failure("The subsystem '" + name() + "' has already been prepared");
   }
 
   infos.put(containerId, Owned<Info>(new Info));
+  infos[containerId]->hardLimitUpdated = false;
+  infos[containerId]->isCommandTask = containerConfig.has_task_info();
 
   oomListen(containerId, cgroup);
   pressureListen(containerId, cgroup);
+
+  return Nothing();
+}
+
+
+Future<Nothing> MemorySubsystemProcess::isolate(
+    const ContainerID& containerId,
+    const string& cgroup,
+    pid_t pid)
+{
+  if (!infos.contains(containerId)) {
+    return Failure(
+        "Failed to isolate subsystem '" + name() + "'"
+        ": Unknown container");
+  }
+
+  // Get the soft limit.
+  Try<Bytes> softLimit =
+    cgroups::memory::soft_limit_in_bytes(hierarchy, cgroup);
+
+  if (softLimit.isError()) {
+    return Failure(
+        "Failed to read 'memory.soft_limit_in_bytes'"
+        ": " + softLimit.error());
+  }
+
+  // Get the hard limit.
+  Try<Bytes> hardLimit =
+    cgroups::memory::limit_in_bytes(hierarchy, cgroup);
+
+  if (hardLimit.isError()) {
+    return Failure(
+        "Failed to read 'memory.limit_in_bytes'"
+        ": " + hardLimit.error());
+  }
+
+  // While the OOM score of a process is a complex function of the process state
+  // and configuration, a decent approximation of the OOM score is 10 x percent
+  // of memory used by the process + `/proc/$pid/oom_score_adj` (a configurable
+  // quantity which is between -1000 and 1000). Containers with higher OOM
+  // scores are killed if the system runs out of memory.
+  //
+  // We would like burstable task containers which consume more memory than
+  // their memory requests (i.e. soft limits) to be preferentially OOM-killed
+  // first. To accomplish this, we set their OOM score adjustment as shown
+  // below, which attempts to ensure that the container which consumes more
+  // memory than its memory request will have an OOM score of 1000.
+  //
+  // Please note that there are two kinds of burstable task containers:
+  //   1. Command task containers whose soft limit < hard limit.
+  //   2. Nested task containers whose soft limit < hard limit.
+  //
+  // For any other kinds of containers (see below), we will just leave their OOM
+  // score adjustments at the default value (i.e. 0).
+  //   1. Containers whose soft limit == hard limit, this is to ensure backward
+  //      compatibility.
+  //   2. Default executor containers whose soft limit < hard limit.
+  //   3. Custom executor containers whose soft limit < hard limit.
+  //   4. Debug containers.
+  if (softLimit.get() < hardLimit.get() &&
+      (infos[containerId]->isCommandTask || containerId.has_parent())) {
+    Try<int> oomScoreAdj = calculateOOMScoreAdj(softLimit.get());
+    if (oomScoreAdj.isError()) {
+      return Failure(
+          "Failed to calculate OOM score adjustment: " + oomScoreAdj.error());
+    }
+
+    const string oomScoreAdjPath =
+      strings::format("/proc/%d/oom_score_adj", pid).get();
+
+    Try<Nothing> write =
+      os::write(oomScoreAdjPath, stringify(oomScoreAdj.get()));
+
+    if (write.isError()) {
+      return Failure("Failed to set OOM score adjustment: " + write.error());
+    }
+
+    LOG(INFO) << "Set " << oomScoreAdjPath << " to " << oomScoreAdj.get()
+              << " for container " << containerId;
+  }
 
   return Nothing();
 }
@@ -165,7 +253,8 @@ Future<ContainerLimitation> MemorySubsystemProcess::watch(
 Future<Nothing> MemorySubsystemProcess::update(
     const ContainerID& containerId,
     const string& cgroup,
-    const Resources& resources)
+    const Resources& resourceRequests,
+    const google::protobuf::Map<string, Value::Scalar>& resourceLimits)
 {
   if (!infos.contains(containerId)) {
     return Failure(
@@ -173,21 +262,21 @@ Future<Nothing> MemorySubsystemProcess::update(
         ": Unknown container");
   }
 
-  if (resources.mem().isNone()) {
+  if (resourceRequests.mem().isNone()) {
     return Failure(
         "Failed to update subsystem '" + name() + "'"
         ": No memory resource given");
   }
 
   // New limit.
-  Bytes mem = resources.mem().get();
-  Bytes limit = std::max(mem, MIN_MEMORY);
+  Bytes mem = resourceRequests.mem().get();
+  Bytes softLimit = std::max(mem, MIN_MEMORY);
 
   // Always set the soft limit.
   Try<Nothing> write = cgroups::memory::soft_limit_in_bytes(
       hierarchy,
       cgroup,
-      limit);
+      softLimit);
 
   if (write.isError()) {
     return Failure(
@@ -196,55 +285,108 @@ Future<Nothing> MemorySubsystemProcess::update(
   }
 
   LOG(INFO) << "Updated 'memory.soft_limit_in_bytes' to "
-            << limit << " for container " << containerId;
+            << softLimit << " for container " << containerId;
 
-  // Read the existing limit.
-  Try<Bytes> currentLimit = cgroups::memory::limit_in_bytes(hierarchy, cgroup);
+  // Read the existing hard limit.
+  Try<Bytes> currentHardLimit =
+    cgroups::memory::limit_in_bytes(hierarchy, cgroup);
+
+  if (currentHardLimit.isError()) {
+    return Failure(
+        "Failed to read 'memory.limit_in_bytes'"
+        ": " + currentHardLimit.error());
+  }
+
+  Option<double> memLimit = None();
+  foreach (auto&& limit, resourceLimits) {
+    if (limit.first == "mem") {
+      memLimit = limit.second.value();
+    }
+  }
+
+  // Rather than trying to represent an infinite limit with the `Bytes`
+  // type, we represent the infinite case by setting `isInfiniteLimit`
+  // to `true` and letting `hardLimit` be NONE.
+  bool isInfiniteLimit = false;
+  Option<Bytes> hardLimit = None();
+  if (memLimit.isSome() && std::isinf(memLimit.get())) {
+    isInfiniteLimit = true;
+  } else {
+    // Set hard limit to memory limit (if any) or to memory request.
+    hardLimit = memLimit.isSome() ?
+        std::max(Megabytes(static_cast<uint64_t>(memLimit.get())), MIN_MEMORY) :
+        softLimit;
+  }
 
   // NOTE: If `flags.cgroups_limit_swap` is (has been) used then both
   // 'limit_in_bytes' and 'memsw.limit_in_bytes' will always be set to
   // the same value.
-  if (currentLimit.isError()) {
-    return Failure(
-        "Failed to read 'memory.limit_in_bytes'"
-        ": " + currentLimit.error());
-  }
-
   bool limitSwap = flags.cgroups_limit_swap;
 
   auto setLimitInBytes = [=]() -> Try<Nothing> {
-    Try<Nothing> write = cgroups::memory::limit_in_bytes(
-        hierarchy,
-        cgroup,
-        limit);
+    if (isInfiniteLimit) {
+      Try<Nothing> write =
+        cgroups::write(hierarchy, cgroup, "memory.limit_in_bytes", "-1");
 
-    if (write.isError()) {
-      return Error(
-          "Failed to set 'memory.limit_in_bytes'"
-          ": " + write.error());
+      if (write.isError()) {
+        return Error(
+            "Failed to update 'memory.limit_in_bytes': " + write.error());
+      }
+
+      LOG(INFO) << "Updated 'memory.limit_in_bytes' to -1"
+                << " for container " << containerId;
+    } else {
+      CHECK_SOME(hardLimit);
+
+      Try<Nothing> write = cgroups::memory::limit_in_bytes(
+          hierarchy,
+          cgroup,
+          hardLimit.get());
+
+      if (write.isError()) {
+        return Error(
+            "Failed to set 'memory.limit_in_bytes'"
+            ": " + write.error());
+      }
+
+      LOG(INFO) << "Updated 'memory.limit_in_bytes' to " << hardLimit.get()
+                << " for container " << containerId;
     }
-
-    LOG(INFO) << "Updated 'memory.limit_in_bytes' to " << limit
-              << " for container " << containerId;
 
     return Nothing();
   };
 
   auto setMemswLimitInBytes = [=]() -> Try<Nothing> {
     if (limitSwap) {
-      Try<bool> write = cgroups::memory::memsw_limit_in_bytes(
-          hierarchy,
-          cgroup,
-          limit);
+      if (isInfiniteLimit) {
+        Try<Nothing> write = cgroups::write(
+            hierarchy, cgroup, "memory.memsw.limit_in_bytes", "-1");
 
-      if (write.isError()) {
-        return Error(
-            "Failed to set 'memory.memsw.limit_in_bytes'"
-            ": " + write.error());
+        if (write.isError()) {
+          return Error(
+              "Failed to update 'memory.memsw.limit_in_bytes'"
+              ": " + write.error());
+        }
+
+        LOG(INFO) << "Updated 'memory.memsw.limit_in_bytes' to -1"
+                  << " for container " << containerId;
+      } else {
+        CHECK_SOME(hardLimit);
+
+        Try<bool> write = cgroups::memory::memsw_limit_in_bytes(
+            hierarchy,
+            cgroup,
+            hardLimit.get());
+
+        if (write.isError()) {
+          return Error(
+              "Failed to set 'memory.memsw.limit_in_bytes'"
+              ": " + write.error());
+        }
+
+        LOG(INFO) << "Updated 'memory.memsw.limit_in_bytes' to "
+                  << hardLimit.get() << " for container " << containerId;
       }
-
-      LOG(INFO) << "Updated 'memory.memsw.limit_in_bytes' to " << limit
-                << " for container " << containerId;
     }
 
     return Nothing();
@@ -265,26 +407,18 @@ Future<Nothing> MemorySubsystemProcess::update(
   // discrepancy between usage and soft limit and introduces a "manual
   // oom" if necessary.
   //
-  // If this is the first time, 'memory.limit_in_bytes' is unlimited
-  // which may be one of following possible values:
-  //   * LONG_MAX (Linux Kernel Version < 3.12)
-  //   * ULONG_MAX (3.12 <= Linux Kernel Version < 3.19)
-  //   * LONG_MAX / pageSize * pageSize (Linux Kernel Version >= 3.19)
-  static const size_t pageSize = os::pagesize();
-  Bytes unlimited(static_cast<uint64_t>(LONG_MAX / pageSize * pageSize));
-
   // NOTE: It's required by the Linux kernel that
   // 'memory.limit_in_bytes' should be less than or equal to
   // 'memory.memsw.limit_in_bytes'. Otherwise, the kernel will fail
   // the cgroup write with EINVAL. As a result, the order of setting
   // these two control files is important. See MESOS-7237 for details.
-  if (currentLimit.get() >= unlimited) {
-    // This is the first time memory limit is being set. So
+  if (!infos[containerId]->hardLimitUpdated) {
+    // This is the first time memory hard limit is being set. So
     // effectively we are reducing the memory limits because of which
     // we need to set the 'memory.limit_in_bytes' before setting
     // 'memory.memsw.limit_in_bytes'
     setFunctions = {setLimitInBytes, setMemswLimitInBytes};
-  } else if (limit > currentLimit.get()) {
+  } else if (isInfiniteLimit || hardLimit.get() > currentHardLimit.get()) {
     setFunctions = {setMemswLimitInBytes, setLimitInBytes};
   }
 
@@ -294,6 +428,8 @@ Future<Nothing> MemorySubsystemProcess::update(
       return Failure(result.error());
     }
   }
+
+  infos[containerId]->hardLimitUpdated = true;
 
   return Nothing();
 }

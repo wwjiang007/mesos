@@ -3940,7 +3940,7 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileTasksMissingFromSlave)
   MesosSchedulerDriver driver(
       &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(allocator, addFramework(_, _, _, _, _));
+  EXPECT_CALL(allocator, addFramework_(_, _, _, _, _));
 
   Future<FrameworkID> frameworkId;
   EXPECT_CALL(sched, registered(_, _, _))
@@ -5332,7 +5332,8 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, ResourceStatistics)
   AWAIT_READY(usage);
 
   // Check the resource limits are set.
-  EXPECT_TRUE(usage->has_cpus_limit());
+  EXPECT_TRUE(usage->has_cpus_soft_limit());
+  EXPECT_TRUE(usage->has_mem_soft_limit_bytes());
   EXPECT_TRUE(usage->has_mem_limit_bytes());
 
   // Destroy the container.
